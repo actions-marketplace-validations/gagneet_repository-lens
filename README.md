@@ -1,423 +1,197 @@
-# repolens — Code Visibility & Traceability for Python Repositories
+# Repository Lens
 
-A comprehensive, zero-configuration code-understanding toolkit for Python repositories. **repolens** provides feature traceability, per-function insights, capability indexing, change-impact analysis, and automated code quality reporting—all configured through a single `repolens.toml` file at your repository root.
+Repository Lens (`repolens`) is a read-only static analysis toolkit for one checked-out
+repository. The current release focuses on JavaScript/TypeScript (including the Next.js
+App Router), Python/FastAPI, and PostgreSQL references. It builds an evidence graph and
+exports bounded Mermaid, Markdown, JSON, and SARIF views that a developer can review
+before changing code.
 
-## 🎯 What repolens Does
+The scanner parses source; it does not import or execute the target application, install
+target dependencies, run migrations/builds/tests, connect to a database, clone a remote
+repository, or infer runtime behavior from a name alone.
 
-| Command | Purpose |
-|---------|---------|
-| `featuretrace map` | Visualize features as Mermaid flowcharts showing data flow from UI to database |
-| `featuretrace audit` | Validate `@featuretrace` markers and maintain traceability quality |
-| `lens` | Build a function index: who calls it, what calls it, what breaks if it changes |
-| `lens similar` | Search the function index by behavior to avoid reimplementing existing features |
-| `owners` | Maintain a capability index to ensure each concept has one clear owner |
-| `impact` | Standalone change-impact tracer: scan, query, and doctor the impact graph |
-| `artefacts regenerate` | Rebuild derived/generated files after a merge |
-| `artefacts install-hooks` | Register merge drivers and post-merge hooks for generated files |
-| `artefacts verify` | Ensure `.gitattributes` and regeneration rules stay in sync |
-| `gates` | Verify every validation script is reachable and can fail the build |
-| `docs coverage` | Track docstring coverage for public Python and TypeScript symbols |
-| `docs build` | Generate HTML API docs via pdoc (Python) and TypeDoc (TypeScript) |
-| `report` | Run all tools in one pass and produce a single prioritized findings list (Markdown, JSON, SARIF) |
-| `init` | Bootstrap repolens in a new repository: detect structure, write config, set up CI |
-| `rules` | Browse and display portable, repository-agnostic rules documents |
+## What is implemented
 
-## ⚡ Quick Start
+| Area | Verified behavior | Important boundary |
+|---|---|---|
+| Python | AST functions/classes, import bindings, calls, FastAPI router prefixes/mounts, `db.<collection>`, literal SQL and ORM table declarations | Dynamic registration, factories, type dispatch and runtime authorization remain unresolved |
+| JavaScript/TypeScript | Tree-sitter syntax extraction, exports, local/alias imports, calls, `fetch`/Axios-style requests, literal SQL calls, Next.js App Router handlers and dynamic route normalization | No TypeScript compiler/type graph; wrappers, re-exports from other modules, Pages Router, middleware and rewrites are not complete |
+| PostgreSQL | SQLGlot parsing of literal PostgreSQL SQL, CTE-aware table references, read/write/DDL detail, SQL variables and ORM class references | No DSN, live catalog, RLS state, migration-head check or query-plan claim |
+| Reports | Bounded impact traversal with evidence origin/resolution, Mermaid/Markdown/JSON, SARIF import/export | A “complete” scan means supported checks finished; it is not a safety or correctness proof |
+| API | Authenticated loopback FastAPI service with OpenAPI/Swagger UI and a generated Postman collection | One operator-configured local checkout; no multi-tenant server or remote-provider OAuth |
+| Extensions | Explicitly enabled trusted Python entry points for other file/database extractors | Plugins are not sandboxed; the local API deliberately does not load them from requests |
 
-### Installation
+Frontend UI, C# analysis, GitHub/GitLab linking, OAuth, hosted workers, and live database
+inspection are deliberately deferred. They are tracked in [the roadmap](docs/roadmap.md),
+not represented as existing features.
 
-```bash
-# From PyPI
-pip install repolens
+## Install
 
-# Or from source (editable install)
-pip install -e .
-```
-
-### Basic Usage
+The base package has no runtime dependency and keeps the existing repository-oriented
+commands available. Install the focused stack and API extras for the new workflow:
 
 ```bash
-# Initialize in your repository (detects Python/TypeScript structure automatically)
-repolens init
-
-# Build the function index for your Python codebase
-repolens lens
-
-# Audit FeatureTrace markers
-repolens featuretrace audit
-
-# Check documentation coverage
-repolens docs coverage
-
-# Run all checks and generate a report
-repolens report
-
-# Generate full HTML API documentation
-repolens docs build --strict
+python -m pip install -e '.[stack,api]'
 ```
 
-### Running on Another Repository
+For the test environment:
 
 ```bash
-repolens --root /path/to/repo featuretrace map
-repolens --root /path/to/repo report --check --fail-on P1
+python -m pip install -e '.[stack,api,test]'
 ```
 
-## 📦 Core Features
+`stack` provides Tree-sitter grammars and SQLGlot. `api` provides FastAPI and Uvicorn.
+Without `stack`, the lower-level `impact` command can fall back to legacy JavaScript
+regex extraction and will report that limitation; `analyze` requires the stack extras so
+it cannot silently present a degraded result.
 
-### 1. **FeatureTrace Markers** (`repolens/featuretrace/`)
-- Declare which feature a file belongs to with `@featuretrace:<tag>` markers
-- Specify layers: frontend, router, service, domain, worker, cron, model, test, etc.
-- Map data flow: where data enters, flows through, and exits the system
-- Track related files, feature toggles, database tables, and test coverage
-- Render as interactive Mermaid flowcharts, mindmaps, and structured JSON
+## Quick start
 
-**Example marker:**
-```python
-# @featuretrace:user-login — Handle user authentication flow
-# Layer: router
-# Data flow: request → auth_service → user_model (authentication)
-# Related: backend/auth.py
-#          backend/models/user.py
-# Tests: tests/auth_test.py
-```
-
-### 2. **Function Lens** (`repolens/lens/`)
-- Index every function across configured source directories
-- For each function, discover:
-  - Purpose and docstring
-  - Direct callers and callees (name-based, upper bound)
-  - Routes, guards, and data stores it interacts with
-  - Tests that reference it by name
-  - FeatureTrace tags and capability ownership
-- Search similar functions by behavior to reduce duplication
-- Call edges are name-based (never type-resolved) for conservative accuracy
-
-### 3. **Static Analysis & Security Scanning** (`repolens/scan/`)
-- **Security checks:** BOLA/IDOR candidates, object-level authorization gaps
-- **Performance checks:** SELECT queries without LIMIT, N+1 query patterns
-- **Database migrations:** Alembic migration validation (NULL without defaults, RLS, security_invoker, index locks)
-- **Python AST-based:** Import-free, file-only parsing—no code execution
-- Every finding includes:
-  - **Severity:** How bad if true (CRITICAL, HIGH, MEDIUM, LOW)
-  - **Confidence:** How likely it's real (HIGH, MEDIUM, LOW)
-  - **Exposure:** unauthenticated, authenticated, internal, unreachable
-  - **Priority:** Severity × Confidence for sorting
-
-### 4. **Impact Tracing** (`repolens/impact/`)
-Standalone, read-only change-impact graph:
-- **Scan:** Build a dependency graph from your repository
-- **Query:** Find what changes when you modify a file/function
-- **Doctor:** Identify structural issues in the dependency graph
-```bash
-repolens impact scan          # Build the graph
-repolens impact query X       # What depends on X?
-repolens impact doctor        # Structural health check
-```
-
-### 5. **Capability Index** (`repolens/owners/`)
-- YAML-based registry of who owns what concept
-- Ensure each capability has one clear owner
-- Integrate with the function index to detect gaps
-- Optionally show impact across owned capabilities
-```bash
-repolens owners --impact      # Show impact of each owner's changes
-repolens owners --check       # Validate index completeness
-```
-
-### 6. **Documentation** (`repolens/docs/`)
-- **Coverage:** Track docstring coverage per file and language
-  - Python: modules, classes, functions, methods (not starting with `_`)
-  - TypeScript/JavaScript: top-level exports
-- **Build:** Generate HTML API docs from pdoc (Python) + TypeDoc (TypeScript)
-- **Ratchet mode:** Prevent regression—fail CI if coverage declines
+Run against the current checkout:
 
 ```bash
-repolens docs coverage --missing backend/api     # Show all undocumented symbols
-repolens docs coverage --check                   # Fail if regression
-repolens docs build --strict                     # Strict pdoc + TypeDoc
+repolens analyze --out .repolens/analysis
 ```
 
-### 7. **Generated Artifacts Management** (`repolens/artefacts/`)
-- Register a custom merge driver for generated files
-- Automatically regenerate artifacts after merges
-- Verify `.gitattributes` stays in sync with regeneration rules
-- Prevent manual edits to generated files
+The command writes:
+
+```text
+.repolens/analysis/
+├── analysis.json       # machine-readable graph, diagnostics and findings
+├── report.md           # bounded Mermaid diagram plus review tables
+├── linkage.mmd         # Mermaid-only view
+└── findings.sarif      # normalized SARIF findings
+```
+
+Inspect one concept or function without re-reading source after the snapshot:
 
 ```bash
-repolens artefacts install-hooks       # Set up post-merge hooks
-repolens artefacts regenerate          # Rebuild artifacts now
-repolens artefacts verify              # Check consistency
+repolens analyze --query 'save_item' --max-nodes 40 --out .repolens/analysis
 ```
 
-### 8. **Validation Gates** (`repolens/gates/`)
-- Ensure every validation script is reachable from the build
-- Check that every audit (ratchet) can actually fail
-- Build a dependency graph of validation → execution
-
-### 9. **Unified Reporting** (`repolens/report/`)
-- Run all tools in one pass
-- Combine findings from security, performance, migrations, docstrings, coverage
-- Output in Markdown, JSON, or SARIF format
-- Support for baselines and ratchets (CI-safe incremental checks)
+The original impact CLI remains available:
 
 ```bash
-repolens report                           # Generate .repolens/report/report.md
-repolens report --check --fail-on P1      # Fail on new P1 findings
-repolens report --update-baseline         # Accept today's findings as baseline
+repolens impact scan /path/to/repository
+repolens impact query 'checkout' --repo /path/to/repository --format markdown
+repolens impact doctor /path/to/repository
 ```
 
-## 🔧 Configuration
+All scans are bounded by `max_file_bytes` and `max_files`; truncation, unreadable files,
+parser recovery and unresolved relationships are explicit diagnostics rather than a
+silent “clean” result.
 
-Every command reads `repolens.toml` at your repository root. No repository-specific facts are hardcoded in the package.
+## Local API, Swagger and Postman
 
-**Example repolens.toml:**
+The API serves one operator-selected checkout on loopback. Set a random bearer token of
+at least 32 characters, then start it from the repository root:
+
+```bash
+export REPOLENS_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+repolens serve --port 8765
+```
+
+Open Swagger UI at `http://127.0.0.1:8765/docs`; the raw contract is at
+`/openapi.json` and ReDoc is at `/redoc`. The health endpoint is unauthenticated; all
+analysis endpoints require `Authorization: Bearer $REPOLENS_API_TOKEN`.
+
+Typical requests:
+
+```bash
+curl http://127.0.0.1:8765/health
+curl -H "Authorization: Bearer $REPOLENS_API_TOKEN" \
+     -X POST http://127.0.0.1:8765/v1/analysis \
+     -H 'content-type: application/json' -d '{}'
+curl -H "Authorization: Bearer $REPOLENS_API_TOKEN" \
+     -X POST http://127.0.0.1:8765/v1/impact \
+     -H 'content-type: application/json' \
+     -d '{"query":"save_item","max_nodes":30}'
+```
+
+Generate contracts from the same FastAPI application used by `serve`:
+
+```bash
+repolens api export --out docs/api
+```
+
+Import [the Postman collection](docs/api/repository-lens.postman_collection.json) and
+[local environment](docs/api/local.postman_environment.json), set `api_token`, and run
+the requests in order. The checked-in [OpenAPI document](docs/api/openapi.json) is
+regenerated from the application; it is not a hand-maintained second API.
+
+## Configuration
+
+Repository-specific settings are read from `repolens.toml` and then
+`.impact-tracer.json`. The impact configuration is additive metadata and safety bounds;
+it is not imported as application code. A minimal example:
+
 ```toml
-[project]
-name = "my-app"
-python_root = "src"
-typescript_root = "frontend"
-tests_dir = "tests"
+[impact]
+backend_api_prefix = "/api"
+max_file_bytes = 2000000
+max_files = 10000
+pg_schemas = ["public", "inventory"]
+roles = ["admin", "operator"]
 
-[featuretrace]
-auto_discover = true
-layer_validation = true
-
-[lens]
-search_roots = ["src", "lib"]
-
-[owners]
-registry_file = "OWNERS.yaml"  # Optional: PyYAML required
-
-[docs]
-coverage_check = true
-build_pdoc = true
-build_typedoc = false
-
-[artefacts]
-rules = [
-  { pattern = "**/*.generated.py", regenerate = "scripts/codegen.py" }
-]
-
-[report]
-require = ["ruff", "bandit"]
-fail_on = ["P0", "P1"]
+[scan.migrations]
+roots = ["backend/alembic/versions"]
 ```
 
-Run `repolens init` to auto-detect your structure and create a starter config.
+The scanner accepts relative artifact paths only. Absolute paths, `..` traversal and
+drive-qualified paths are rejected. The API takes only bounded scan values from a
+request and always layers them over the repository’s policy; it never accepts a source
+path, command, repository URL or plugin name from the caller.
 
-## 📋 Configuration Details
+## Evidence and diagrams
 
-### repolens.toml Structure
-- **[project]:** Project metadata and source directories
-- **[featuretrace]:** FeatureTrace marker rules
-- **[lens]:** Function index settings
-- **[owners]:** Capability index path (optional, requires PyYAML)
-- **[docs]:** Documentation coverage and build settings
-- **[artefacts]:** Generated file management
-- **[report]:** Report generation and CI integration
-- **[scan]:** Security and performance scan configuration
+Every graph edge keeps its origin (`tree-sitter`, `python_ast`, `sqlglot`, declared
+metadata, heuristic, and so on) separate from its resolution (`exact`, `high`,
+`probable`, `declared`, or `ambiguous`). “Exact” describes the syntax or declaration
+that was observed; it does not mean the code will execute at runtime. Mermaid output is
+bounded and escapes repository-controlled labels so report text cannot inject Mermaid
+directives.
 
-## 🚀 Python Support
+```mermaid
+flowchart TD
+    A["Checked-out source"] --> B["Bounded parsers"]
+    C["Repository metadata"] --> B
+    B --> D["Evidence graph"]
+    D --> E["CLI and local API reports"]
+```
 
-- **Python 3.11+** (uses `tomllib` from the standard library)
-- **Core dependencies:** None (zero by default)
-- **Optional dependencies:**
-  - `PyYAML` — for owners/capability index (`pip install repolens[yaml]`)
-  - `pdoc>=14` — for docs build (`pip install repolens[docs]`)
-  - `TypeScript/Node.js + npx` — for TypeDoc (fetched on first use)
+## Extending languages and databases
 
-## 🧪 Testing
+Additional trusted extractors can be installed as Python entry points in the
+`repolens.extractors` group. A plugin declares `api_version = 1`, a unique `name`, a
+version, lowercase suffixes, and `analyze(SourceFile) -> Extraction`. Enable one
+explicitly with:
 
 ```bash
-# Run all tests
-python -m pytest tests/
-
-# Run specific test module
-python -m pytest tests/test_lens.py -v
-
-# Run with coverage
-python -m pytest --cov=repolens tests/
+repolens analyze --plugin my-extractor
 ```
 
-## 📚 Documentation
+Use `repolens analyze --list-plugins` to inspect installed entry-point metadata without
+loading plugin code. See [docs/plugins.md](docs/plugins.md) for the contract and safety
+rules. A future C# or database adapter should live in a plugin rather than adding an
+unverified language guess to the core scanner.
 
-- **[docs/installation.md](docs/installation.md)** — How to install repolens in another repository, CI setup, upgrades, troubleshooting
-- **[docs/impact.md](docs/impact.md)** — Detailed guide to the impact tracer
-- **[docs/roadmap.md](docs/roadmap.md)** — Known issues, open tasks, future work (C#, TypeScript security, etc.)
-- **[repolens/rules/](repolens/rules/)** — Repository-agnostic, portable rules documents
+## Testing
 
-## 🏗️ Architecture
-
-```
-repolens/
-├── cli.py                 # Command dispatcher
-├── config.py              # repolens.toml loading and validation
-├── featuretrace/          # Feature mapping and marker audit
-├── lens/                  # Function indexing and similarity search
-├── impact/                # Change-impact graph scanner and query
-├── scan/                  # Security and performance detectors
-│   ├── security.py        # BOLA/IDOR, auth checks
-│   ├── performance.py     # Query limits, N+1 detection
-│   ├── migrations.py      # Alembic migration validation
-│   ├── python_ast.py      # AST parsing utilities
-│   └── wiring.py          # Call graph construction
-├── owners/                # Capability index management
-├── docs/                  # Documentation coverage and building
-├── artefacts/             # Generated file management
-├── gates/                 # Validation reachability
-├── report/                # Unified findings report
-├── core/                  # Shared utilities
-│   ├── console.py         # Terminal output
-│   ├── files.py           # File operations
-│   ├── findings.py        # Finding model and priority
-│   ├── git.py             # Git operations
-│   └── ratchet.py         # Baseline and ratcheting
-├── rules/                 # Portable rules (Markdown)
-└── templates/             # Configuration templates
-```
-
-## 🛠️ CLI Examples
-
-### FeatureTrace
 ```bash
-# Generate Mermaid flowcharts for all features
-repolens featuretrace map
-
-# Audit marker quality and generate a report
-repolens featuretrace audit --check
-
-# Show staleness gates (if any markers are outdated)
-repolens featuretrace audit --check --verbose
+python -m unittest discover -s tests -q
 ```
 
-### Function Lens
-```bash
-# Build the function index
-repolens lens
+The suite covers bounded reads and cache fingerprints, JavaScript/TypeScript syntax and
+Next.js routes, FastAPI mounts, PostgreSQL SQL/ORM references, Mermaid sanitization,
+SARIF validation, API auth/concurrency/contracts, and report output. `pytest` is not a
+runtime requirement for the project’s own tests.
 
-# Look up one function and see who calls it
-repolens lens --lookup authenticate_user
+## Documentation
 
-# Find similar functions by behavior
-repolens lens similar --query "check authorization"
-```
+- [docs/impact.md](docs/impact.md) — lower-level graph and query reference
+- [docs/api/README.md](docs/api/README.md) — Swagger/OpenAPI/Postman workflow
+- [docs/plugins.md](docs/plugins.md) — extractor extension contract
+- [docs/roadmap.md](docs/roadmap.md) — implemented scope, open gaps and priorities
+- [docs/audit/2026-09-12-professional-foundation.md](docs/audit/2026-09-12-professional-foundation.md) — deep-dive verification and confidence ratings
 
-### Impact Tracing
-```bash
-# Build the impact graph
-repolens impact scan
-
-# Find everything that depends on models/user.py
-repolens impact query models/user.py
-
-# Health check the graph
-repolens impact doctor
-```
-
-### Documentation
-```bash
-# Show coverage by file
-repolens docs coverage
-
-# Show all undocumented public symbols in a path
-repolens docs coverage --missing src/api
-
-# Generate strict HTML docs (fail if coverage < 100%)
-repolens docs build --strict
-```
-
-### Full Report
-```bash
-# Quick report (default tools)
-repolens report
-
-# Include slow tools (impact, external scanners)
-repolens report --with impact,semgrep
-
-# Fail CI on any new P1 or P0 findings
-repolens report --check --fail-on P1
-
-# Accept current findings as baseline
-repolens report --update-baseline
-```
-
-## 📊 Report Outputs
-
-The `repolens report` command generates three files in `.repolens/report/`:
-- **report.md** — Human-readable Markdown with findings by category
-- **report.json** — Structured JSON for programmatic consumption
-- **report.sarif** — SARIF format for GitHub Code Scanning integration
-
-Each finding includes:
-- Tool name
-- Category (security, performance, documentation, etc.)
-- Severity, confidence, and exposure
-- File, line, and column
-- Message and remediation guidance
-
-## 🎓 Use Cases
-
-### 1. **Maintain Feature Traceability**
-Use FeatureTrace markers to document how features flow through your codebase, then generate visual maps for architecture reviews and onboarding.
-
-### 2. **Reduce Code Duplication**
-Use `lens similar` to find existing implementations before writing new code, ensuring consistent patterns across the codebase.
-
-### 3. **Understand Function Impact**
-Run `lens --lookup` to see all callers, callees, related tests, and owning capability of a function before refactoring.
-
-### 4. **Predict Change Impact**
-Use the impact tracer to understand what breaks when you change a file—ideal for review and testing strategy.
-
-### 5. **Enforce Ownership**
-Use the capability index to ensure each concept has a clear owner and to prevent architectural drift.
-
-### 6. **Maintain Documentation Quality**
-Use `docs coverage --check` as a ratchet in CI to prevent undocumented APIs from being committed.
-
-### 7. **Catch Security Issues Early**
-Run `report --check` in CI to fail on new BOLA/IDOR candidates and other security findings.
-
-### 8. **Manage Generated Files**
-Use artefacts hooks to ensure generated files are always up-to-date, reducing merge conflicts.
-
-## 🔗 Integration
-
-### GitHub Actions
-```yaml
-name: repolens
-on: [push, pull_request]
-jobs:
-  report:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-      - run: pip install repolens
-      - run: repolens report --check --fail-on P1
-```
-
-See `action.yml` for a pre-built GitHub Action.
-
-## 📝 License
-
-MIT License. See [LICENSE](LICENSE) for details.
-
-Copyright (c) 2026 StrataOS contributors.
-
-## 🤝 Contributing
-
-Contributions welcome! Please ensure:
-1. All tests pass: `pytest tests/`
-2. Code is documented: `repolens docs coverage --check`
-3. No new findings: `repolens report --check`
-
-## 📖 Further Reading
-
-- **[Installation Guide](docs/installation.md)** — Set up in new repositories
-- **[Impact Tracer Docs](docs/impact.md)** — Deep dive into change-impact analysis
-- **[Roadmap](docs/roadmap.md)** — Known issues and future work
-- **[Rules Documents](repolens/rules/)** — Portable, repository-agnostic guidance
+MIT licensed; see [LICENSE](LICENSE).

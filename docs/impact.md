@@ -4,15 +4,15 @@ Impact Tracer is a standalone, read-only repository scanner that answers:
 
 > If this concept, page, endpoint, module, or function changes, what else should a developer review?
 
-It scans a checked-out repository without importing or executing the target application's code. It works with zero project configuration for Python, JavaScript and TypeScript repositories, and can optionally read declarative project metadata such as FeatureTrace markers or a generated canonical-owner JSON file.
+It scans a checked-out repository without importing or executing the target application's code. It works with zero project configuration for Python, JavaScript and TypeScript repositories. Install `repolens[stack]` for Tree-sitter JavaScript/TypeScript syntax and SQLGlot PostgreSQL parsing; without those extras the lower-level command reports a deliberate degraded-parser diagnostic. Declarative project metadata such as FeatureTrace markers or a generated canonical-owner JSON file is optional.
 
 The tool is deliberately separate from the application it analyses. The application does not import Impact Tracer, and Impact Tracer never connects to its database, server, package manager, build hooks, or runtime.
 
 ## Current capabilities
 
-- Python AST extraction for functions, classes, calls, FastAPI decorators and direct `db.<collection>` references.
-- JavaScript/TypeScript extraction for functions, local imports, Axios/API/fetch calls and Next.js App Router pages.
-- PostgreSQL table, MongoDB collection, role, feature-toggle and FeatureTrace discovery.
+- Python AST extraction for functions, classes, import-bound candidate calls, FastAPI router prefixes/mounts, ORM table declarations/references and direct `db.<collection>` references.
+- Tree-sitter JavaScript/TypeScript extraction for functions, exports, local/`tsconfig`-alias imports, calls, Axios/API/fetch calls, literal SQL and Next.js App Router handlers.
+- SQLGlot PostgreSQL table references from literal SQL, with read/write/DDL meaning retained in edge detail; MongoDB collection, role, feature-toggle and FeatureTrace discovery.
 - Optional import of `docs/architecture/canonical_owners.json`, including owners, symbols, tests, consumers and recorded violations.
 - Free-text, path, concept, page, endpoint and symbol search.
 - Bounded incoming/outgoing impact traversal.
@@ -36,17 +36,19 @@ Likewise:
 ## Install
 
 Impact Tracer is part of the repolens package (`repolens.impact`). It requires Python 3.11
-or later and has no runtime dependencies.
+or later. The base package has no runtime dependencies; the focused parser stack is an
+optional extra.
 
 ```bash
-python -m pip install ./tools/repolens      # installs `repolens` and `impact-tracer`
+python -m pip install -e .                  # installs `repolens` and `impact-tracer`
+python -m pip install -e '.[stack]'         # recommended for JS/TS and PostgreSQL
 repolens impact --help                      # the same CLI as `impact-tracer --help`
 ```
 
 It can also be run directly without installation:
 
 ```bash
-PYTHONPATH=tools/repolens python -m repolens.impact --help
+PYTHONPATH=. python -m repolens.impact --help
 ```
 
 ## Usage
@@ -105,7 +107,8 @@ Application vocabulary is configuration too, and empty by default: `pg_schemas` 
     "canonical_owners": "docs/architecture/canonical_owners.json"
   },
   "max_ambiguous_targets": 12,
-  "max_file_bytes": 2000000
+  "max_file_bytes": 2000000,
+  "max_files": 10000
 }
 ```
 
@@ -116,7 +119,7 @@ An example StrataOS profile is included at `examples/strata-management.impact-tr
 Every edge reports independent dimensions rather than one opaque score:
 
 - `origin`: AST, syntax, framework path, regex, declared project metadata, policy or heuristic;
-- `resolution`: exact, probable, declared or ambiguous;
+- `resolution`: exact, high (import-bound syntax), probable, declared or ambiguous;
 - `direct`: whether the evidence joins the two nodes directly;
 - `activation`: static by default; reserved for conditional, startup, scheduled and user-action classifications;
 - `evidence`: source location or artifact that produced the edge.
@@ -130,6 +133,10 @@ Impact results use these dimensions to present:
 
 The scanner proposes the review surface. The developer or administrator decides whether each candidate must change.
 
+For the authenticated local API, Swagger/OpenAPI and Postman workflow, see
+[`docs/api/README.md`](api/README.md). The API is an operator-configured loopback
+service; it does not clone or fetch repositories.
+
 ## Security model
 
 The target repository is untrusted input.
@@ -138,7 +145,7 @@ The target repository is untrusted input.
 - No package is installed from the target.
 - No generator, migration, hook, test or build is run.
 - Paths referenced by metadata are normalized under the repository root.
-- Files larger than the configured limit are skipped during phrase search.
+- Source files larger than the configured limit are skipped during indexing and phrase search.
 - Potential secrets in displayed source snippets are redacted.
 - Mermaid labels are escaped and directive-like text is neutralized.
 
@@ -160,20 +167,18 @@ The JSON graph is the durable machine output. Mermaid is a bounded view, not the
 ## Tests
 
 ```bash
-cd tools/repolens
 python -m unittest discover -s tests -v
 ```
 
-The current test corpus covers Python/FastAPI, TypeScript/Next.js, canonical concepts and consumers, phrase search, ambiguous calls, dynamic routes, deterministic indexes, secret/diagram sanitization and all output formats.
+The current test corpus covers Python/FastAPI, TypeScript/Next.js, PostgreSQL SQL/ORM
+references, canonical concepts and consumers, phrase search, ambiguous calls, dynamic
+routes, deterministic indexes, secret/diagram sanitization and all output formats.
 
 ## Recommended next increments
 
-1. Resolve Python import aliases and TypeScript path aliases so fewer call edges remain ambiguous.
-2. Add OpenAPI request/response-field lineage.
-3. Import FeatureTrace graph JSON, router/store maps and capability-route inventories through explicit read-only adapters.
-4. Add change-kind-aware traversal for calculation, contract, datastore, permission and status changes.
-5. Add `git diff main...HEAD` impact reports and SARIF/GitHub Check output.
-6. Add exact normalized-function duplicate detection with suppression fingerprints and expiry.
-7. Measure precision and recall against a reviewed StrataOS benchmark before introducing semantic or embedding search.
-
-These increments should remain in this standalone package. StrataOS-specific rules belong in an optional profile, not in the core scanner.
+1. Add a reviewed fixture corpus and precision/recall measurements for the focused stack.
+2. Resolve TypeScript re-exports and package `exports` maps with an opt-in type-aware adapter.
+3. Add OpenAPI request/response-field lineage and change-kind-aware traversal.
+4. Add optional read-only PostgreSQL catalog/RLS and migration-head inspection.
+5. Add JavaScript/TypeScript security and performance adapters through SARIF.
+6. Add immutable provider checkouts and a browser UI only after the local API/job model is stable.
