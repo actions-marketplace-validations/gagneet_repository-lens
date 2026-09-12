@@ -5,4 +5,4 @@ generated artefacts live) is read from `repolens.toml` at the repository root; t
 package itself ships only generic defaults.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

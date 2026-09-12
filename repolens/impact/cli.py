@@ -60,13 +60,13 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Build a deterministic static graph index.")
-    scan.add_argument("repo", type=_repo)
+    scan.add_argument("repo", type=_repo, nargs="?")
     scan.add_argument("--config", type=Path)
     scan.add_argument("--output", help=f"Index path; default {DEFAULT_INDEX}")
 
     query = sub.add_parser("query", help="Find a phrase/concept and render its bounded impact graph.")
     query.add_argument("query")
-    query.add_argument("--repo", type=_repo, default=Path.cwd())
+    query.add_argument("--repo", type=_repo)
     query.add_argument("--config", type=Path)
     query.add_argument("--index")
     query.add_argument("--refresh", action="store_true")
@@ -77,7 +77,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     query.add_argument("--output")
 
     doctor = sub.add_parser("doctor", help="Summarize scan coverage and uncertainty.")
-    doctor.add_argument("repo", type=_repo)
+    doctor.add_argument("repo", type=_repo, nargs="?")
     doctor.add_argument("--config", type=Path)
     doctor.add_argument(
         "--all-issues", action="store_true",
@@ -95,12 +95,8 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None, *, config=None, prog: str | None = None) -> int:
-    # `config` is the repolens profile of the CURRENT directory, passed by the repolens
-    # CLI. It is deliberately unused: the repository to trace is named on the command
-    # line, and its own repolens.toml / .impact-tracer.json is what applies to it.
-    del config
     args = build_parser(prog).parse_args(argv)
-    repo = args.repo.resolve()
+    repo = (args.repo or (config.root if config else Path.cwd())).resolve()
     config = Config.load(repo, args.config)
     if args.command == "scan":
         graph = scan_repository(repo, config)

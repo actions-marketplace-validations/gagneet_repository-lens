@@ -470,7 +470,7 @@ def scan(s: ScanSettings) -> list[Finding]:
     dead = unreachable_route_files(s)
     mounts = MountIndex(s)
     for path in python_files(s):
-        tree = parse(str(path))
+        tree = parse(str(path), s.max_file_bytes)
         if tree is None:
             continue
         rel = s.rel(path)

@@ -87,7 +87,7 @@ def _expand_aliases(query: str, config: Config) -> set[str]:
     return {item for item in terms if item}
 
 
-def search(graph: Graph, root: Path, query: str, config: Config, limit: int = 12) -> list[Match]:
+def search(graph: Graph, root: Path, query: str, config: Config, limit: int = 12, *, search_source: bool = True) -> list[Match]:
     terms = _expand_aliases(query, config)
     tokens = set().union(*(set(term.split()) for term in terms))
     matches: dict[str, Match] = {}
@@ -120,7 +120,7 @@ def search(graph: Graph, root: Path, query: str, config: Config, limit: int = 12
             matches[node.id] = Match(node.id, score, sorted(set(reasons)))
 
     lowered_terms = [term.lower() for term in terms]
-    for node in graph.nodes.values():
+    for node in graph.nodes.values() if search_source else ():
         if node.kind != "file" or not node.path:
             continue
         path = (root / node.path).resolve()
@@ -251,8 +251,11 @@ def impact(
     depth: int = 2,
     max_nodes: int = 40,
     seed_limit: int = 8,
+    *, search_source: bool = True,
 ) -> ImpactResult:
-    seeds = search(graph, root, query, config, limit=seed_limit)
+    if max_nodes < 1 or seed_limit < 1:
+        raise ValueError("max_nodes and seed_limit must be positive")
+    seeds = search(graph, root, query, config, limit=min(seed_limit, max_nodes), search_source=search_source)
     selected: dict[str, Node] = {}
     classifications: dict[str, str] = {}
     best_cost: dict[str, int] = {}

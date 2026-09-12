@@ -23,6 +23,9 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "docs coverage": ("repolens.docs.coverage", "docstring coverage of public symbols; --check is a ratchet"),
     "docs build": ("repolens.docs.build", "code-reference HTML: pdoc (Python) and TypeDoc (TypeScript)"),
     "report": ("repolens.report.runner", "run every tool: one prioritised findings report (md, json, sarif)"),
+    "analyze": ("repolens.analysis", "static stack analysis: JSON, Mermaid, Markdown and SARIF"),
+    "serve": ("repolens.api.cli", "serve a configured local repository with Swagger and a bearer token"),
+    "api export": ("repolens.api.export", "generate OpenAPI and Postman contracts from the API"),
     "init": ("repolens.bootstrap", "set up a repository: repolens.toml, rules documents, CI workflow"),
     "rules": ("repolens.rules", "list or print the portable rules documents (`rules show NAME`)"),
 }

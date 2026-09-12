@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -24,16 +25,29 @@ def iter_files(
     found: set[Path] = set()
     for scan_dir in scan_dirs:
         base = root / scan_dir
-        if not base.exists():
+        if (not base.exists() or base.is_symlink()
+                or not base.resolve().is_relative_to(root.resolve())):
             continue
-        for path in base.rglob("*"):
-            if not path.is_file() or path.suffix not in wanted:
+        paths = []
+        if base.is_file():
+            paths = [base]
+        else:
+            for parent, directories, files in os.walk(base, followlinks=False):
+                directory = Path(parent)
+                directories[:] = [name for name in directories if
+                                  not (directory / name).is_symlink()
+                                  and not skip.matches((directory / name).relative_to(root).parts)]
+                paths.extend(directory / name for name in files)
+        for path in paths:
+            if path.is_symlink() or not path.is_file() or path.suffix not in wanted:
                 continue
             try:
                 parts = path.relative_to(root).parts
             except ValueError:
                 parts = path.parts
             if skip.matches(parts):
+                continue
+            if not path.resolve().is_relative_to(root.resolve()):
                 continue
             found.add(path)
     return sorted(found)

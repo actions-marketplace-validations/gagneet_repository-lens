@@ -67,6 +67,8 @@ class Graph:
             existing.path = node.path
         if not existing.line and node.line:
             existing.line = node.line
+        if not existing.language and node.language:
+            existing.language = node.language
         existing.metadata.update(node.metadata)
         return existing
 

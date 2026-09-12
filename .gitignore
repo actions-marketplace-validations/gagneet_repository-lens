@@ -1,4 +1,10 @@
 # Logs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.repolens/analysis/
+.impact-tracer/
 logs
 *.log
 npm-debug.log*
