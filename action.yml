@@ -1,0 +1,50 @@
+name: Impact Tracer
+description: Build a read-only repository graph and publish a bounded impact report.
+
+inputs:
+  query:
+    description: Phrase, concept, page, endpoint, module or function to trace.
+    required: true
+  repository-path:
+    description: Checked-out repository path.
+    required: false
+    default: .
+  depth:
+    description: Incoming/outgoing graph depth from matched nodes.
+    required: false
+    default: "2"
+  max-nodes:
+    description: Maximum number of nodes in the Mermaid view.
+    required: false
+    default: "40"
+  output:
+    description: Markdown report path.
+    required: false
+    default: impact-tracer-report.md
+
+outputs:
+  report:
+    description: Generated Markdown report path.
+    value: ${{ steps.trace.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - id: trace
+      shell: bash
+      env:
+        IMPACT_QUERY: ${{ inputs.query }}
+        IMPACT_REPO: ${{ inputs.repository-path }}
+        IMPACT_DEPTH: ${{ inputs.depth }}
+        IMPACT_MAX_NODES: ${{ inputs.max-nodes }}
+        IMPACT_OUTPUT: ${{ inputs.output }}
+        IMPACT_TOOL_ROOT: ${{ github.action_path }}
+      run: |
+        PYTHONPATH="$IMPACT_TOOL_ROOT" python -m repolens.impact query "$IMPACT_QUERY" \
+          --repo "$IMPACT_REPO" \
+          --depth "$IMPACT_DEPTH" \
+          --max-nodes "$IMPACT_MAX_NODES" \
+          --format markdown \
+          --output "$IMPACT_OUTPUT"
+        echo "report=$IMPACT_OUTPUT" >> "$GITHUB_OUTPUT"
+        cat "$IMPACT_OUTPUT" >> "$GITHUB_STEP_SUMMARY"

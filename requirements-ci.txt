@@ -1,0 +1,12 @@
+# What the repolens CI job installs. Pinned on purpose: the committed report baseline
+# (.repolens/report_baseline.json) is only comparable with the scanner versions that
+# produced it — a newer ruff or bandit adds rules, and their findings would read as new.
+# Rebuild the baseline with these versions:
+#   python -m pip install -r tools/repolens/requirements-ci.txt
+#   python tools/repolens/bin/repolens report --update-baseline
+PyYAML==6.0.2
+ruff==0.16.7
+bandit==1.9.4
+pdoc==16.0.0
+# pdoc imports backend/domain to document it, and domain imports pydantic (the backend's pin).
+pydantic==2.13.5

@@ -1,0 +1,76 @@
+# repolens profile for @@NAME@@. Written by `repolens init`; edit freely.
+#
+# repolens knows nothing about a repository except what this file says. Every section is
+# optional: a missing one falls back to generic defaults. Detected when written:
+#   @@DETECTED@@
+
+# ── FeatureTrace: what makes up a feature ────────────────────────────────────────
+[featuretrace]
+scan_dirs = @@SCAN_DIRS@@
+map_dir = "docs/featuretrace"
+
+[featuretrace.audit]
+# A multi-tenant codebase lists its scope qualifiers, e.g. ["tenant-scoped", "global"],
+# and every marker must then state one.
+scope_values = []
+
+# ── Function lens: one page per function ─────────────────────────────────────────
+[lens]
+python_roots = @@PYTHON_ROOTS@@
+frontend_roots = @@JS_ROOTS@@
+tests_dir = "@@TESTS_DIR@@"
+# Calls that establish a trust boundary (auth dependencies, role guards). The lens answers
+# "what gates this function?" from them.
+guard_calls = []
+owners_yaml = "@@REGISTRY@@"
+
+# ── Capability index: one concept, one owner ─────────────────────────────────────
+[owners]
+registry = "@@REGISTRY@@"
+python_roots = @@PYTHON_ROOTS@@
+javascript_roots = @@JS_ROOTS@@
+
+# ── Static scanners (security, performance) ──────────────────────────────────────
+[scan]
+python_roots = @@PYTHON_ROOTS@@
+# Code that never serves a request (one-off scripts, seeds): findings there rank lower.
+internal_prefixes = []
+@@MIGRATIONS@@
+
+# Route path regex -> why it is public BY DESIGN. Each reason names what authorises the
+# request instead of a session, so a reviewer can check that thing.
+[scan.security.public_routes]
+
+# ── Docstring coverage and the code reference ────────────────────────────────────
+[docs]
+python_roots = @@PYTHON_ROOTS@@
+javascript_roots = @@JS_ROOTS@@
+# Regexes for generated boilerplate that must count as undocumented.
+placeholder_patterns = []
+
+[docs.python]
+# pdoc IMPORTS these; their dependencies must be installed where the docs are built.
+modules = @@PDOC_MODULES@@
+path = @@PDOC_PATH@@
+exclude = []
+
+[docs.typescript]
+entry_points = @@TS_ENTRY@@
+tsconfig = "@@TSCONFIG@@"
+
+# ── The findings report ──────────────────────────────────────────────────────────
+[report]
+title = "@@NAME@@ code health report"
+
+# A repository's own checks join the report: a non-zero exit is one finding, and a crash
+# is an error. Check that a command CAN exit non-zero before relying on it.
+# [[report.commands]]
+# name = "typecheck"
+# run = ["npx", "tsc", "--noEmit"]
+# category = "correctness"
+@@CSHARP@@
+# ── Validation gates ─────────────────────────────────────────────────────────────
+# Every validation script is run by something, and every audit can fail.
+# [gates]
+# scripts = ["scripts/check_*.py"]
+# must_fail = ["scripts/check_*.py"]

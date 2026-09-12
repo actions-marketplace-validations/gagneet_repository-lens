@@ -1,0 +1,101 @@
+"""Walking and reading a source tree."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Iterable
+
+
+def iter_files(
+    root: Path,
+    scan_dirs: Iterable[str],
+    extensions: Iterable[str],
+    skip_parts: Iterable[str],
+) -> list[Path]:
+    """Every file under `scan_dirs` with a wanted suffix, sorted and de-duplicated.
+
+    Skipped directories are matched as whole path COMPONENTS below the root. A
+    substring test would skip `rebuild_ledger.py` for containing "build", and testing
+    the absolute path would skip the entire repository whenever it is cloned under a
+    directory that happens to be called `build`.
+    """
+    wanted = frozenset(extensions)
+    skip = SkipRule(skip_parts)
+    found: set[Path] = set()
+    for scan_dir in scan_dirs:
+        base = root / scan_dir
+        if not base.exists():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file() or path.suffix not in wanted:
+                continue
+            try:
+                parts = path.relative_to(root).parts
+            except ValueError:
+                parts = path.parts
+            if skip.matches(parts):
+                continue
+            found.add(path)
+    return sorted(found)
+
+
+class SkipRule:
+    """Directory names to skip, matched against whole path components.
+
+    An entry with a slash (`alembic/versions`) names a run of CONSECUTIVE components,
+    so it skips `backend/alembic/versions/0001.py` and not a file that merely has
+    `versions` somewhere in its path.
+    """
+
+    def __init__(self, entries: Iterable[str]):
+        self.single: frozenset[str] = frozenset(e.strip("/") for e in entries if "/" not in e.strip("/"))
+        self.runs: tuple[tuple[str, ...], ...] = tuple(
+            tuple(e.strip("/").split("/")) for e in entries if "/" in e.strip("/")
+        )
+
+    def matches(self, parts: tuple[str, ...]) -> bool:
+        if any(part in self.single for part in parts):
+            return True
+        for run in self.runs:
+            width = len(run)
+            if any(tuple(parts[i:i + width]) == run for i in range(len(parts) - width + 1)):
+                return True
+        return False
+
+
+def read_text(path: Path) -> str:
+    """The file as UTF-8, dropping undecodable bytes. Raises OSError when it cannot be
+    read at all; walkers that should carry on call `read_text_or_none` instead."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def read_text_or_none(path: Path) -> str | None:
+    """`read_text`, or None (with a line on stderr) when the file cannot be read.
+
+    A file can vanish between listing and reading: a checkout, or a generator running
+    beside the scan. One such file must not crash a whole run. A caller that has to
+    REPORT an unreadable file (docs coverage records it as an error) calls `read_text`
+    and handles OSError itself.
+    """
+    try:
+        return read_text(path)
+    except OSError as exc:
+        print(f"repolens: skipped {path}: {exc.strerror or exc}", file=sys.stderr)
+        return None
+
+
+def rel(path: Path, root: Path) -> str:
+    """Repo-relative path, or the absolute one when it lies outside the repo.
+
+    `Path.relative_to` RAISES on a path outside the root, and a display helper should
+    never be the thing that fails — a baseline under a test tmpdir is outside the root.
+    """
+    try:
+        # POSIX separators: the result keys baselines and fingerprints, which must be
+        # the same on Windows as on the Linux CI runner that checks them.
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()

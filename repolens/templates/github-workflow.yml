@@ -1,0 +1,66 @@
+# Written by `repolens init --ci github`. Review before committing.
+#
+# Every gate runs even when an earlier one fails (`!cancelled()`), so one push shows every
+# problem instead of only the first.
+name: repolens
+
+on:
+  pull_request:
+  push:
+    branches: [@@DEFAULT_BRANCH@@]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repolens-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repolens:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Only for the TypeDoc half of `repolens docs build`.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      # Pin the scanners to the versions the committed baseline was built with: a newer
+      # release adds rules, and its extra findings would read as new.
+      - name: Install repolens and its scanners
+        run: python -m pip install "@@INSTALL_SPEC@@" @@SCANNER_PINS@@
+
+      - name: Findings report did not regress
+        if: ${{ !cancelled() }}
+        run: repolens report --check --require ruff,bandit
+
+      - name: Docstring coverage did not regress
+        if: ${{ !cancelled() }}
+        run: repolens docs coverage --check
+
+      - name: Code reference builds
+        if: ${{ !cancelled() }}
+        run: repolens docs build
+
+      - name: Report summary
+        if: ${{ always() }}
+        run: |
+          if [ -f .repolens/report/report.md ]; then
+            head -c 900000 .repolens/report/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: repolens
+          path: |
+            .repolens/report/
+            .repolens/docs/
+          if-no-files-found: ignore

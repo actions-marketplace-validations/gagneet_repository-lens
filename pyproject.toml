@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repolens"
+version = "0.2.0"
+description = "Feature traceability, a per-function lens, a capability index, impact tracing, generated-artefact hygiene and code docs for one repository."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "StrataOS contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+# The capability index is YAML; everything else reads TOML, which is in the standard library.
+yaml = ["PyYAML>=6"]
+docs = ["pdoc>=14"]
+
+[project.scripts]
+repolens = "repolens.cli:main"
+# Kept so the standalone impact tracer's documented command still works.
+impact-tracer = "repolens.impact.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["repolens*"]
+
+# `repolens init` and `repolens rules` read these at run time, from a checkout or a wheel.
+[tool.setuptools.package-data]
+repolens = ["templates/*"]
+"repolens.rules" = ["*.md"]

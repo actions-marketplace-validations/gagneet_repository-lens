@@ -1,0 +1,23 @@
+# Capability index: concepts that must have EXACTLY ONE owner. Written by `repolens init`.
+#
+# A call graph answers "what calls what". It cannot answer "does this concept already
+# have an owner", because a re-implementation has no edge to the original. This file is
+# where that answer is written down; `repolens owners --check` fails a change that adds a
+# second implementation of a concept listed here.
+#
+# Rules: @@RULES_DIR@@/one-concept-one-owner.md
+#
+# One entry per concept:
+#
+#   - concept: money-to-cents            # kebab-case: the IDEA, not the function
+#     language: python                   # python | javascript
+#     owner: src/money.py                # the ONE module, repo-relative
+#     symbols: [to_cents]                # what callers use; removing one fails the check
+#     rule: Convert money to integer cents only through to_cents.
+#     why: Two converters rounded "10.005" differently.
+#     detect: 'round\(\s*float\([^)]*\)\s*\*\s*100'   # finds a re-implementation; null + reason if none separates right from wrong
+#     allow: [src/money.py]              # files where the pattern is legitimate
+#     known_violations: []               # debt being paid down, never an escape hatch
+#     tests: []                          # tests that enforce the rule
+#     consumers: []                      # surfaces that PUBLISH the concept's answer
+concepts: []
