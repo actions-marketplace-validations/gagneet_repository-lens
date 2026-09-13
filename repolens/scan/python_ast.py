@@ -39,15 +39,26 @@ def last(node: ast.AST) -> str:
     return ""
 
 
-@lru_cache(maxsize=8192)
-def parse(path: str) -> ast.Module | None:
+@lru_cache(maxsize=256)
+def _parse_text(path: str, text: str) -> ast.Module | None:
     try:
-        return ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
-    except (SyntaxError, ValueError, OSError):
+        return ast.parse(text, filename=path)
+    except (SyntaxError, ValueError, RecursionError):
         return None
 
 
+def parse(path: str, max_bytes: int = 2_000_000) -> ast.Module | None:
+    # Content-keyed: a long-lived API process must not reuse yesterday's AST for a
+    # path changed in-place. The bounded cache also prevents retaining 8192 full ASTs.
+    from ..impact.source import read_source
+    source = Path(path)
+    read = read_source(source.parent, source, max_bytes)
+    return _parse_text(path, read.text) if read.text is not None else None
+
+
 def python_files(s: ScanSettings) -> list[Path]:
+    if s.admitted_python_files is not None:
+        return [s.root / path for path in s.admitted_python_files]
     return iter_files(s.root, s.python_roots, [".py"], s.skip_parts)
 
 

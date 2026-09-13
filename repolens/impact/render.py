@@ -27,10 +27,10 @@ SHAPES = {
 
 
 def _safe_label(value: str) -> str:
-    value = value.replace("\\", "/").replace('"', "'")
-    value = re.sub(r"[\r\n\t]+", " ", value)
-    value = value.replace("%%", "% %").replace("```", "'''")
-    return value[:100]
+    # Keep repository-controlled labels inside Mermaid string literals. Escape
+    # HTML, pipes and delimiters with Mermaid's decimal entity notation.
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))[:100]
+    return "".join(f"#{ord(char)};" if char in '#"<>|`{}[]\\%' else char for char in value)
 
 
 def _mermaid_id(node_id: str) -> str:

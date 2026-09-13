@@ -581,6 +581,8 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
                     help="comma-separated tools whose being SKIPPED fails --check, added to "
                          "[report] require (CI names the tools it installed)")
     ap.add_argument("--list-tools", action="store_true")
+    ap.add_argument("--sarif", action="append", default=[], metavar="FILE",
+                    help="import local SARIF 2.1.0 findings; repeat for multiple files")
     args = ap.parse_args(argv)
     if args.check and args.update_baseline:
         # Writing the baseline first makes every finding known, so the check could only pass.
@@ -602,6 +604,15 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
         return 2
 
     runs: list[ToolRun] = []
+    from .sarif import import_sarif
+    for filename in args.sarif:
+        try:
+            sarif_path = Path(filename)
+            if not sarif_path.is_absolute():
+                sarif_path = ctx.root / sarif_path
+            runs.extend(import_sarif(sarif_path, ctx.root))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            runs.append(ToolRun("sarif", error=f"Cannot import {filename}: {exc}"[:400]))
     for name in tools:
         start = time.time()
         if name == "commands":
@@ -626,6 +637,9 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
 
     baseline_path = ctx.root / section["baseline"]
     if args.update_baseline:
+        if any(run.error for run in runs):
+            print("Cannot update the baseline: one or more tools failed; fix the incomplete run first.", file=sys.stderr)
+            return 2
         write_baseline(baseline_path, findings)
         print(f"baseline: {len(findings)} findings recorded in {baseline_path.relative_to(ctx.root)}")
     try:
@@ -660,7 +674,7 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
                     and PRIORITIES.index(f.priority) <= worst]
         errored = [r.tool for r in runs if r.error]
         required = set(section["require"]) | {t for t in args.require.split(",") if t}
-        missing = [r.tool for r in runs if r.skipped and r.tool in required]
+        missing = sorted(required - {r.tool for r in runs if not r.skipped})
         for f in blocking:
             print(f"NEW {f.priority} {f.rule} {f.location}: {f.message}", file=sys.stderr)
         if errored:

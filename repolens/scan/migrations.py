@@ -425,7 +425,7 @@ def _module_strings(tree: ast.Module) -> dict[str, list[_Sql]]:
 
 
 def _read(s: ScanSettings, path: Path) -> _Migration | None:
-    tree = parse(str(path))
+    tree = parse(str(path), s.max_file_bytes)
     if tree is None:
         return None
     m = _Migration(s.rel(path))
@@ -476,8 +476,17 @@ def migration_roots(s: ScanSettings) -> list[Path]:
 
 def migration_files(s: ScanSettings) -> list[Path]:
     """Every migration module under the migration roots, sorted, without `__init__.py`."""
+    if s.admitted_python_files is not None:
+        roots = {root.resolve() for root in migration_roots(s)}
+        return sorted(
+            path for relative in s.admitted_python_files
+            if Path(relative).name != "__init__.py"
+            and (path := s.root / relative).parent.resolve() in roots
+            and not any(part in {"tests", "test"} for part in Path(relative).parts)
+        )
     return sorted(p for root in migration_roots(s) for p in root.glob("*.py")
-                  if p.name != "__init__.py")
+                  if p.name != "__init__.py" and not p.is_symlink()
+                  and p.resolve().is_relative_to(s.root.resolve()))
 
 
 # ── the rules ────────────────────────────────────────────────────────────────────

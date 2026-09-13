@@ -1,0 +1,959 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Repository Lens API",
+    "description": "Static analysis of one operator-configured local repository. Requests cannot select filesystem paths, run commands, load plugins, clone repositories or connect to databases. Results describe evidence and limitations.",
+    "version": "0.3.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Status"
+        ],
+        "summary": "Health",
+        "description": "Check service availability without disclosing repository details.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/capabilities": {
+      "get": {
+        "tags": [
+          "Status"
+        ],
+        "summary": "Capabilities",
+        "description": "Read the implemented scope and its limitations.",
+        "operationId": "capabilities",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitiesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "409": {
+            "description": "No completed scan, or another scan is in progress."
+          },
+          "503": {
+            "description": "Analysis dependencies unavailable or scan failed."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/analysis": {
+      "get": {
+        "tags": [
+          "Analysis"
+        ],
+        "summary": "Get Analysis",
+        "description": "Read the most recent scan held in this process; restarting clears it.",
+        "operationId": "get_analysis",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "409": {
+            "description": "No completed scan, or another scan is in progress."
+          },
+          "503": {
+            "description": "Analysis dependencies unavailable or scan failed."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Analysis"
+        ],
+        "summary": "Scan",
+        "description": "Scan the configured checkout. Incomplete results remain available with complete=false.",
+        "operationId": "scan_repository",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "409": {
+            "description": "No completed scan, or another scan is in progress."
+          },
+          "503": {
+            "description": "Analysis dependencies unavailable or scan failed."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/impact": {
+      "post": {
+        "tags": [
+          "Analysis"
+        ],
+        "summary": "Query Impact",
+        "description": "Query stored graph evidence without reading or executing target source.",
+        "operationId": "query_impact",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImpactRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImpactResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "409": {
+            "description": "No completed scan, or another scan is in progress."
+          },
+          "503": {
+            "description": "Analysis dependencies unavailable or scan failed."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/report": {
+      "get": {
+        "tags": [
+          "Analysis"
+        ],
+        "summary": "Export Report",
+        "description": "Export a bounded Mermaid/Markdown view or the full normalized SARIF findings.",
+        "operationId": "export_report",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "markdown",
+                "mermaid",
+                "sarif"
+              ],
+              "type": "string",
+              "default": "markdown",
+              "title": "Format"
+            }
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 500,
+              "default": "",
+              "title": "Query"
+            }
+          },
+          {
+            "name": "max_nodes",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 30,
+              "title": "Max Nodes"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "409": {
+            "description": "No completed scan, or another scan is in progress."
+          },
+          "503": {
+            "description": "Analysis dependencies unavailable or scan failed."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AnalysisResponse": {
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version"
+          },
+          "tool_version": {
+            "type": "string",
+            "title": "Tool Version"
+          },
+          "complete": {
+            "type": "boolean",
+            "title": "Complete",
+            "description": "Supported checks completed; does not mean vulnerability-free or fully understood."
+          },
+          "scope": {
+            "type": "string",
+            "title": "Scope"
+          },
+          "limits": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Limits"
+          },
+          "coverage": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Coverage"
+          },
+          "graph": {
+            "$ref": "#/components/schemas/GraphRecord"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/ToolStatus"
+            },
+            "type": "array",
+            "title": "Tools"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/FindingRecord"
+            },
+            "type": "array",
+            "title": "Findings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schema_version",
+          "tool_version",
+          "complete",
+          "scope",
+          "limits",
+          "coverage",
+          "graph",
+          "tools",
+          "findings"
+        ],
+        "title": "AnalysisResponse"
+      },
+      "CapabilitiesResponse": {
+        "properties": {
+          "languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Languages"
+          },
+          "frameworks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Frameworks"
+          },
+          "databases": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Databases"
+          },
+          "limits": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Limits"
+          }
+        },
+        "type": "object",
+        "required": [
+          "languages",
+          "frameworks",
+          "databases",
+          "limits"
+        ],
+        "title": "CapabilitiesResponse"
+      },
+      "Diagnostic": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "severity": {
+            "type": "string",
+            "title": "Severity"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Node Ids"
+          },
+          "evidence": {
+            "type": "string",
+            "title": "Evidence"
+          },
+          "recommendation": {
+            "type": "string",
+            "title": "Recommendation"
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "severity",
+          "message",
+          "node_ids",
+          "evidence",
+          "recommendation"
+        ],
+        "title": "Diagnostic"
+      },
+      "EdgeRecord": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "resolution": {
+            "type": "string",
+            "title": "Resolution",
+            "description": "Evidence strength, not proof of runtime execution."
+          },
+          "evidence": {
+            "type": "string",
+            "title": "Evidence"
+          },
+          "origin": {
+            "type": "string",
+            "title": "Origin"
+          },
+          "direct": {
+            "type": "boolean",
+            "title": "Direct"
+          },
+          "activation": {
+            "type": "string",
+            "title": "Activation"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "target",
+          "kind",
+          "resolution",
+          "evidence",
+          "origin",
+          "direct",
+          "activation"
+        ],
+        "title": "EdgeRecord"
+      },
+      "FindingRecord": {
+        "properties": {
+          "tool": {
+            "type": "string",
+            "title": "Tool"
+          },
+          "rule": {
+            "type": "string",
+            "title": "Rule"
+          },
+          "severity": {
+            "type": "string",
+            "title": "Severity"
+          },
+          "confidence": {
+            "type": "string",
+            "title": "Confidence"
+          },
+          "category": {
+            "type": "string",
+            "title": "Category"
+          },
+          "file": {
+            "type": "string",
+            "title": "File"
+          },
+          "line": {
+            "type": "integer",
+            "title": "Line"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "remedy": {
+            "type": "string",
+            "title": "Remedy"
+          },
+          "evidence": {
+            "type": "string",
+            "title": "Evidence"
+          },
+          "priority": {
+            "type": "string",
+            "title": "Priority"
+          },
+          "fingerprint": {
+            "type": "string",
+            "title": "Fingerprint"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "tool",
+          "rule",
+          "severity",
+          "confidence",
+          "category",
+          "file",
+          "line",
+          "message",
+          "remedy",
+          "evidence",
+          "priority",
+          "fingerprint"
+        ],
+        "title": "FindingRecord"
+      },
+      "GraphRecord": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "title": "Version"
+          },
+          "root": {
+            "type": "string",
+            "title": "Root"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/NodeRecord"
+            },
+            "type": "array",
+            "title": "Nodes"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/EdgeRecord"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array",
+            "title": "Issues"
+          }
+        },
+        "type": "object",
+        "required": [
+          "version",
+          "root",
+          "metadata",
+          "nodes",
+          "edges",
+          "issues"
+        ],
+        "title": "GraphRecord"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok",
+            "title": "Status"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "version"
+        ],
+        "title": "HealthResponse"
+      },
+      "ImpactRequest": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Query",
+            "examples": [
+              "list_items"
+            ]
+          },
+          "max_nodes": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Max Nodes",
+            "default": 30
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "ImpactRequest"
+      },
+      "ImpactResponse": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "seeds": {
+            "items": {
+              "$ref": "#/components/schemas/MatchRecord"
+            },
+            "type": "array",
+            "title": "Seeds"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/NodeRecord"
+            },
+            "type": "array",
+            "title": "Nodes"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/EdgeRecord"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array",
+            "title": "Issues"
+          },
+          "classifications": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Classifications"
+          },
+          "omitted_nodes": {
+            "type": "integer",
+            "title": "Omitted Nodes"
+          },
+          "omitted_breakdown": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Omitted Breakdown"
+          }
+        },
+        "type": "object",
+        "required": [
+          "query",
+          "seeds",
+          "nodes",
+          "edges",
+          "issues",
+          "classifications",
+          "omitted_nodes",
+          "omitted_breakdown"
+        ],
+        "title": "ImpactResponse"
+      },
+      "MatchRecord": {
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "title": "Node Id"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasons"
+          },
+          "snippets": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Snippets"
+          }
+        },
+        "type": "object",
+        "required": [
+          "node_id",
+          "score",
+          "reasons",
+          "snippets"
+        ],
+        "title": "MatchRecord"
+      },
+      "NodeRecord": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "label"
+        ],
+        "title": "NodeRecord"
+      },
+      "ScanRequest": {
+        "properties": {
+          "max_file_bytes": {
+            "type": "integer",
+            "maximum": 2000000.0,
+            "minimum": 1.0,
+            "title": "Max File Bytes",
+            "description": "Maximum source bytes per file.",
+            "default": 2000000
+          },
+          "max_files": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Max Files",
+            "description": "Maximum admitted files; truncation is reported as incomplete.",
+            "default": 10000
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ScanRequest"
+      },
+      "ToolStatus": {
+        "properties": {
+          "tool": {
+            "type": "string",
+            "title": "Tool"
+          },
+          "error": {
+            "type": "string",
+            "title": "Error"
+          },
+          "skipped": {
+            "type": "string",
+            "title": "Skipped"
+          },
+          "finding_count": {
+            "type": "integer",
+            "title": "Finding Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tool",
+          "error",
+          "skipped",
+          "finding_count"
+        ],
+        "title": "ToolStatus"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Status",
+      "description": "Service status and analysis scope."
+    },
+    {
+      "name": "Analysis",
+      "description": "Scan, inspect and export the configured repository."
+    }
+  ]
+}

@@ -151,6 +151,9 @@ class ScanSettings:
     security: SecuritySettings
     performance: PerformanceSettings
     migrations: MigrationSettings = field(default_factory=MigrationSettings)
+    # Set by the shared analysis service after bounded discovery. Not repo config.
+    admitted_python_files: tuple[str, ...] | None = None
+    max_file_bytes: int = 2_000_000
 
     def rel(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()
@@ -163,7 +166,7 @@ def _patterns(values: list[str]) -> tuple[re.Pattern[str], ...]:
     return tuple(re.compile(v) for v in values)
 
 
-def from_config(cfg: Config | None = None) -> ScanSettings:
+def from_config(cfg: Config | None = None, *, max_file_bytes: int = 2_000_000) -> ScanSettings:
     cfg = cfg if cfg is not None else load_config()
     section = merge(DEFAULTS, cfg.section("scan"))
     sec, perf, mig = section["security"], section["performance"], section["migrations"]
@@ -200,4 +203,5 @@ def from_config(cfg: Config | None = None) -> ScanSettings:
             require_rls=bool(mig["require_rls"]),
             rls_schemas=tuple(mig["rls_schemas"]),
         ),
+        max_file_bytes=max_file_bytes,
     )

@@ -17,9 +17,8 @@ callers/callees a NAVIGATION aid and blast_radius an UPPER BOUND, never proof. A
 type-resolving analysis would be exact and far slower; this is meant to be cheap
 enough to run in CI.
 
-Frontend extraction is regex-based: TypeScript needs a TS parser to do properly, and
-a Python-side regex pass is honest about being a shallow index of declarations
-rather than a call graph.
+Frontend extraction uses Tree-sitter when the stack extras are installed, with a
+legacy regex fallback. Neither path performs compiler type or runtime resolution.
 """
 from __future__ import annotations
 
@@ -62,7 +61,7 @@ def limits(s: LensSettings) -> list[str]:
     out = [
         "Call edges are NAME-based, not type-resolved: every definition sharing a "
         "callee's name is linked. Navigation aid; blast_radius is an upper bound.",
-        "Frontend records are regex-extracted declarations, not a call graph.",
+        "Frontend records use Tree-sitter when available, otherwise regex; call targets remain name-based.",
         f"tests[] is a NAME match against {s.tests_dir}/. When tests_ambiguous is true the "
         "list belongs to every function sharing the name, not this one. "
         "untested_upper_bound counts functions no test NAMES - not uncovered code.",
@@ -355,6 +354,23 @@ def _extract_frontend(s: LensSettings, path: Path, module_tags: list[str],
     rel = s.rel(path)
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
+    from ..core import javascript
+    if javascript.available():
+        facts = javascript.parse_source(text, path.suffix.lower())
+        language = "typescript" if path.suffix.lower() in {".ts", ".tsx", ".mts", ".cts"} else "javascript"
+        for symbol in facts.symbols:
+            if symbol.kind != "function":
+                continue
+            out.append({
+                "key": f"{rel}::{symbol.qualified}", "path": rel, "name": symbol.name,
+                "qualname": symbol.qualified, "language": language, "lineno": symbol.line,
+                "is_async": symbol.is_async, "is_private": symbol.name.startswith("_"),
+                "purpose": "", "feature_tags": module_tags, "layer": layer, "routes": [],
+                "callees": sorted({called.rsplit(".", 1)[-1] for owner, called, _ in facts.calls if owner == symbol.qualified}),
+                "guards": [], "postgres_tables": [], "mongo_collections": [],
+                "extraction": "tree-sitter",
+            })
+        return out
     for m in _JS_DECL_RE.finditer(text):
         name = m.group("fn") or m.group("const")
         if not name or name in seen:
