@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -82,3 +83,30 @@ class SarifTests(unittest.TestCase):
         self.doc["runs"][0]["results"][0]["ruleId"] = ["RULE1"]
         with self.assertRaises(ValueError):
             import_sarif(self.save(), self.root)
+
+
+class AnalysisSarifTests(unittest.TestCase):
+    @unittest.skipUnless(all(importlib.util.find_spec(m) for m in ("tree_sitter", "sqlglot")), "install repolens[stack]")
+    def test_a_python_file_the_checks_never_opened_is_not_a_successful_run(self):
+        from repolens.analysis import analyze
+        from repolens.core.findings import to_sarif
+        from repolens.impact.config import Config as ImpactConfig
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app").mkdir()
+            (root / "app" / "svc.py").write_text('def f(cur, x):\n    cur.execute(f"SELECT * FROM t WHERE id = {x}")\n' + "# pad\n" * 40)
+            (root / "app" / "small.py").write_text("x = 1\n")
+            settings = ImpactConfig.load(root)
+            settings.max_file_bytes = 100
+            result = analyze(root, config=settings)
+            self.assertFalse(result.complete)
+            runs = {run["tool"]["driver"]["name"]: run for run in json.loads(to_sarif(result.runs, "0"))["runs"]}
+            for name in ("repolens/security", "repolens/performance"):
+                invocation = runs[name]["invocations"][0]
+                self.assertFalse(invocation["executionSuccessful"])
+                self.assertIn("app/svc.py", invocation["toolExecutionNotifications"][0]["message"]["text"])
+                self.assertIn("results", runs[name])  # what WAS examined is still reported
+            # No migration root contains the file, so that run's claim is unchanged.
+            self.assertTrue(runs["repolens/migrations"]["invocations"][0]["executionSuccessful"])
+            self.assertEqual(next(t for t in result.to_dict()["tools"] if t["tool"] == "security")["notes"],
+                             ["app/svc.py was not examined (FILE_SKIPPED)."])

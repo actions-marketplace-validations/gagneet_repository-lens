@@ -126,7 +126,7 @@
         "description": "Query stored graph evidence without reading or executing target source.",
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"query\": \"list_items\",\n  \"max_nodes\": 30\n}",
+          "raw": "{\n  \"query\": \"list_items\",\n  \"max_nodes\": 30,\n  \"depth\": 6\n}",
           "options": {
             "raw": {
               "language": "json"
@@ -151,8 +151,8 @@
       "request": {
         "method": "GET",
         "header": [],
-        "url": "{{base_url}}/v1/report?format=mermaid&max_nodes=30",
-        "description": "Export a bounded Mermaid/Markdown view or the full normalized SARIF findings."
+        "url": "{{base_url}}/v1/report?format=mermaid&max_nodes=30&depth=6",
+        "description": "Export a bounded Mermaid/Markdown/HTML view or the full normalized SARIF findings."
       },
       "event": [
         {

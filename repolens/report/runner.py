@@ -6,8 +6,8 @@
     repolens report --update-baseline       accept today's findings as known
     repolens report --check --fail-on P1    CI: fail on a NEW finding at P1 or worse
 
-Writes `report.md` (to read), `report.json` (to query) and `report.sarif` (for GitHub code
-scanning or any SARIF viewer).
+Writes `report.md` (to read), `report.html` (a self-contained page with no scripts),
+`report.json` (to query) and `report.sarif` (for GitHub code scanning or any SARIF viewer).
 
 A tool that cannot run is SKIPPED with the reason, and a tool that crashes is an ERROR;
 neither is ever reported as zero findings, because a silent zero and a clean result read
@@ -16,6 +16,8 @@ stdout from a crashed scanner is an error, never `{}` — and a file the tool re
 could NOT scan is itself a finding. `--check` fails on an errored tool for the same
 reason: a report that could not look cannot vouch. A SKIPPED tool fails `--check` only if
 it is listed in `[report] require`, since what is installed differs between machines.
+A tool named with `--require` is an assertion by this invocation, so its being skipped,
+erroring or not selected exits 1 in EVERY mode, and refuses `--update-baseline` (exit 2).
 
 Only medium- and high-confidence findings can fail `--check`. Low-confidence ones are
 review candidates (a "hotspot", in SonarQube's terms): a gate that fails on guesses is a
@@ -31,15 +33,18 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from .. import __version__
+from ..core.html_report import render_html
 from ..config import Config, load_config, merge
 from ..core.findings import (PRIORITIES, BaselineError, Finding, ToolRun, load_baseline,
                              load_magnitudes, mark_new, sort_key, summary, to_json, to_markdown,
                              to_sarif, write_baseline)
+from ..core.git import is_modified, run_git
+from ..provenance import describe_build, tool_build
 
 DEFAULTS: dict[str, Any] = {
     "title": "repolens report",
@@ -76,6 +81,16 @@ class Skip(Exception):
 class Context:
     cfg: Config
     section: dict[str, Any]
+    _scan: Any = field(default=None, repr=False, compare=False)
+
+    def scan_settings(self) -> Any:
+        """`[scan]` settings, made once per report: security, performance and migrations
+        then share one parse cache (`ScanSettings.parse_cache`) instead of each parsing the
+        whole tree again."""
+        if self._scan is None:
+            from ..scan.settings import from_config
+            self._scan = from_config(self.cfg)
+        return self._scan
 
     @property
     def root(self) -> Path:
@@ -88,10 +103,20 @@ class Context:
         return sys.executable
 
     def executable(self, name: str) -> str:
-        """`name` on PATH, beside the venv interpreter, or in $REPOLENS_TOOLS_BIN."""
+        """`name` in $REPOLENS_TOOLS_BIN, beside the configured venv interpreter, beside the
+        interpreter running repolens, or on PATH, in that order.
+
+        The running interpreter's own bin directory matters: `python -m pip install ruff`
+        into an unactivated venv puts ruff there and nowhere on PATH, and the report then
+        called an installed tool "not installed"."""
         extra = [os.environ.get("REPOLENS_TOOLS_BIN", "")]
         if self.section["venv_python"]:
             extra.append(str((self.root / self.section["venv_python"]).parent))
+        # Not resolved: a venv's python is a symlink out of the venv, and its tools are not.
+        running = Path(sys.executable).parent
+        extra.append(str(running))
+        if os.name == "nt" and running.name.lower() != "scripts":
+            extra.append(str(running / "Scripts"))  # a base Windows install keeps tools there
         search = os.pathsep.join([p for p in extra if p] + [os.environ.get("PATH", "")])
         found = shutil.which(name, path=search)
         if not found:
@@ -120,27 +145,24 @@ def _rel(ctx: Context, path: str) -> str:
 # ── built-in tools ───────────────────────────────────────────────────────────────
 def _security(ctx: Context) -> list[Finding]:
     from ..scan import security
-    from ..scan.settings import from_config
-    return security.scan(from_config(ctx.cfg))
+    return security.scan(ctx.scan_settings())
 
 
 def _performance(ctx: Context) -> list[Finding]:
     from ..scan import performance
-    from ..scan.settings import from_config
-    return performance.scan(from_config(ctx.cfg))
+    return performance.scan(ctx.scan_settings())
 
 
 def _migrations(ctx: Context) -> list[Finding]:
     from ..scan import migrations
-    from ..scan.settings import from_config
-    return migrations.scan(from_config(ctx.cfg))
+    return migrations.scan(ctx.scan_settings())
 
 
 _FT_REMEDY = {
     "featuretrace/references-a-path-that-does-not-exist": "Fix or remove the stale path in the marker block.",
     "featuretrace/missing-data-flow": "Add a `Data flow:` line: where the data comes from and goes.",
     "featuretrace/missing-related": "Add `Related:` naming the other files in the chain.",
-    "featuretrace/missing-scope-qualifier": "State the scope: (building-scoped), (global) or (scope param: building|global).",
+    "featuretrace/missing-scope-qualifier": "State the scope qualifier the repository configures (`[featuretrace] scope_values`), e.g. (tenant-scoped) or (global).",
     "featuretrace/missing-layer-needed-for-map-generation": "Add `Layer:` so the maps can place the file.",
     "featuretrace/marker-not-near-top": "Move the marker into the first lines of the file.",
 }
@@ -556,13 +578,12 @@ def _command_runs(ctx: Context) -> list[ToolRun]:
 
 def _commit(root: Path) -> str:
     try:
-        sha = subprocess.run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
-                             capture_output=True, text=True, check=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
-                               capture_output=True, text=True).stdout.strip()
-        return sha + ("+dirty" if dirty else "")
-    except (OSError, subprocess.CalledProcessError):
+        sha = run_git(root, "rev-parse", "--short", "HEAD", check=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
         return "unknown"
+    # Not `git status`, which runs the target's clean filters; unknown is never shown as clean.
+    modified = is_modified(root)
+    return sha + ("+dirty" if modified else "" if modified is False else "+unknown")
 
 
 def main(argv: list[str] | None = None, *, config: Config | None = None, prog: str | None = None) -> int:
@@ -578,12 +599,14 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
     ap.add_argument("--update-baseline", action="store_true",
                     help="record every current finding as known")
     ap.add_argument("--require", default="",
-                    help="comma-separated tools whose being SKIPPED fails --check, added to "
-                         "[report] require (CI names the tools it installed)")
+                    help="comma-separated tools that must run: one skipped, errored or not "
+                         "selected exits 1 in every mode (and refuses --update-baseline). Also "
+                         "added to [report] require for --check (CI names the tools it installed)")
     ap.add_argument("--list-tools", action="store_true")
     ap.add_argument("--sarif", action="append", default=[], metavar="FILE",
                     help="import local SARIF 2.1.0 findings; repeat for multiple files")
     args = ap.parse_args(argv)
+    build = tool_build()  # at start-up: stamp the code that ran, not a later checkout
     if args.check and args.update_baseline:
         # Writing the baseline first makes every finding known, so the check could only pass.
         ap.error("--check with --update-baseline always passes; run them separately")
@@ -630,6 +653,17 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
         status = run.skipped and "skipped" or run.error and "ERROR" or f"{len(run.findings)} findings"
         print(f"  {name:<13} {run.seconds:6.1f}s  {status}", file=sys.stderr)
 
+    # A tool the command line requires must have RUN: skipped, errored and never selected
+    # all mean it did not look, and `ruff skipped` scrolling past a green exit was how an
+    # installed tool silently dropped out of a CI report.
+    demanded = [t for t in dict.fromkeys(args.require.split(",")) if t]
+    ran = {r.tool for r in runs if not r.skipped and not r.error}
+    unmet = [t for t in demanded if t not in ran]
+    if unmet:
+        why = {r.tool: r.skipped or r.error for r in runs}
+        for tool in unmet:
+            print(f"required tool {tool} did not run: {why.get(tool) or 'not selected'}", file=sys.stderr)
+
     suppress = section["suppress"]
     for run in runs:
         run.findings = [f for f in run.findings if f.fingerprint not in suppress]
@@ -639,6 +673,10 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
     if args.update_baseline:
         if any(run.error for run in runs):
             print("Cannot update the baseline: one or more tools failed; fix the incomplete run first.", file=sys.stderr)
+            return 2
+        if unmet:
+            print(f"Cannot update the baseline: required tool(s) did not run: {', '.join(unmet)}.",
+                  file=sys.stderr)
             return 2
         write_baseline(baseline_path, findings)
         print(f"baseline: {len(findings)} findings recorded in {baseline_path.relative_to(ctx.root)}")
@@ -651,19 +689,25 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
     mark_new(findings, baseline, load_magnitudes(baseline_path))
 
     meta = {"title": section["title"], "commit": _commit(ctx.root), "baseline": baseline is not None,
-            "tools": tools, "repolens": __version__, "suppressed": len(suppress)}
+            "tools": tools, "repolens": __version__, "suppressed": len(suppress),
+            "produced_by": describe_build(build)}
     out_dir = Path(args.out) if args.out else ctx.root / section["out_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "report.md").write_text(to_markdown(runs, meta), encoding="utf-8")
     (out_dir / "report.json").write_text(to_json(runs, meta), encoding="utf-8")
-    (out_dir / "report.sarif").write_text(to_sarif(runs, __version__), encoding="utf-8")
+    (out_dir / "report.sarif").write_text(to_sarif(runs, __version__, build=build), encoding="utf-8")
+    # The report makes no whole-analysis completeness claim: each skipped or errored tool is
+    # shown as such in its own run.
+    (out_dir / "report.html").write_text(
+        render_html(runs, title=section["title"], repository=ctx.root.name, complete=None,
+                    build=describe_build(build), baseline=baseline is not None), encoding="utf-8")
 
     s = summary(findings)
     print(f"\n{s['total']} findings: " + ", ".join(f"{p} {n}" for p, n in s["by_priority"].items())
           + (f"  ({s['new']} new)" if baseline is not None else "  (no baseline)"))
     for f in [f for f in findings if f.priority in ("P0", "P1")][:12]:
         print(f"  {f.priority} {f.severity:<8} {f.rule:<48} {f.location}")
-    print(f"\nwrote {out_dir}/report.md, report.json, report.sarif")
+    print(f"\nwrote {out_dir}/report.md, report.html, report.json, report.sarif")
 
     if args.check:
         if baseline is None:
@@ -681,8 +725,8 @@ def main(argv: list[str] | None = None, *, config: Config | None = None, prog: s
             print(f"tool(s) errored, so the report is incomplete: {', '.join(errored)}", file=sys.stderr)
         if missing:
             print(f"required tool(s) did not run: {', '.join(missing)}", file=sys.stderr)
-        return 1 if blocking or errored or missing else 0
-    return 0
+        return 1 if blocking or errored or missing or unmet else 0
+    return 1 if unmet else 0
 
 
 if __name__ == "__main__":
