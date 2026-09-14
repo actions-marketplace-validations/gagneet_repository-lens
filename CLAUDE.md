@@ -304,6 +304,15 @@ These come from the original toolkit and are configured through `repolens.toml`:
 rules each command enforces are in `repolens/rules/*.md`. `templates/` and `rules/*.md`
 ship as package data.
 
+`docs generate` (`docs/generate.py`) and `featuretrace propose` (`featuretrace/propose.py`)
+turn one `analyze()` graph into documentation and draft markers. Both group files through
+`impact/features.py` `feature_groups`, so they agree on route areas. Neither may invent a
+schema, a purpose or an owner: unresolved parts stay as listed gaps, drafts say `(draft)` or
+`TODO(repolens)`. Only `propose --apply` changes the scanned repository's files, under its hash,
+git-clean and in-root checks; both commands otherwise write under `.repolens/` in the checkout
+(excluded from the scan) or `--out`, never through a symlink, and never over a file without their
+build stamp.
+
 ## Documentation conventions
 Docs are deliberately conservative. Capabilities not backed by an implementation and a
 regression test belong in `docs/roadmap.md`, not the README. Known open issues and pending
