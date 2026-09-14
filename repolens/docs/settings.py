@@ -9,6 +9,10 @@ from typing import Any
 
 from ..config import Config, load_config, merge
 
+#: Opens every JSDoc block `repolens featuretrace propose --jsdoc` drafts. Always a placeholder, even when
+#: a repository lists its own patterns: `merge` replaces lists, and `repolens init` writes an empty one.
+REPOLENS_PLACEHOLDER = r"TODO\(repolens\)"
+
 DEFAULTS: dict[str, Any] = {
     # Where the coverage count looks. JavaScript is opt-in: a repository says which of its
     # directories are source rather than build output or vendored bundles.
@@ -33,6 +37,8 @@ DEFAULTS: dict[str, Any] = {
     # Regexes. A docstring matching one is boilerplate and counts as MISSING: a generated
     # "Function header" placeholder is not documentation, and counting it as such would
     # let the number rise while nothing a reader can use was written.
+    # `TODO(repolens)` (`REPOLENS_PLACEHOLDER`) is added to whatever this lists: it opens every JSDoc
+    # block `repolens featuretrace propose --jsdoc` drafts, whose purpose is still unwritten.
     "placeholder_patterns": [],
     "baseline": ".repolens/docstring_baseline.json",
     "command": "repolens docs coverage",
@@ -126,7 +132,7 @@ def from_config(cfg: Config | None = None) -> DocsSettings:
         include_private=bool(d["include_private"]),
         count_modules=bool(d["count_modules"]),
         javascript_kinds=frozenset(d["javascript_kinds"]),
-        placeholders=tuple(re.compile(p) for p in d["placeholder_patterns"]),
+        placeholders=tuple(re.compile(p) for p in dict.fromkeys([*d["placeholder_patterns"], REPOLENS_PLACEHOLDER])),
         baseline=root / d["baseline"],
         command=str(d["command"]),
         out_dir=root / d["out_dir"],

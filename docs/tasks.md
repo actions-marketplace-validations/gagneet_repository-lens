@@ -30,12 +30,12 @@ are wanted but not planned for this branch belong in [`roadmap.md`](roadmap.md),
 **Source of the evidence.** The analysis comes from adversarial audits. Each audit built
 small temporary repositories (probes) that reproduce a behaviour and ran the scanner on them.
 Performance figures come from profiling a full `repolens analyze` of a large Python and
-Next.js monorepo, with about 2,300 Python files and 900 JS/TS files, checked out read-only.
+Next.js monorepo, with about 2,400 Python files and 930 JS/TS files, checked out read-only.
 The evaluation targets are deliberately not named.
 
 ## Index
 
-43 open tasks on 2026-09-14: 3 decision, 35 open, 2 in progress, 3 deferred. 79 items are in the Resolved table.
+49 open tasks on 2026-09-14: 3 decision, 41 open, 2 in progress, 3 deferred. 84 items are in the Resolved table.
 
 | ID | Task | Status | Severity |
 |---|---|---|---|
@@ -54,6 +54,7 @@ The evaluation targets are deliberately not named.
 | [JS-25](#js-25--two-sql-rebuilding-shapes-are-still-quadratic) | Two SQL-rebuilding shapes are still quadratic | open | low–medium |
 | [JS-27](#js-27--unmodelled-route-downgrades-are-repository-wide) | Unmodelled-route downgrades are repository-wide | open | low–medium |
 | [JS-28](#js-28--poolqueryformat-s-x-is-not-seen-as-sql) | `pool.query(format('… %s', x))` is not seen as SQL | open | low |
+| [JS-31](#js-31--defines-misses-object-literal-members-and-wrapped-callbacks) | `DEFINES` misses object-literal members and wrapped callbacks | open | low |
 | [JS-21](#js-21--known-misses-nuxt-angular-private-fields-hono-base-paths) | Known misses: Nuxt, Angular private fields, Hono base paths | deferred | low |
 | [JS-22](#js-22--grammar-gaps-make-an-analysis-incomplete) | Grammar gaps make an analysis incomplete | deferred | medium |
 | [JS-23](#js-23--claimed-behaviour-without-tests) | Claimed behaviour without tests | open | low |
@@ -75,11 +76,16 @@ The evaluation targets are deliberately not named.
 | [PERF-06](#perf-06--python-files-parsed-twice) | Python files parsed twice | open | low |
 | [DOC-02](#doc-02--a-dated-audit-document-for-this-pass) | A dated audit document for this pass | open | low |
 | [DOC-03](#doc-03--verify-the-skipped-test-statement-in-claudemd) | Verify the skipped-test statement in CLAUDE.md | open | low |
+| [DOC-06](#doc-06--generated-openapi-has-no-request-or-response-shapes-for-jsts-routes) | Generated OpenAPI has no request or response shapes for JS/TS routes | open | medium |
+| [DOC-07](#doc-07--the-generated-er-diagram-leaves-out-orm-declared-columns) | The generated ER diagram leaves out ORM-declared columns | open | low |
+| [DOC-08](#doc-08--generated-openapi-hides-any-method-routes-and-the-er-diagram-keeps-dropped-constraints) | Generated OpenAPI hides any-method routes, and the ER diagram keeps dropped constraints | open | low–medium |
 | [TEST-01](#test-01--wall-clock-limits-in-tests-can-flake-under-load) | Wall-clock limits in tests can flake under load | open | low |
 | [PY-01](#py-01--any-file-or-folder-named-like-a-package-makes-its-imports-local) | Any file or folder named like a package makes its imports local | open | low–medium |
 | [FT-01](#ft-01--featuretrace-maps-match-basenames-by-substring) | FeatureTrace maps match basenames by substring | open | medium |
 | [FT-02](#ft-02--an-untracked-related-target-is-called-nonexistent) | An untracked `Related:` target is called nonexistent | open | low |
 | [FT-03](#ft-03--cross-tag-related-references-are-listed-but-never-drawn) | Cross-tag `Related:` references are listed but never drawn | decision | low |
+| [FT-05](#ft-05--proposed-markers-skip-scope-qualifiers-cjs-and-schema-files) | Proposed markers skip scope qualifiers, `.cjs` and schema files | open | low |
+| [FT-06](#ft-06--code-a-page-calls-directly-belongs-to-no-feature-group) | Code a page calls directly belongs to no feature group | open | low–medium |
 | [REL-08](#rel-08--continuous-integration-for-this-repository) | Continuous integration for this repository | open | medium |
 | [REL-09](#rel-09--repolens-vendor-verify) | `repolens vendor verify` | open | low |
 
@@ -107,18 +113,51 @@ same real syntax error in an archived script (`PYTHON_PARSE_ERROR`).
 What the run showed, and the task each observation maps to:
 - A request wrapper `` `${origin}/api${url}` `` matched every one of 782 handlers under `/api`,
   and edges went to an arbitrary 12 of them (JS-24).
-- 864 of 1,084 calls took their base URL from the single-base fallback, and 865 come from a
-  client the scanner did not trace, mostly one handed over by a hook (JS-08, JS-10).
+- 864 of 1,084 calls (865 of 998 after) came from a client `api` the scanner did not trace, and
+  all of them took their base URL from the single-base fallback; 815 of the 865 are in files that
+  take `api` from a hook (JS-08, JS-10).
 - A vendored copy of an analysis tool, tests included, is scanned as target code. Its SQL test
   fixtures created 11 tables such as `schema.mv` and `schema.v` (SQL-21).
 - 38 tables came only from a generated artifact's list of unvalidated names (`schema.view`,
   `schema.fact_`, `schema.generate`) (SQL-22).
-- 403 `performance/unbounded-sql-fetch` findings, many of them grouped aggregates (SCAN-01).
+- 403 `performance/unbounded-sql-fetch` findings; 57 were grouped aggregates, which SCAN-01 no
+  longer reports (403 → 346, the whole P3 drop; the JS/TS fixes changed no finding count).
 - 17,926 of 20,554 diagnostics are info-level `AMBIGUOUS_CALL`, and the whole graph is written
   to `analysis.json` (OUT-09).
 - Not exercised: no JS/TS code splices values into SQL (`SQL_INJECTION_RISK` 0 in both runs), so
   JS-25/JS-28 found nothing; there is no Prisma schema and only two tracked `.sql` files, so
   `SQL_UNKNOWN_COLUMN` had almost no catalog to check against.
+
+`repolens docs generate` on the same checkout, writing only to a scratch directory; the target's
+`git status` was unchanged after every run, and every run was incomplete for the same parse error.
+The final run is of the code in this change (DOC-05).
+
+| Measure | First draft | Final |
+|---|---|---|
+| OpenAPI operations | 1,586 (scanned handlers only) | 2,693 (1,501 scanned, 1,107 artifact-declared, 85 both); 0 errors from `openapi-spec-validator` |
+| Unserved calls listed | 1,123 (artifact routes and matched placeholders counted as unserved) | 0 (the one request wrapper too open to link is now "open") |
+| Stores per operation, median / p90 / max | 9 / 15 / 36 (probable and ambiguous calls followed) | 3 / 7 / 17 (exact, high and declared only) |
+| ER diagram | 150 entities, 0 relationships (the cap spent on MongoDB collections) | 150 entities, 44 relationships; 382 stores listed but not drawn (311 MongoDB, 71 PostgreSQL) |
+| Architecture map | parsed by Mermaid | 500 edges hit Mermaid's limit and failed to parse; capped at 450, 118 edges counted in a comment |
+| Feature groups / largest mindmap | 496 / 31,459 characters | 496 / 9,012 characters (25 leaves per section) |
+| Diagrams parsed by Mermaid 11 | not checked | 500 of 500 |
+| Run time, peak memory | 285.6 s, 1.3 GB | 116 s, 1.3 GB |
+
+`repolens featuretrace propose --jsdoc --owners` on the same checkout, drafting only (no `--apply`),
+writing to a scratch directory; the target's `git status` was unchanged. The final run is of the
+code in this change (FT-04).
+
+| Measure | First draft | Final |
+|---|---|---|
+| Markers proposed | 272 | 371 (frontend 277, router 61, service 28, model 5) |
+| Stores per marker, median / p90 / max | 14 / 48 / 83 (the whole group's stores) | 0 / 7 / 16 (the file's own) |
+| `Related:` entries | always 8 | at most 8; 169 markers say `Related: none found (draft)` |
+| Files left alone | 477, 114 of them wrongly as generated (`* @generated FunctionHeader`) | 289: 288 already carry a marker, 1 outside `[featuretrace] scan_dirs` |
+| Routes with no static caller | described as called by "HTTP client" | 32, saying "no static caller found" |
+| Predicted audit issues | not recorded | 367 drafts lack the scope qualifier this repository's audit requires (FT-05); 1 names a value that is not a store identifier |
+| JSDoc blocks | 0 | 0 (no exported JS/TS route handler or data-access function without one) |
+| Owners draft | 1.8 MB | 0.5 MB (at most 10 consumers per concept) |
+| Exit code, run time, peak memory | 0, 139 s | 2 (incomplete analysis; proposal still written), 120 s, 1.3 GB |
 
 ---
 
@@ -328,6 +367,17 @@ are fixed with tests except where JS-25 to JS-28 below say otherwise. The field 
 - **Required:** rebuild `format(literal, …)` arguments the way template literals are rebuilt,
   with `%s` as a spliced value and `%I`/`%L` as quoted parameters; test both.
 - **Why:** a missed injection shape in a security check.
+
+### JS-31 — `DEFINES` misses object-literal members and wrapped callbacks
+- **Status:** open · **Severity:** low
+- **Analysis:** found by the audit of JS-30. A handler object defined inside a component
+  (`const handlers = { go: () => fetch("/api/go") }`, qualified `Page.handlers.go`) gets no
+  `DEFINES` edge, because `Page.handlers` is not a symbol, so feature groups do not see that
+  page's call. `onClick={handle(() => save())}` records the role `handle` (the call that
+  receives the arrow) instead of the JSX attribute `onClick`.
+- **Required fix:** link a nested function to the nearest enclosing symbol by walking up its
+  qualified name, and prefer an enclosing `jsx_attribute` name over a wrapping call's.
+- **Why:** the page-to-API calls feature groups report miss handlers written this way.
 
 ### JS-21 — Known misses: Nuxt, Angular private fields, Hono base paths
 - **Status:** deferred · **Severity:** low
@@ -606,6 +656,52 @@ profiled, 5 min 23 s unprofiled, before the import-resolution fix.
 
 ---
 
+### DOC-06 — Generated OpenAPI has no request or response shapes for JS/TS routes
+- **Status:** open · **Severity:** medium
+- **Analysis:** `repolens docs generate` names declared FastAPI models and lists every other
+  request body and response schema in `x-repolens-gaps`. A Next.js or Express handler that
+  validates with a zod schema, types its body with a TypeScript interface, or returns
+  `Response.json({ ... })` with a literal object has a shape the source states, and the
+  generated contract still says it is unknown.
+- **Required fix:** read literal zod schemas bound in the handler's file (`z.object({...})`
+  passed to `.parse`/`.safeParse` on `request.json()`), and object literals returned through
+  `Response.json`/`NextResponse.json`, into OpenAPI schemas marked with their evidence. Leave a
+  gap wherever the shape comes from a type the scanner cannot resolve without a compiler.
+- **Why:** request and response shapes are the part of an API contract a reader of an
+  undocumented application most needs, and a gap for a shape written in the same file
+  understates what static evidence can show.
+
+### DOC-07 — The generated ER diagram leaves out ORM-declared columns
+- **Status:** open · **Severity:** low
+- **Analysis:** `schema.mmd` draws columns from scanned SQL DDL and PostgreSQL Prisma models.
+  Tables declared through Drizzle, TypeORM, Sequelize or SQLAlchemy models appear with
+  `%% columns not resolved`, although those declarations name their columns. Prisma schema
+  selection in the generator also counts every non-test `.prisma` file when all providers are
+  PostgreSQL, instead of the per-package rule `columns.check_columns` uses.
+- **Required fix:** record declared columns (and relations) on the store facts the JS/TS and
+  Python extractors already build, and draw them; reuse the column check's per-package Prisma
+  selection.
+- **Why:** an application built on an ORM without raw DDL gets an entity list with no columns.
+
+### DOC-08 — Generated OpenAPI hides any-method routes, and the ER diagram keeps dropped constraints
+- **Status:** open · **Severity:** low–medium
+- **Analysis:** found by the audit of `docs generate`.
+  - A Pages Router API route (`pages/api/items.ts`) answers every method, so `openapi.json`
+    puts it under the path-item extension `x-repolens-any-method`. The document validates
+    against the OpenAPI 3.1 schema, but Swagger UI, Redoc and client generators ignore `x-`
+    keys, so real served routes are invisible there while `index.md` counts them.
+  - `schema.mmd` applies `DROP TABLE`, `DROP COLUMN`, `RENAME` and `SET`/`DROP NOT NULL` in path
+    order, but not `DROP CONSTRAINT`: a constraint's name does not say which foreign key it was.
+  - `REFERENCES public.orders` creates a `public.orders` store separate from `orders`, so the
+    diagram can show an orphan table.
+- **Required fix:** read the handler's `req.method` checks (`if (req.method !== "POST")`,
+  `switch (req.method)`) into real operations, and keep `x-repolens-any-method` only when none
+  is found. Record constraint names with the foreign keys they declare so a later drop removes
+  the right one. Resolve a `public.` qualifier to the bare name when no `search_path` change is
+  in the scanned SQL.
+- **Why:** documentation a standard viewer cannot show, or a relationship the schema no longer
+  has, misleads the reader it was generated for.
+
 ## 8. Checks, FeatureTrace, Python imports and release tooling
 
 Tasks from the verification of the open GitHub issues (#6, #8, #10, #13, #14, #15) and
@@ -636,6 +732,11 @@ the mount investigation on the large evaluation repository.
 - **Required:** match a whole relative path first, then a basename on path-segment and word
   boundaries; refuse an ambiguous basename with an audit note. Add render tests.
 - **Why:** wrong edges in committed maps mislead the reader the map exists for.
+- **Progress (2026-09-14):** the `Related:` half is fixed: an entry binds its exact path first,
+  then a unique path ending in it, and an ambiguous basename binds nothing; reference paths keep
+  Next.js segments such as `[id]` and `(group)`
+  (`RelatedReferenceTests.test_a_related_entry_binds_its_whole_path_before_a_basename`).
+  `Data flow:` steps in `render.py` still match by substring.
 
 ### FT-02 — An untracked `Related:` target is called nonexistent
 - **Status:** open · **Severity:** low
@@ -654,6 +755,29 @@ the mount investigation on the large evaluation repository.
 - **Required:** the maintainer decides between drawing external stub nodes in per-tag maps
   and emitting a distinct advisory. Then add tests.
 - **Why:** a map that silently drops declared links under-reports a feature's reach.
+
+### FT-05 — Proposed markers skip scope qualifiers, `.cjs` and schema files
+- **Status:** open · **Severity:** low
+- **Analysis:** `repolens featuretrace propose` drafts no scope qualifier, so in a repository
+  that sets `[featuretrace.audit] scope_values` every applied marker is weak until someone adds
+  one. It drafts nothing for `.cjs` files or for `.sql`/`.prisma` model files, which can carry a
+  marker in a comment, and its bounds (`Related:` length, the minified-line length) are
+  constants rather than `[featuretrace.propose]` settings.
+- **Required fix:** draft the qualifier as a placeholder the audit still reports, add `.cjs`,
+  `.sql` (`--`) and `.prisma` (`//`) comment syntax, and read the bounds from settings.
+- **Why:** the proposal should pass the audit a repository has actually configured.
+
+### FT-06 — Code a page calls directly belongs to no feature group
+- **Status:** open · **Severity:** low–medium
+- **Analysis:** found by the audit of `featuretrace propose`. `features.feature_groups` adds
+  code reached from an endpoint's handler, and a page's component file, but not modules the
+  page component itself calls: a Next.js server component or server action that imports
+  `lib/orders.ts` and queries the database without an API route. Such a module is in no group,
+  so it gets no marker, no JSDoc and no place in the generated feature page.
+- **Required fix:** walk confident calls from each page component as the handler walk does, and
+  add the reached files and stores to the page's group at the `service`/`model` layer.
+- **Why:** App Router applications often read data in server components, so the most important
+  data-access code of a page can be invisible to both commands.
 
 ### REL-08 — Continuous integration for this repository
 - **Status:** open · **Severity:** medium
@@ -764,3 +888,8 @@ Implemented and covered by tests during this audit pass (verified together under
 | JS-26 Common route registration shapes were not recognised | `chained_route` records `.route(path).<verb>()` chains and hapi/Fastify `.route({ method, path, handler })` objects (`url` for `path`, `options` or `config` for `handler`) on a router-named receiver or in a file importing a server framework; `route_shape` counts a router-named parameter given a handler by reference. All are unmodelled routes. | `UnmodelledRouteEvidenceTests.test_route_chains_route_objects_and_parameter_routers_are_unmodelled_routes` (4 shapes, 3 look-alikes) |
 | SQL-21 Pattern-only store references in test code created stores | Found in the field evaluation: a vendored tool's SQL test fixtures created 11 tables. Regex store matches in `is_test_path` files are recorded on `ScanState.test_store_references` and linked by `_link_test_store_references` (after every other pass, before `mark_unverified_stores`) only to stores other evidence created. | `tests/test_schema_references.py` `TestCodeAndArtifactStoreTests.test_a_pattern_match_in_test_code_links_only_to_a_store_found_elsewhere` |
 | SQL-22 Unvalidated artifact table names became tables | Found in the field evaluation: 38 tables (`schema.view`, `schema.fact_`) came only from the router/datastore artifact's `postgres_unverified_refs`. Such a name now links only to a table the scan found by more than a pattern match; the rest are listed in one `ARTIFACT_STORE_UNCONFIRMED` (info). | `TestCodeAndArtifactStoreTests.test_unvalidated_artifact_names_link_only_to_tables_the_scan_found` |
+| JS-29 Route parameter names were discarded | Endpoint and page nodes carry `path` (OpenAPI spelling with source names: `[orderId]`, `[...slug]`, `:id`, `{file_path:path}`, `:id{[0-9]+}`, `:from-:to` become `{orderId}`, `{slug}`, `{id}`, `{file_path}`, `{id}`, `{from}-{to}`) and `parameters`, for Next.js App and Pages Router, listening JS servers, FastAPI mount prefixes and artifact routes. `route`, ids and matching are unchanged; the first spelling read (the walk reads a directory's files before its subdirectories) keeps its names (`state.route_path_and_parameters`, `state.route_metadata`). | `tests/test_route_parameters.py` `RoutePathTests`, `EndpointPathTests`, `FastApiPathTests`, `ExampleApplicationTests.test_the_order_route_is_documented_with_its_parameter_name` |
+| JS-30 Page views missed API calls inside inline callbacks | A `DEFINES` edge (cost 2) runs from a JS/TS function or class to each function defined inside it, and an anonymous callback records `lexical_role` (`onClick`, `onSubmit`, `then`). Feature groups follow it from a page component to the calls its callbacks make; `impact()` walks it only from the inner function outwards, so a matched callback does not pull in its siblings (a page with 65 helpers keeps the page in the endpoint's view). Liveness and gap checks do not read the edge. Remaining misses: JS-31. | `ExampleApplicationTests.test_functions_and_inline_callbacks_are_defined_by_their_component`; `DefinesTraversalTests.test_an_endpoint_view_reaches_the_page_not_the_siblings_of_its_callback`; `tests/test_features.py` `test_a_page_calls_another_area_through_an_inline_callback` |
+| SQL-23 SQL foreign keys drew no relationship | `postgres._foreign_keys` adds a `REFERENCES` edge (exact, sqlglot) for `REFERENCES`/`FOREIGN KEY` in `CREATE TABLE`/`ALTER TABLE`, as `python_scan` does for SQLAlchemy; DDL in test paths adds none. | `tests/test_route_parameters.py` `ForeignKeyTests`; `tests/test_docs_generate.py` `test_schema_draws_declared_columns_relationships_and_collections` |
+| DOC-05 No documentation for the scanned application | `repolens docs generate` (`docs/generate.py`) writes OpenAPI 3.1 for the application's routes with gaps listed in `x-repolens-gaps`, a Mermaid ER diagram, an architecture flowchart, a mindmap page and context pack per route area (`impact/features.py`), and an index with completeness. Unserved calls stay out of `paths`. Calls from test code are not callers and form no group. The ER diagram applies SQL files in path order (drops, renames, nullability). It exits 2 when incomplete, never writes through a symlink, and never replaces or deletes an output-directory file without its build stamp in the place it writes one. `repolens api export` still documents only Repository Lens's own API. The outputs of the example application validate with `openapi-spec-validator` (OpenAPI 3.1) and every diagram parses with Mermaid 11 (checked by hand in the audit, not in the suite). Open: DOC-06, DOC-07, DOC-08. | `tests/test_docs_generate.py` `ExampleAppDocsTests`, `MermaidLabelTests`, `StoreReachTests`, `CommandBoundaryTests` (including `test_a_file_that_only_quotes_the_stamp_is_not_its_output`, `test_it_never_writes_through_a_symlink`, `test_the_schema_is_what_the_migrations_leave`, `test_a_mindmap_section_is_capped`); `tests/test_features.py` |
+| FT-04 FeatureTrace could not bootstrap an undocumented repository | `repolens featuretrace propose` drafts markers as `proposal.patch` and `proposal.json`, with the issues the audit would report recorded per draft. `--apply` writes the saved, reviewed proposal (never a new draft) under hash, edited-patch, git-clean (literal pathspecs) and root checks, and preserves BOM, line endings, encoding declarations and directives. `--jsdoc` drafts fact-only JSDoc opening with `TODO(repolens)`, which is always a `[docs] placeholder_patterns` entry. `--owners` writes a bounded capability-index draft to the proposal directory only. The output directory refuses symlinks and unstamped files. The audit's description now says it checks structure and references, not that a declared flow matches the code. Remaining: FT-05, FT-01 (data-flow half), JS-31. | `tests/test_featuretrace_propose.py`: `ProposeTests` (23), `PlacementTests` (6), `PlaceholderSettingTests`, `RelatedReferenceTests` (3), `EvidenceRuleTests` (3), `GeneratedHeaderTests`, `FileEvidenceTests` (6); including `test_apply_writes_the_reviewed_proposal_not_a_new_draft`, `test_applied_markers_pass_the_audit_and_render_maps` |

@@ -75,6 +75,11 @@ The focused stack currently provides:
   per-file failure diagnostics, and explicit incomplete status.
 - Mermaid/Markdown/HTML/JSON/SARIF reports, SARIF import, a trusted extractor entry-point
   contract, and a loopback FastAPI API with generated OpenAPI and Postman contracts.
+- Documentation drafted from the evidence graph for the scanned application: OpenAPI with
+  gaps kept, an ER diagram from declared DDL and Prisma, architecture and per-area mindmaps
+  with context packs (`docs generate`), and draft FeatureTrace markers, JSDoc and a
+  capability-index draft as a reviewable patch (`featuretrace propose`). Request/response
+  shapes from zod or TypeScript types, ORM-declared columns and MongoDB fields are future work.
 
 ## Priority order
 

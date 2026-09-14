@@ -12,6 +12,7 @@ from .core.console import utf8_console
 COMMANDS: dict[str, tuple[str, str]] = {
     "featuretrace map": ("repolens.featuretrace.maps", "generate FeatureTrace maps; --check gates staleness"),
     "featuretrace audit": ("repolens.featuretrace.audit", "audit marker quality; --check is the ratchet"),
+    "featuretrace propose": ("repolens.featuretrace.propose", "draft markers from the evidence graph as a patch; --apply writes them"),
     "lens": ("repolens.lens.build", "build the function index; --lookup NAME; --check gates staleness"),
     "lens similar": ("repolens.lens.similar", "search the index by behaviour before writing a helper"),
     "owners": ("repolens.owners.registry", "check the capability index; --impact; --check"),
@@ -22,6 +23,7 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "gates": ("repolens.gates.reachability", "every validation script is run by something, and can fail"),
     "docs coverage": ("repolens.docs.coverage", "docstring coverage of public symbols; --check is a ratchet"),
     "docs build": ("repolens.docs.build", "code-reference HTML: pdoc (Python) and TypeDoc (TypeScript)"),
+    "docs generate": ("repolens.docs.generate", "OpenAPI, schema, architecture and feature maps generated from the evidence graph"),
     "report": ("repolens.report.runner", "run every tool: one prioritised findings report (md, json, sarif)"),
     "analyze": ("repolens.analysis", "static stack analysis: JSON, Mermaid, Markdown and SARIF"),
     "serve": ("repolens.api.cli", "serve a configured local repository with Swagger and a bearer token"),

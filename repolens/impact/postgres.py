@@ -6,6 +6,7 @@ import logging
 import re
 from typing import Iterator
 
+from ..core.files import is_test_path
 from .model import Edge, Graph, Issue, Node, stable_id
 
 
@@ -855,6 +856,8 @@ def add_sql(graph: Graph, source: str, sql: str, location: str, *, dynamic: bool
                           if not isinstance(table.parent, exp.Lock) and (name := _table_name(table))]
                 understood = True
             record_statement(graph, source, location, expression)
+            if isinstance(expression, (exp.Create, exp.Alter)):
+                _foreign_keys(graph, expression, location)
             if not tables and not understood:
                 # A bare expression (`FOOBAR orders` parses as an alias) is not a
                 # statement; `TABLE users` and `CHECKPOINT` are.
@@ -871,6 +874,37 @@ def add_sql(graph: Graph, source: str, sql: str, location: str, *, dynamic: bool
                 tables = recovered
             found.extend(tables)
     _emit(graph, source, location, _group(found))
+
+
+def _foreign_keys(graph: Graph, expression, location: str) -> None:
+    """`REFERENCES` edges from a table to each table its `CREATE TABLE`/`ALTER TABLE` foreign keys name.
+
+    The same edge the Python reader records for SQLAlchemy foreign keys. DDL in test code or
+    fixtures declares nothing, so it adds no edge. A failure here only loses the edge: it is
+    never the statement's parse error."""
+    from sqlglot import exp
+    if is_test_path(re.sub(r":\d+(?::\d+)?$", "", location)):
+        return
+    try:
+        if str(expression.args.get("kind") or "").upper() != "TABLE":
+            return
+        declaring = _target(expression)
+        name = _table_name(declaring) if declaring is not None else None
+        if not name:
+            return
+        for reference in expression.find_all(exp.Reference):
+            table = reference.this.this if isinstance(reference.this, exp.Schema) else reference.this
+            referenced = _table_name(table) if isinstance(table, exp.Table) else None
+            if not referenced:
+                continue
+            ids = []
+            for store in (name, referenced):
+                ids.append(stable_id("postgres_table", store))
+                graph.add_node(Node(ids[-1], "postgres_table", store,
+                                    metadata={"store": store, "dialect": "postgres", "catalog_verified": False}))
+            graph.add_edge(Edge(ids[0], ids[1], "REFERENCES", "exact", location, origin="sqlglot", detail="foreign key"))
+    except Exception:  # noqa: BLE001 - advisory
+        return
 
 
 def _group(tables: list[tuple[str, str]]) -> dict[str, set[str]]:

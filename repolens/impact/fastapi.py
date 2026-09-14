@@ -16,7 +16,7 @@ from typing import Iterator
 
 from ..scan.python_ast import annotated_aliases, dotted, functions, keyword_value, last, module_level
 from .model import Edge, Issue, Node
-from .state import with_api_prefix, PendingCall, ScanState, _endpoint_id, _symbol_id, normalise_route
+from .state import with_api_prefix, PendingCall, ScanState, _endpoint_id, _symbol_id, normalise_route, route_metadata
 
 _HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"})
 _BASE_CONSTRUCTORS = frozenset({"APIRouter", "FastAPI"})
@@ -641,12 +641,14 @@ class _FastAPI:
         for prefix, inherited in variants:
             dependencies = (*inherited, *route_dependencies)
             names = list(dict.fromkeys(d.name.rsplit(".", 1)[-1] for d in dependencies))
-            route = normalise_route(with_api_prefix(self.state, prefix + declared))
+            spelled = with_api_prefix(self.state, prefix + declared)
+            route = normalise_route(spelled)
             for method in methods:
                 endpoint = _endpoint_id(method, route)
                 self.graph.add_node(Node(endpoint, "endpoint", f"{method} {route}", path=path, line=call.lineno,
                                          language="python", metadata={"method": method, "route": route,
-                                                                     "framework": "fastapi", "dependencies": names}))
+                                                                     "framework": "fastapi", "dependencies": names,
+                                                                     **route_metadata(self.graph, endpoint, spelled)}))
                 self.graph.add_edge(Edge(endpoint, symbol, "HANDLES_API", "exact" if receiver else "probable",
                                          evidence, origin="python_ast",
                                          detail="Static router mount; runtime registration not executed"))

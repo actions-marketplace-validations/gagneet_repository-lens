@@ -56,7 +56,8 @@ deployment_detection = true
 [docs]
 python_roots = @@PYTHON_ROOTS@@
 javascript_roots = @@JS_ROOTS@@
-# Regexes for generated boilerplate that must count as undocumented.
+# Regexes for generated boilerplate that must count as undocumented. `TODO\(repolens\)`, which
+# opens JSDoc drafted by `repolens featuretrace propose --jsdoc`, is always included.
 placeholder_patterns = []
 
 [docs.python]
