@@ -14,6 +14,7 @@ import stat
 
 @dataclass(frozen=True)
 class SourceRead:
+    """One bounded read: the text when `status` is "read", otherwise None and why (too_large, binary, ...)."""
     text: str | None
     status: str
     size: int = 0
@@ -51,7 +52,9 @@ def read_source(root: Path, path: Path, max_bytes: int) -> SourceRead:
             return SourceRead(None, "too_large", len(raw))
         if b"\0" in raw:
             return SourceRead(None, "binary", len(raw))
-        return SourceRead(raw.decode("utf-8"), "read", len(raw))
+        # `utf-8-sig`: a leading byte-order mark is valid in Python and JS sources, and
+        # left in place it is a parse error on line 1 that marks the whole scan incomplete.
+        return SourceRead(raw.decode("utf-8-sig"), "read", len(raw))
     except UnicodeDecodeError:
         return SourceRead(None, "invalid_utf8", len(raw))
     except (OSError, ValueError, RuntimeError):

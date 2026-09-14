@@ -1,3 +1,4 @@
+"""Seed search and bounded, cost-weighted impact traversal over a scanned graph."""
 from __future__ import annotations
 
 import heapq
@@ -14,6 +15,7 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 
 @dataclass(slots=True)
 class Match:
+    """A search seed: a node, its relevance score, why it matched and source-line snippets."""
     node_id: str
     score: float
     reasons: list[str] = field(default_factory=list)
@@ -22,6 +24,11 @@ class Match:
 
 @dataclass(slots=True)
 class ImpactResult:
+    """The bounded subgraph `impact()` returns for one query.
+
+    `classifications` maps each selected node to query match, required review, review
+    recommended or similar candidate. `omitted_breakdown` groups what the node, per-file
+    and per-layer budgets or hub collapsing left out, so a cut result is never silent."""
     query: str
     seeds: list[Match]
     nodes: dict[str, Node]
@@ -88,9 +95,22 @@ def _expand_aliases(query: str, config: Config) -> set[str]:
 
 
 def search(graph: Graph, root: Path, query: str, config: Config, limit: int = 12, *, search_source: bool = True) -> list[Match]:
+    """The `limit` best nodes for `query` and its configured aliases, highest score first.
+
+    Scores come from node labels, paths and metadata and, when `search_source` is true,
+    from the text of file nodes read from `root`. A query that exactly names a table or
+    collection keeps only phrase or exact matches, not nodes sharing one of its words."""
     terms = _expand_aliases(query, config)
     tokens = set().union(*(set(term.split()) for term in terms))
     matches: dict[str, Match] = {}
+    # A query that IS a table or collection name asks about that store. Nodes that
+    # merely share one of its words (`order_items` -> every "order" and "items" symbol)
+    # took the remaining seed slots, and traversal from them crowded out the store's
+    # own service -> handler -> endpoint chain. Phrase and exact matches still seed.
+    wanted = query.strip().casefold()
+    exact_store = bool(wanted) and any(
+        node.kind in {"postgres_table", "mongo_collection"} and node.label.casefold() == wanted
+        for node in graph.nodes.values())
 
     for node in graph.nodes.values():
         label = _normalise(node.label)
@@ -115,6 +135,8 @@ def search(graph: Graph, root: Path, query: str, config: Config, limit: int = 12
                 score += 16.0
                 reasons.append("metadata contains phrase")
         haystack_tokens = set((label + " " + path + " " + metadata).split())
+        if exact_store and not reasons:
+            continue
         score += 4.0 * len(tokens & haystack_tokens)
         if score:
             matches[node.id] = Match(node.id, score, sorted(set(reasons)))
@@ -145,6 +167,8 @@ def search(graph: Graph, root: Path, query: str, config: Config, limit: int = 12
                     safe = re.sub(r"(?i)(password|secret|token|api[_-]?key)\s*[:=]\s*\S+", r"\1=<redacted>", line.strip())
                     snippets.append(f"{node.path}:{number}: {safe[:220]}")
             token_hits += len(tokens & set(_normalise(line).split()))
+        if exact_store and not exact_hits:
+            continue  # token-only source text; see `exact_store` above
         if exact_hits or token_hits:
             entry = matches.setdefault(node.id, Match(node.id, 0.0))
             entry.score += min(36.0, exact_hits * 8.0) + min(12.0, token_hits * 0.2)
@@ -159,8 +183,8 @@ def search(graph: Graph, root: Path, query: str, config: Config, limit: int = 12
 # Traversal was a plain FIFO BFS whose per-node neighbour sort fell through to the
 # node LABEL. That is truncation, not ranking: once a hub file is dequeued its
 # hundreds of CONTAINS neighbours flood the budget in alphabetical order, so a query
-# for "expenditure volatility" returned `AGMCreate`, `AmenityBookingCreate`,
-# `AnnualBudgetCreate`… and omitted 830 nodes including the four files that mattered.
+# for a two-word concept returned `AccountCreate`, `AddressCreate`, `AuditCreate`… and
+# omitted hundreds of nodes, including the four files that mattered.
 #
 # Cost is accumulated along the path and expanded best-first, so a two-hop policy
 # edge outranks a one-hop containment edge. Lower is better.
@@ -170,7 +194,11 @@ EDGE_COST: dict[str, int] = {
     # An HTTP call and the handler that serves it.
     "CALLS_API": 1, "HANDLES_API": 1,
     # Direct import, or a call resolved to exactly one definition.
-    "IMPORTS": 1, "CALLS": 2,
+    "IMPORTS": 1, "CALLS": 2, "RENDERS": 2,
+    # An endpoint's request/response model: changing the model changes the contract.
+    "ACCEPTS_MODEL": 2, "RETURNS_MODEL": 2,
+    # A foreign key: the referenced table's shape constrains the referencing one.
+    "REFERENCES": 4,
     # Contract and data relationships.
     "TOUCHES_STORE": 3, "IMPLEMENTED_BY": 3, "GUARDED_BY": 3,
     # A FeatureTrace `Related:` line — declared, but by convention, not by policy.
@@ -253,6 +281,13 @@ def impact(
     seed_limit: int = 8,
     *, search_source: bool = True,
 ) -> ImpactResult:
+    """Expand the search seeds for `query` best-first, up to `depth` hops and `max_nodes` nodes.
+
+    Edges are walked in both directions at `EDGE_COST` plus resolution and origin
+    surcharges. A hub file's contents are not entered unless the hub is a seed, and
+    per-file and per-layer shares keep one source from filling the budget. Only issues
+    whose subject is selected are returned. `search_source=False` queries a stored graph
+    without re-reading the working tree."""
     if max_nodes < 1 or seed_limit < 1:
         raise ValueError("max_nodes and seed_limit must be positive")
     seeds = search(graph, root, query, config, limit=min(seed_limit, max_nodes), search_source=search_source)

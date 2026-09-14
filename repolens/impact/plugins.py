@@ -20,6 +20,7 @@ MAX_RECORDS_PER_FILE = 20_000
 
 @dataclass(frozen=True)
 class SourceFile:
+    """One admitted file handed to an extractor: relative path, decoded text and file node id."""
     path: str
     text: str
     file_id: str
@@ -27,18 +28,21 @@ class SourceFile:
 
 @dataclass
 class Extraction:
+    """Records an extractor proposes for one file; `merge_extraction` validates them as a whole."""
     nodes: list[Node] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
 
 
 class Extractor(Protocol):
+    """What a `repolens.extractors` entry point must provide; see docs/plugins.md."""
     api_version: int
     name: str
     version: str
     extensions: tuple[str, ...]
 
-    def analyze(self, source: SourceFile) -> Extraction: ...
+    def analyze(self, source: SourceFile) -> Extraction:
+        """Return the nodes, edges and issues found in one file with a matching extension."""
 
 
 def available() -> list[dict[str, str]]:

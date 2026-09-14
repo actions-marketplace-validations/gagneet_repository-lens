@@ -1,3 +1,4 @@
+"""`impact-tracer`: index a repository's evidence graph, query change impact, or report scan coverage."""
 from __future__ import annotations
 
 import argparse
@@ -53,6 +54,7 @@ def _write_or_print(content: str, output: str | None) -> None:
 
 
 def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
+    """The argument parser for the `scan`, `query` and `doctor` subcommands."""
     parser = argparse.ArgumentParser(
         prog=prog or "impact-tracer",
         description="Read-only repository linkage and change-impact explorer.",
@@ -95,6 +97,11 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None, *, config=None, prog: str | None = None) -> int:
+    """Run one `impact-tracer` subcommand and return its exit code.
+
+    `query` reuses the saved index only while its root, content and config fingerprints
+    still match, and exits 2 when nothing matched. `doctor` exits 1 only under
+    `--fail-on-error` when an error-severity issue exists."""
     args = build_parser(prog).parse_args(argv)
     repo = (args.repo or (config.root if config else Path.cwd())).resolve()
     config = Config.load(repo, args.config)
@@ -115,6 +122,9 @@ def main(argv: list[str] | None = None, *, config=None, prog: str | None = None)
         print(f"files={graph.metadata['file_count']} nodes={len(graph.nodes)} edges={len(graph.edges)}")
         print("issues=" + ", ".join(f"{key}:{value}" for key, value in sorted(by_severity.items())))
         print(f"content_sha256={graph.metadata['content_sha256']}")
+        from ..provenance import describe_build
+        from .scanner import config_fingerprint
+        print(f"tool={describe_build()} config_sha256={config_fingerprint(config)[:12]}")
 
         # A per-code breakdown, because a bare total of 28,755 is not a health report:
         # 88% of it was one advisory code, and the 32 findings anybody would act on
