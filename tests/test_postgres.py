@@ -41,7 +41,7 @@ class Repo:
 CLEAN = '''
     revision = "0002_clean"
     down_revision = "0001"
-    TABLES = ["accounts", "ledgers"]
+    TABLES = ["accounts", "inventory"]
 
     def upgrade():
         """ALTER TABLE core.x ENABLE ROW LEVEL SECURITY -- a docstring runs nothing."""
@@ -306,26 +306,26 @@ FETCHES = '''
     from sqlalchemy import select, text
 
     async def everything(conn):
-        return await conn.fetch("SELECT id, name FROM core.lots")
+        return await conn.fetch("SELECT id, name FROM core.products")
 
     async def one_page(conn):
-        return await conn.fetch("SELECT id FROM core.lots ORDER BY id LIMIT 50")
+        return await conn.fetch("SELECT id FROM core.products ORDER BY id LIMIT 50")
 
     async def a_total(conn):
-        return await conn.fetch("SELECT count(*) FROM core.lots")
+        return await conn.fetch("SELECT count(*) FROM core.products")
 
-    async def per_scheme(conn):
-        return await conn.fetch("SELECT scheme_id, count(*) FROM core.lots GROUP BY scheme_id")
+    async def per_store(conn):
+        return await conn.fetch("SELECT store_id, count(*) FROM core.products GROUP BY store_id")
 
     async def orm_every_row(session):
-        stmt = select(Lot).where(Lot.scheme_id == 1)
+        stmt = select(Product).where(Product.store_id == 1)
         return (await session.execute(stmt)).scalars().all()
 
     async def orm_one_page(session):
-        return (await session.execute(select(Lot).limit(10))).scalars().all()
+        return (await session.execute(select(Product).limit(10))).scalars().all()
 
     async def text_every_row(session):
-        return (await session.execute(text("SELECT * FROM core.lots"))).fetchall()
+        return (await session.execute(text("SELECT * FROM core.products"))).fetchall()
 
     def not_a_query(values):
         return all(values)
@@ -334,14 +334,14 @@ FETCHES = '''
 
 class UnboundedFetchTests(unittest.TestCase):
     def test_a_select_with_no_limit_is_flagged_and_a_bounded_or_aggregate_one_is_not(self):
-        repo = Repo({"svc/lots.py": FETCHES})
+        repo = Repo({"svc/products.py": FETCHES})
         self.addCleanup(repo.close)
         tree = ast.parse(textwrap.dedent(FETCHES))
         spans = [(fn.lineno, fn.end_lineno, fn.name) for fn in tree.body
                  if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))]
         found = [f for f in performance.scan(repo.settings) if f.rule == "performance/unbounded-sql-fetch"]
         flagged = {name for f in found for start, end, name in spans if start <= f.line <= end}
-        self.assertEqual(flagged, {"everything", "per_scheme", "orm_every_row", "text_every_row"})
+        self.assertEqual(flagged, {"everything", "per_store", "orm_every_row", "text_every_row"})
         self.assertEqual({f.confidence for f in found}, {"low"})
 
 
@@ -353,24 +353,24 @@ class LensTableTests(unittest.TestCase):
     def test_sql_tables_reads_bare_and_qualified_names_and_skips_what_is_not_a_table(self):
         source = '''
             async def f(conn, session):
-                await conn.fetch("SELECT a FROM finance.receipts r JOIN core.lots l ON l.id = r.lot_id")
-                await conn.execute(f"UPDATE levy_items SET paid = 1 WHERE id = {item}")
+                await conn.fetch("SELECT a FROM billing.payments r JOIN core.products l ON l.id = r.product_id")
+                await conn.execute(f"UPDATE invoice_items SET paid = 1 WHERE id = {item}")
                 await conn.execute("INSERT INTO audit (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2")
                 await session.execute(text("WITH recent AS (SELECT 1) SELECT * FROM recent JOIN users u ON TRUE"))
                 await conn.fetch("SELECT EXTRACT(YEAR FROM created_at) FROM orders FOR UPDATE SKIP LOCKED")
                 await conn.fetch("SELECT * FROM unnest($1::int[]) AS x")
         '''
         self.assertEqual(_sql_tables(_LensSettings(), ast.parse(textwrap.dedent(source))),
-                         ["audit", "core.lots", "finance.receipts", "levy_items", "orders", "users"])
+                         ["audit", "billing.payments", "core.products", "invoice_items", "orders", "users"])
 
     def test_orm_table_reads_the_schema_from_table_args(self):
         def table(body: str) -> str | None:
             return _orm_table(ast.parse(textwrap.dedent(body)).body[0])
         self.assertEqual(table('''
-            class Receipt(Base):
-                __tablename__ = "receipts"
-                __table_args__ = (Index("ix"), {"schema": "finance"})
-        '''), "finance.receipts")
+            class Payment(Base):
+                __tablename__ = "payments"
+                __table_args__ = (Index("ix"), {"schema": "billing"})
+        '''), "billing.payments")
         self.assertEqual(table('class Note(Base):\n    __tablename__ = "notes"\n'), "notes")
         self.assertIsNone(table("class Plain:\n    pass\n"))
 
@@ -379,31 +379,31 @@ class LensTableTests(unittest.TestCase):
         from repolens.lens.settings import from_config as lens_settings
         repo = Repo({
             "repolens.toml": '[lens]\npython_roots = ["."]\n',
-            "models.py": 'class Lot(Base):\n    __tablename__ = "lots"\n    __table_args__ = {"schema": "core"}\n',
-            "svc.py": "def list_lots(session):\n    return session.query(Lot).all()\n",
+            "models.py": 'class Product(Base):\n    __tablename__ = "products"\n    __table_args__ = {"schema": "core"}\n',
+            "svc.py": "def list_products(session):\n    return session.query(Product).all()\n",
         })
         self.addCleanup(repo.close)
         with contextlib.redirect_stderr(io.StringIO()):
             data = load_index(lens_settings(load_config(str(repo.root))))
-        [record] = [r for r in data["functions"].values() if r["name"] == "list_lots"]
-        self.assertEqual(record["postgres_tables"], ["core.lots"])
+        [record] = [r for r in data["functions"].values() if r["name"] == "list_products"]
+        self.assertEqual(record["postgres_tables"], ["core.products"])
         self.assertNotIn("_names", record)
 
 
 class ImpactTableTests(unittest.TestCase):
     def test_orm_tables_are_exact_and_sql_text_is_probable_without_a_schema_list(self):
         repo = Repo({
-            "backend/models.py": 'class Lot(Base):\n    __tablename__ = "lots"\n'
+            "backend/models.py": 'class Product(Base):\n    __tablename__ = "products"\n'
                                  '    __table_args__ = {"schema": "core"}\n',
             "backend/repo.py": 'from x import y\n'
-                               'SQL = "SELECT * FROM finance.receipts r JOIN levy_items l ON TRUE"\n',
+                               'SQL = "SELECT * FROM billing.payments r JOIN invoice_items l ON TRUE"\n',
         })
         self.addCleanup(repo.close)
         graph = scan_repository(repo.root)
         tables = {graph.nodes[e.target].label: e.resolution for e in graph.edges
                   if e.kind == "TOUCHES_STORE" and graph.nodes[e.target].kind == "postgres_table"}
-        self.assertEqual(tables, {"core.lots": "exact", "finance.receipts": "probable",
-                                  "levy_items": "probable"})
+        self.assertEqual(tables, {"core.products": "exact", "billing.payments": "probable",
+                                  "invoice_items": "probable"})
 
 
 class InitMigrationTests(unittest.TestCase):
