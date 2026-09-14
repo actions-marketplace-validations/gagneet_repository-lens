@@ -25,6 +25,7 @@ from .files import rel
 
 @dataclass
 class Ratchet:
+    """A per-file count baseline for one check, plus the wording its messages use."""
     label: str
     baseline_path: Path
     root: Path
@@ -40,6 +41,7 @@ class Ratchet:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def load(self) -> dict[str, int] | None:
+        """The baseline's per-file counts, or None when the file is missing or not valid JSON."""
         if not self.baseline_path.exists():
             return None
         try:
@@ -49,6 +51,7 @@ class Ratchet:
         return data.get(self.files_key, data) if isinstance(data, dict) else None
 
     def write(self, counts: dict[str, int]) -> None:
+        """Write `counts` as the baseline, with the comment, the total and any `extra` keys."""
         payload = {
             "_comment": self.comment,
             self.total_key: sum(counts.values()),
@@ -61,6 +64,11 @@ class Ratchet:
         )
 
     def run(self, counts: dict[str, int], update: bool) -> int:
+        """Compare live `counts` with the baseline, or rewrite it when `update`; returns the exit code.
+
+        1 when the baseline is missing or unreadable, when a file is new or its count
+        rose, or when a count fell without the baseline being updated. 0 otherwise.
+        """
         counts = dict(sorted(counts.items()))
         baseline = self.load()
         where = rel(self.baseline_path, self.root)

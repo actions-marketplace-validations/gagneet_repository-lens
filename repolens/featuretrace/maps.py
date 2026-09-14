@@ -107,6 +107,10 @@ def run_check(settings: FTSettings) -> int:
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          settings: FTSettings | None = None, prog: str | None = None) -> int:
+    """CLI entry point for `featuretrace map`: list tags, write the index, check or render maps.
+
+    Returns 1 when `--check` finds drift or the requested tag has no markers, otherwise 0.
+    """
     utf8_console()
     s = settings or from_config(config or load_config())
     cmd = s.command

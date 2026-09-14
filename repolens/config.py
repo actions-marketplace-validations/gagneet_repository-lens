@@ -42,11 +42,13 @@ def merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class Config:
+    """A parsed profile: the repository root, the TOML data, and the file it came from (if any)."""
     root: Path
     data: dict[str, Any]
     path: Path | None = None
 
     def section(self, *names: str) -> dict[str, Any]:
+        """The nested table at `names` (e.g. `section("scan", "migrations")`), or {} if absent or not a table."""
         node: Any = self.data
         for name in names:
             node = node.get(name, {}) if isinstance(node, dict) else {}

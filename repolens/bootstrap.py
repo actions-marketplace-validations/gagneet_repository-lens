@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
+from .core.git import run_git
 from . import rules
 from .config import CONFIG_NAME, Config
 from .core.files import SkipRule
@@ -83,6 +84,7 @@ class Detected:
     truncated: bool = False
 
     def summary(self) -> str:
+        """One line for the profile header and console: file counts per language, migrations, truncation."""
         parts = [f"{n} {lang}" for lang, n in sorted(self.counts.items())] or ["no source files"]
         if self.migration_roots:
             parts.append(f"migrations in {', '.join(self.migration_roots)}")
@@ -225,8 +227,10 @@ def profile_text(root: Path, d: Detected, registry: str) -> str:
 
 
 def _default_branch(root: Path) -> str:
-    out = subprocess.run(["git", "-C", str(root), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                         capture_output=True, text=True)
+    try:
+        out = run_git(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "main"
     return out.stdout.strip().split("/", 1)[-1] if out.returncode == 0 and out.stdout.strip() else "main"
 
 
@@ -240,6 +244,12 @@ class Action:
 
 
 def plan(root: Path, args: argparse.Namespace) -> tuple[list[Action], Detected]:
+    """Work out what init would do to each file, without writing anything.
+
+    Returns the actions and the detection they were built from. An existing file is
+    skipped unless `--force` and its content differs; `.gitignore` is only appended to,
+    and the agents file only has its rules block added or refreshed.
+    """
     d = detect(root)
     rules_dir = args.rules_dir.strip("/")
     registry = f"{rules_dir}/canonical_owners.yaml"
@@ -289,6 +299,7 @@ def plan(root: Path, args: argparse.Namespace) -> tuple[list[Action], Detected]:
 
 
 def apply(actions: list[Action]) -> None:
+    """Carry out planned `write`, `update` and `append` actions with LF line endings; others are no-ops."""
     for action in actions:
         if action.verb in ("write", "update"):
             action.path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,6 +312,7 @@ def apply(actions: list[Action]) -> None:
 
 
 def main(argv: list[str] | None = None, *, config: Config | None = None, prog: str | None = None) -> int:
+    """Entry point for `repolens init`: print the plan, then apply it unless `--dry-run`."""
     ap = argparse.ArgumentParser(prog=prog, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true", help="print the plan; write nothing")

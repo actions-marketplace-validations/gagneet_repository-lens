@@ -49,12 +49,14 @@ class MarkerNode:
 
     @property
     def rel_path(self) -> str:
+        """The file's path relative to the root (absolute if no root), with forward slashes."""
         # POSIX on every OS: the result is printed into committed maps and compared with
         # `Related:` paths, which are written with forward slashes.
         return (self.file_path.relative_to(self.root) if self.root else self.file_path).as_posix()
 
     @property
     def short_name(self) -> str:
+        """The file's base name."""
         return self.file_path.name
 
     @property
@@ -70,6 +72,7 @@ class MarkerNode:
         return [s.strip() for s in self.data_flow_raw.split("→") if s.strip()]
 
     def to_dict(self) -> dict:
+        """The node as a JSON-serialisable dict, keyed as in the committed graph JSON."""
         return {
             "file": self.rel_path,
             "tag": self.tag,
@@ -86,6 +89,7 @@ class MarkerNode:
 
 
 def iter_files(settings: FTSettings) -> list[Path]:
+    """The files to search for markers: configured dirs and extensions, minus skipped parts."""
     return _iter_files(settings.root, settings.scan_dirs, settings.extensions, settings.skip_parts)
 
 
@@ -246,10 +250,12 @@ def _markers_in(settings: FTSettings, only_tag: str | None = None):
 
 
 def scan_for_tag(settings: FTSettings, tag: str) -> list[MarkerNode]:
+    """Every parsed marker carrying `tag`, in file order."""
     return list(_markers_in(settings, tag))
 
 
 def scan_all_tags(settings: FTSettings) -> dict[str, list[MarkerNode]]:
+    """Every parsed marker in the repository, grouped by tag."""
     result: dict[str, list[MarkerNode]] = {}
     for node in _markers_in(settings):
         result.setdefault(node.tag, []).append(node)

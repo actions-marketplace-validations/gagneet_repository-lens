@@ -20,9 +20,9 @@ import os
 import shlex
 import shutil
 import stat
-import subprocess
 from pathlib import Path
 
+from ..core.git import run_git
 from ..config import Config
 from .settings import ArtefactSettings, from_config
 
@@ -45,14 +45,14 @@ def _python() -> str:
 
 
 def hook_body(settings: ArtefactSettings) -> str:
+    """The script written to each hook: `hook_command` with `{python}` filled in, never failing."""
     # Quoted: an interpreter under a path with a space otherwise splits into two words,
     # the hook fails, and `|| true` swallows it — nothing regenerated, nothing reported.
     return HOOK_TEMPLATE.format(command=settings.hook_command.replace("{python}", shlex.quote(_python())))
 
 
 def _git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
-                          check=True).stdout.strip()
+    return run_git(root, *args, check=True, timeout=60).stdout.strip()
 
 
 def install(settings: ArtefactSettings) -> list[str]:
@@ -95,6 +95,7 @@ def install(settings: ArtefactSettings) -> list[str]:
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          settings: ArtefactSettings | None = None, prog: str | None = None) -> int:
+    """Entry point for `repolens artefacts install-hooks`: install for this clone, print the summary."""
     argparse.ArgumentParser(prog=prog, description=__doc__,
                             formatter_class=argparse.RawDescriptionHelpFormatter).parse_args(argv)
     for line in install(settings or from_config(config)):

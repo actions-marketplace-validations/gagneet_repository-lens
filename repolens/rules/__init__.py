@@ -39,6 +39,7 @@ def documents() -> dict[str, str]:
 
 
 def main(argv: list[str] | None = None, *, config: Config | None = None, prog: str | None = None) -> int:
+    """Entry point for `repolens rules`: list the rules, or print one with `show NAME` (exit 2 if unknown)."""
     ap = argparse.ArgumentParser(prog=prog, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="action")

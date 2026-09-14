@@ -52,6 +52,7 @@ AUDIT_WINDOW = 20
 
 
 def is_store_identifier_list(value: str) -> bool:
+    """Whether a `Collection:`/`Table:` value is a non-empty list of store identifiers, not prose."""
     parts = split_store_field(value)
     return bool(parts) and all(STORE_TOKEN_RE.match(p) for p in parts)
 
@@ -73,15 +74,18 @@ class AuditContext:
         self._tag_index: dict[str, frozenset[str]] | None = None
 
     def iter_files(self) -> list[Path]:
+        """The files the audit scans, as selected by the FeatureTrace settings."""
         return iter_files(self.settings)
 
     @property
     def tracked(self) -> frozenset[str]:
+        """Git-tracked repo-relative paths, fetched once per context; empty without git."""
         if self._tracked is None:
             self._tracked = git.tracked_paths(self.root)
         return self._tracked
 
     def ignored(self, candidates: list[str]) -> set[str]:
+        """The subset of `candidates` that `.gitignore` excludes."""
         return git.ignored(self.root, candidates)
 
     @property
@@ -110,6 +114,11 @@ class AuditContext:
         return self._tag_index
 
     def is_ref(self, token: str) -> bool:
+        """Whether a path-like token is a repo-relative reference the audit should verify.
+
+        With `ref_prefixes` configured, only tokens starting with one count; otherwise
+        any token containing `/` that is not absolute does.
+        """
         prefixes = self.settings.ref_prefixes
         if prefixes:
             return token.startswith(prefixes)
@@ -122,11 +131,13 @@ class AuditContext:
 
 @lru_cache(maxsize=1)
 def default_context() -> AuditContext:
+    """A cached context for the current repository, used by markers built without one."""
     return AuditContext(from_config(load_config()))
 
 
 @dataclass(frozen=True)
 class Marker:
+    """One `@featuretrace:<tag>` marker and the block of lines the audit checks with it."""
     path: Path
     line_no: int
     tag: str
@@ -139,23 +150,28 @@ class Marker:
 
     @property
     def has_data_flow(self) -> bool:
+        """Whether the block has a `Data flow:` field."""
         return "Data flow:" in self.block
 
     @property
     def has_related(self) -> bool:
+        """Whether the block has a `Related:` field."""
         return "Related:" in self.block
 
     @property
     def has_scope(self) -> bool:
+        """Whether the block names a configured scope qualifier; always true when none are configured."""
         scope_re = self._c.scope_re
         return True if scope_re is None else bool(scope_re.search(self.block))
 
     @property
     def has_layer(self) -> bool:
+        """Whether the block has a `Layer:` naming a configured layer other than `unknown`."""
         return bool(self._c.layer_re.search(self.block))
 
     @property
     def is_near_top(self) -> bool:
+        """Whether the marker sits within `near_top_lines`, or its file may carry section markers."""
         c = self._c
         try:
             relative = self.path.relative_to(c.root).as_posix()
@@ -258,6 +274,7 @@ class Marker:
 
     @cached_property
     def issues(self) -> list[str]:
+        """Every problem with this marker as a readable message; empty when it is complete."""
         # One issue per bad reference or value, never one per marker: the ratchet
         # counts issues, so collapsing three into one would let two be re-added
         # after one is fixed without the count moving.
@@ -283,6 +300,7 @@ class Marker:
 
 
 def markers_for(ctx: AuditContext, path: Path, text: str) -> list[Marker]:
+    """Every marker in one file's text, each with its `AUDIT_WINDOW`-line block."""
     lines = text.splitlines()
     markers: list[Marker] = []
     for idx, line in enumerate(lines, start=1):
@@ -311,6 +329,7 @@ def weak_counts(ctx: AuditContext, markers: list) -> dict[str, int]:
 
 
 def ratchet_for(ctx: AuditContext, baseline_path: Path | None = None) -> Ratchet:
+    """The per-file marker-issue ratchet, with failure help built from the repository's settings."""
     s = ctx.settings
     if s.scope_values:
         help_lines = [
@@ -340,12 +359,18 @@ def ratchet_for(ctx: AuditContext, baseline_path: Path | None = None) -> Ratchet
 
 def run_ratchet(ctx: AuditContext, markers: list, update: bool,
                 baseline_path: Path | None = None) -> int:
+    """Check the markers' issue counts against the baseline, or rewrite it when `update`."""
     return ratchet_for(ctx, baseline_path).run(weak_counts(ctx, markers), update)
 
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          context: AuditContext | None = None, baseline_path: Path | None = None,
          prog: str | None = None) -> int:
+    """CLI entry point for `featuretrace audit`: print weak markers and return an exit code.
+
+    Returns the ratchet's result under `--check`/`--update-baseline` (2 if combined with
+    a tag), 1 under `--strict` when any marker is weak, otherwise 0.
+    """
     ctx = context or AuditContext(from_config(config or load_config()))
     parser = argparse.ArgumentParser(prog=prog, description="Audit @featuretrace marker coverage.")
     parser.add_argument("tag", nargs="?", help="Limit audit to one feature tag.")

@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 def main(argv=None, *, config=None, prog=None) -> int:
+    """Serve the API on 127.0.0.1 with the token from `REPOLENS_API_TOKEN`."""
     parser = argparse.ArgumentParser(prog=prog, description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
