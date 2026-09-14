@@ -1,26 +1,25 @@
 {
   "exclude_paths": [
     "_archive",
-    "backend/venv",
     "backend/alembic/versions",
     "backend/backups",
     "docs/archive",
     "frontend/public"
   ],
   "aliases": {
-    "fund balance": [
-      "sinking fund balance",
-      "capital works fund balance",
-      "reserve balance"
+    "order total": [
+      "invoice total",
+      "basket total",
+      "amount due"
     ],
     "effective role": [
       "role elevation",
       "temporary elevation",
       "permission role"
     ],
-    "arrears stage": [
-      "notice stage",
-      "debt recovery stage",
+    "overdue stage": [
+      "reminder stage",
+      "collection stage",
       "days overdue"
     ]
   },
@@ -28,8 +27,8 @@
     "canonical_owners": "docs/architecture/canonical_owners.json",
     "router_datastore": "docs/architecture/router_datastore_map.json"
   },
-  "backend_api_prefix": "/api",
+  "client_api_base": "/api",
   "max_ambiguous_targets": 12,
   "max_file_bytes": 2000000,
-  "_note_exclude_paths": "_archive holds a stale checkout including venv-root-stale/lib/python3.12/site-packages \u2014 vendored code the repo does not own. The default `venv` exclude does not match that directory NAME, so it is listed here."
+  "_note_exclude_paths": "_archive holds an old copy of the application, including a virtualenv under a directory not named `venv`, so the default excludes do not match it."
 }

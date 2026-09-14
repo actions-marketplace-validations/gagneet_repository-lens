@@ -1,12 +1,23 @@
-# What the repolens CI job installs. Pinned on purpose: the committed report baseline
-# (.repolens/report_baseline.json) is only comparable with the scanner versions that
-# produced it — a newer ruff or bandit adds rules, and their findings would read as new.
-# Rebuild the baseline with these versions:
-#   python -m pip install -r tools/repolens/requirements-ci.txt
-#   python tools/repolens/bin/repolens report --update-baseline
+# The scanners a CI job installs for `repolens report` and `repolens docs`. Pinned on
+# purpose: a committed report baseline (.repolens/report_baseline.json in the repository
+# being checked) is only comparable with the scanner versions that produced it — a newer
+# ruff or bandit adds rules, and their findings would read as new. Keep these in step with
+# SCANNER_PINS in repolens/bootstrap.py, which `repolens init --ci github` writes into a
+# target repository's workflow.
+#
+# From a checkout of this repository (or an installed package):
+#   python -m pip install -e . -r requirements-ci.txt
+#   repolens report --update-baseline
+#
+# Vendored: a copy of this repository inside the repository being checked, at <dir>
+# (for example tools/repolens; see docs/installation.md, "Vendoring a copy"):
+#   python -m pip install -r <dir>/requirements-ci.txt
+#   python <dir>/bin/repolens report --update-baseline
+#
+# The optional `api` extra (FastAPI) is deliberately not installed here. `repolens docs
+# build` leaves out a module whose third-party dependency is missing, such as
+# repolens.api.app, and names it, instead of failing the whole pdoc build.
 PyYAML==6.0.2
 ruff==0.16.7
 bandit==1.9.4
 pdoc==16.0.0
-# pdoc imports backend/domain to document it, and domain imports pydantic (the backend's pin).
-pydantic==2.13.5

@@ -10,8 +10,9 @@ The tool is deliberately separate from the application it analyses. The applicat
 
 ## Current capabilities
 
-- Python AST extraction for functions, classes, import-bound candidate calls, FastAPI router prefixes/mounts, ORM table declarations/references and direct `db.<collection>` references.
-- Tree-sitter JavaScript/TypeScript extraction for functions, exports, local/`tsconfig`-alias imports, calls, Axios/API/fetch calls, literal SQL and Next.js App Router handlers.
+- Python AST extraction for functions, classes, import-bound candidate calls, FastAPI routes (`api_route`, `add_api_route`, websockets), dependencies, request/response models, resolved router prefixes and sub-app mounts, SQLAlchemy/SQLModel/Alembic tables and foreign keys, and MongoDB/ODM collections claimed only through driver methods.
+- Tree-sitter JavaScript/TypeScript extraction for declarations, every export form and barrel, local/`tsconfig`-alias imports, calls and JSX renders, `fetch`/SWR/axios/ky requests (module `const` base paths and client base URLs included), Next.js App and Pages Router routes and pages, and SQL assembled in variables. A value spliced into SQL text from a CLI argument, request input or Next.js route `params`/`searchParams` is a `security/sql-string-interpolation` finding (values passed through `Number`/`parseInt` count as safe); other spliced values are named in `DYNAMIC_SQL`. Bare `&` in JSX text is not a parse error.
+- A call to a path that is served only for other methods is `API_METHOD_MISMATCH` (a PATCH to a GET-only route, a likely 405), reported as the finding `stack/api-method-mismatch`. A call to a path with no handler at all is `API_CALL_WITHOUT_HANDLER`. Both drop to info when every caller is judged dead: nothing imports, renders or routes to the calling module.
 - SQLGlot PostgreSQL table references from literal SQL, with read/write/DDL meaning retained in edge detail; MongoDB collection, role, feature-toggle and FeatureTrace discovery.
 - Optional import of `docs/architecture/canonical_owners.json`, including owners, symbols, tests, consumers and recorded violations.
 - Free-text, path, concept, page, endpoint and symbol search.
@@ -62,7 +63,7 @@ impact-tracer scan /path/to/repository
 Search a concept and produce a Markdown report containing a Mermaid diagram:
 
 ```bash
-impact-tracer query "sinking fund balance" \
+impact-tracer query "order total" \
   --repo /path/to/repository \
   --depth 2 \
   --max-nodes 40 \
@@ -73,8 +74,8 @@ impact-tracer query "sinking fund balance" \
 Query a function or route and return only Mermaid:
 
 ```bash
-impact-tracer query "horizon_funding_position" --repo /path/to/repository --format mermaid
-impact-tracer query "/financials/levy-fairness" --repo /path/to/repository --format mermaid
+impact-tracer query "calculate_order_total" --repo /path/to/repository --format mermaid
+impact-tracer query "/api/orders/{order_id}" --repo /path/to/repository --format mermaid
 ```
 
 Summarize scan coverage and scanner uncertainty:
@@ -87,21 +88,29 @@ The included composite `action.yml` can also publish a Markdown/Mermaid report i
 
 The exit codes are:
 
-- `0`: successful scan/query, or doctor found no error-severity issue;
-- `1`: doctor found at least one error-severity issue;
+- `0`: successful scan or query, or doctor ran (doctor is advisory by default);
+- `1`: `doctor --fail-on-error` found at least one error-severity issue;
 - `2`: the query found no entry point.
+
+`doctor` prints the build (`tool=`) and the configuration fingerprint (`config_sha256=`), so two runs that disagree can be told apart.
 
 ## Optional configuration
 
 Put an `[impact]` section in the target repository's `repolens.toml`, place `.impact-tracer.json` in it, or pass `--config`. Sources layer in that order, later over earlier. Configuration is enrichment, not an application dependency.
 
-Application vocabulary is configuration too, and empty by default: `pg_schemas` (schemas whose `<schema>.<table>` names are PostgreSQL tables), `roles` (literal role names), `toggle_calls` (regex fragments for a call whose first argument is a feature toggle) and `mongo_receiver` (default `db`). These were hard-coded for StrataOS until 2026-09-10.
+Application vocabulary is configuration too, and empty by default: `pg_schemas` (schemas whose `<schema>.<table>` names are PostgreSQL tables), `roles` (literal role names), `toggle_calls` (regex fragments for a call whose first argument is a feature toggle) and `mongo_receiver` (default `db`).
+
+Three more keys shape what is read and how HTTP clients resolve:
+
+- `client_api_base`: the base path for an HTTP client the scanner cannot trace to its declaration, such as `const { api } = useAuth()`. When it is unset and the repository declares exactly one client base URL, that one is used.
+- `client_receivers`: receiver names (for example `http`) that are such clients.
+- `respect_gitignore` (default `true`): untracked files that git ignores (backups, build output) are skipped by the graph and by the built-in Python checks; tracked files are always read. When git cannot list them the scan reports `GITIGNORE_UNAVAILABLE` (info) and reads everything.
 
 ```json
 {
   "exclude_paths": ["docs/archive", "backend/alembic/versions"],
   "aliases": {
-    "fund balance": ["sinking fund balance", "capital works fund balance"]
+    "order total": ["invoice total", "amount due"]
   },
   "artifacts": {
     "canonical_owners": "docs/architecture/canonical_owners.json"
@@ -112,7 +121,10 @@ Application vocabulary is configuration too, and empty by default: `pg_schemas` 
 }
 ```
 
-An example StrataOS profile is included at `examples/strata-management.impact-tracer.json`.
+An example profile is included at [`examples/example-project.impact-tracer.json`](../examples/example-project.impact-tracer.json).
+Set `backend_api_prefix` only for a prefix the code does not declare (a proxy or `root_path`). A route that
+already starts with the prefix keeps its path and the scan reports `API_PREFIX_ALREADY_RESOLVED`, so a proxy
+prefix equal to the start of the application's own routes is not added a second time.
 
 ## Evidence model
 
@@ -177,7 +189,7 @@ routes, deterministic indexes, secret/diagram sanitization and all output format
 ## Recommended next increments
 
 1. Add a reviewed fixture corpus and precision/recall measurements for the focused stack.
-2. Resolve TypeScript re-exports and package `exports` maps with an opt-in type-aware adapter.
+2. Resolve package `exports` maps and workspace imports with an opt-in type-aware adapter (local re-exports and barrels are already resolved).
 3. Add OpenAPI request/response-field lineage and change-kind-aware traversal.
 4. Add optional read-only PostgreSQL catalog/RLS and migration-head inspection.
 5. Add JavaScript/TypeScript security and performance adapters through SARIF.

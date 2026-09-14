@@ -1,0 +1,881 @@
+# Open tasks: stack-depth audit follow-ups
+
+This list tracks every known open issue and piece of pending work on the
+`feat/stack-depth-audit` branch after the audit of 2026-09-13. Each task records the
+analysis behind it (what was observed, with the probe input and output), what resolving it
+requires, why it matters, and how to verify it.
+
+The numbered sections list work that is not finished. When a task is done, move it to
+[Resolved](#resolved) with the verifying test, and record user-visible changes in
+`CHANGELOG.md`. Capabilities that
+are wanted but not planned for this branch belong in [`roadmap.md`](roadmap.md), not here.
+
+**Status:**
+
+| Status | Meaning |
+|---|---|
+| `open` | Not started. |
+| `in progress` | A fix is being written. The task is not done until its tests pass and the final verification (REL-01) confirms it. |
+| `deferred` | Understood and recorded, deliberately not in this branch. |
+| `decision` | Needs a decision from the maintainer before work can start. |
+
+**Severity:**
+
+| Severity | Meaning |
+|---|---|
+| high | A false result that hides risk, a crash that loses facts, or unbounded work. |
+| medium | A false warning or false link in a realistic layout. |
+| low | A miss, an inaccuracy, or a clean-up. |
+
+**Source of the evidence.** The analysis comes from adversarial audits. Each audit built
+small temporary repositories (probes) that reproduce a behaviour and ran the scanner on them.
+Performance figures come from profiling a full `repolens analyze` of a large Python and
+Next.js monorepo, with about 2,300 Python files and 900 JS/TS files, checked out read-only.
+The evaluation targets are deliberately not named.
+
+## Index
+
+58 open tasks on 2026-09-14: 2 decision, 50 open, 3 in progress, 3 deferred. 62 items are in the Resolved table.
+
+| ID | Task | Status | Severity |
+|---|---|---|---|
+| [REL-01](#rel-01--final-verification-pass) | Final verification pass | in progress | high |
+| [REL-04](#rel-04--docsimpactmd-does-not-describe-the-new-diagnostics) | `docs/impact.md` does not describe the new diagnostics | open | low |
+| [REL-05](#rel-05--logical-commits-and-the-pull-request) | Logical commits and the pull request | in progress | medium |
+| [SQL-13](#sql-13--strict-package-scoping-loses-recall-for-a-root-level-schema) | Strict package scoping loses recall for a root-level schema | deferred | low |
+| [SQL-15](#sql-15--all-lowercase-prose-still-passes-the-sql-gate) | All-lowercase prose still passes the SQL gate | open | low |
+| [SQL-16](#sql-16--mongodb-handles-passed-around-without-evidence-are-missed) | MongoDB handles passed around without evidence are missed | open | low–medium |
+| [SQL-17](#sql-17--collection-receivers-are-re-read-from-source-lines) | `collection()` receivers are re-read from source lines | open | low |
+| [SQL-18](#sql-18--two-diverging-lists-of-test-directories) | Two diverging lists of test directories | in progress | low |
+| [SQL-19](#sql-19--the-foreign-ddl-scan-re-walks-the-tree-and-can-disable-catalogs-silently) | The foreign-DDL scan re-walks the tree and can disable catalogs silently | open | low |
+| [SQL-20](#sql-20--a-search_path-change-hides-every-unqualified-reference-in-its-file) | A `search_path` change hides every unqualified reference in its file | open | low |
+| [JS-06](#js-06--allow-list-guards-are-too-narrow) | Allow-list guards are too narrow | open | medium |
+| [JS-07](#js-07--a-backslash-silently-drops-a-query) | A backslash silently drops a query | open | medium |
+| [JS-08](#js-08--the-single-repository-base-url-fallback-is-applied-too-broadly) | The single-repository base URL fallback is applied too broadly | open | medium |
+| [JS-09](#js-09--configured-origin-suffix-matching-creates-false-links) | Configured-origin suffix matching creates false links | open | medium |
+| [JS-10](#js-10--hook-results-assumed-to-be-http-clients) | Hook results assumed to be HTTP clients | open | medium |
+| [JS-11](#js-11--test-runner-globals-treated-as-clients) | Test-runner globals treated as clients | open | medium |
+| [JS-12](#js-12--client_receivers-overrides-local-bindings) | `client_receivers` overrides local bindings | open | medium |
+| [JS-13](#js-13--liveness-misjudges-dynamic-imports-barrels-and-expo-router) | Liveness misjudges dynamic imports, barrels and Expo Router | open | medium |
+| [JS-14](#js-14--params-counted-as-request-input-in-any-default-export) | `params` counted as request input in any default export | open | low |
+| [JS-15](#js-15--axiosurl-call-form-not-recognised) | `axios(url)` call form not recognised | open | low |
+| [JS-16](#js-16--environment-and-localhost-base-urls-handled-inconsistently) | Environment and localhost base URLs handled inconsistently | open | low |
+| [JS-17](#js-17--the-configured-origin-marker-collides-with-a-real-url) | The configured-origin marker collides with a real URL | open | low |
+| [JS-18](#js-18--parameter-defaults-used-for-non-url-values) | Parameter defaults used for non-URL values | open | low |
+| [JS-19](#js-19--method-mismatch-check-ignores-catch-all-routes) | Method-mismatch check ignores catch-all routes | open | low |
+| [JS-25](#js-25--two-sql-rebuilding-shapes-are-still-quadratic) | Two SQL-rebuilding shapes are still quadratic | open | low–medium |
+| [JS-26](#js-26--common-route-registration-shapes-are-not-recognised) | Common route registration shapes are not recognised | open | medium |
+| [JS-27](#js-27--unmodelled-route-downgrades-are-repository-wide) | Unmodelled-route downgrades are repository-wide | open | low–medium |
+| [JS-28](#js-28--poolqueryformat-s-x-is-not-seen-as-sql) | `pool.query(format('… %s', x))` is not seen as SQL | open | low |
+| [JS-21](#js-21--known-misses-nuxt-angular-private-fields-hono-base-paths) | Known misses: Nuxt, Angular private fields, Hono base paths | deferred | low |
+| [JS-22](#js-22--grammar-gaps-make-an-analysis-incomplete) | Grammar gaps make an analysis incomplete | deferred | medium |
+| [JS-23](#js-23--claimed-behaviour-without-tests) | Claimed behaviour without tests | open | low |
+| [DEP-16](#dep-16--unresolved-apps-in-auxiliary-files-block-the-demotion) | Unresolved apps in auxiliary files block the demotion | open | low–medium |
+| [DEP-17](#dep-17--a-development-compose-override-hides-the-dockerfiles-command) | A development compose override hides the Dockerfile's command | open | low |
+| [DEP-18](#dep-18--one-run-time-import-anywhere-switches-reachability-off) | One run-time import anywhere switches reachability off | open | low |
+| [DEP-19](#dep-19--ci-and-container-publishing) | CI and container publishing | open | low |
+| [OUT-02](#out-02--grammar-versions-and-a-reproduction-procedure) | Grammar versions and a reproduction procedure | open | low |
+| [OUT-05](#out-05--git-timeouts-in-the-artefact-commands) | Git timeouts in the artefact commands | open | low |
+| [OUT-06](#out-06--pre-existing-lint-findings) | Pre-existing lint findings | open | low |
+| [OUT-07](#out-07--deployment-manifests-are-read-even-when-git-ignores-them) | Deployment manifests are read even when git ignores them | open | low |
+| [OUT-08](#out-08--should-unreadable-test-files-also-leave-the-analysis-complete) | Should unreadable test files also leave the analysis complete? | decision | low |
+| [OUT-09](#out-09--report-summary-overview-map-and-output-size-on-large-repositories) | Report summary, overview map and output size on large repositories | open | medium |
+| [OUT-10](#out-10--repolens-report-outputs-carry-no-configuration-hash) | `repolens report` outputs carry no configuration hash | open | low |
+| [PERF-02](#perf-02--wiringroute_exposure-is-computed-twice) | `wiring.route_exposure` is computed twice | open | low |
+| [PERF-03](#perf-03--schema-reference-string-scan) | Schema-reference string scan | open | low |
+| [PERF-04](#perf-04--function-body-fingerprints) | Function-body fingerprints | open | low |
+| [PERF-05](#perf-05--serialising-the-analysis-several-times) | Serialising the analysis several times | open | low |
+| [PERF-06](#perf-06--python-files-parsed-twice) | Python files parsed twice | open | low |
+| [DOC-02](#doc-02--a-dated-audit-document-for-this-pass) | A dated audit document for this pass | open | low |
+| [DOC-03](#doc-03--verify-the-skipped-test-statement-in-claudemd) | Verify the skipped-test statement in CLAUDE.md | open | low |
+| [TEST-01](#test-01--wall-clock-limits-in-tests-can-flake-under-load) | Wall-clock limits in tests can flake under load | open | low |
+| [SCAN-01](#scan-01--grouped-aggregates-reported-as-unbounded-fetches) | Grouped aggregates reported as unbounded fetches | open | medium |
+| [PY-01](#py-01--any-file-or-folder-named-like-a-package-makes-its-imports-local) | Any file or folder named like a package makes its imports local | open | low–medium |
+| [FT-01](#ft-01--featuretrace-maps-match-basenames-by-substring) | FeatureTrace maps match basenames by substring | open | medium |
+| [FT-02](#ft-02--an-untracked-related-target-is-called-nonexistent) | An untracked `Related:` target is called nonexistent | open | low |
+| [FT-03](#ft-03--cross-tag-related-references-are-listed-but-never-drawn) | Cross-tag `Related:` references are listed but never drawn | decision | low |
+| [JS-24](#js-24--open-ended-request-urls-link-to-every-handler-under-the-prefix) | Open-ended request URLs link to every handler under the prefix | open | low |
+| [REL-08](#rel-08--continuous-integration-for-this-repository) | Continuous integration for this repository | open | medium |
+| [REL-09](#rel-09--repolens-vendor-verify) | `repolens vendor verify` | open | low |
+
+---
+
+## 1. Release blockers for this branch
+
+### REL-01 — Final verification pass
+- **Status:** in progress · **Severity:** high
+- **Analysis:** the fixes from the first audits, and from the second audits of those fixes,
+  have landed. The combined tree must be checked as a whole, not module by module.
+- **Required, with the results of 2026-09-14:**
+  1. Full suite with extras (`python -m unittest discover -s tests -q`): 505 tests, OK,
+     1 skipped.
+  2. The same in a bare virtualenv, to confirm every test needing `tree_sitter`, `sqlglot`,
+     `fastapi` or `httpx` carries a `skipUnless` guard: **not yet run** (also DOC-03).
+  3. `python -m compileall -q repolens tests`: clean.
+  4. `ruff check --select F,E9,B` against `master`: master 20 findings, branch 12, none new
+     (the remaining ones are listed in OUT-06).
+  5. `repolens analyze` on the large read-only evaluation checkout, writing only to a scratch
+     directory: 119 s; the target's `git status` was identical before and after (the only
+     newer file was the target application's own log). `complete=false` because of one real
+     syntax error in an archived script (`PYTHON_PARSE_ERROR`). Against the previous run:
+     the one application `UNRESOLVED_ROUTER_MOUNT` is gone (the aliased-router fix; the other
+     5 are in test code and do not count), and the one `API_METHOD_MISMATCH` is gone because
+     the target's owner changed that call to a method the route serves between the runs.
+     No route file was demoted to `undeployed`.
+  6. The sanitized copy of the private evaluation repository: 8 s, `complete=true`.
+  7. Self-scan of this repository: 7 s, `complete=true`.
+  8. Name sweep of every tracked and untracked file for evaluation-target names and domain
+     identifiers: clean.
+- **Why:** the branch changes what the analyzer reports and how confident it claims to be.
+  The rule "a skipped or failed input never looks complete" only holds if the combined tree
+  is checked.
+- **Done when:** step 2 has run, and the results are in the PR description.
+
+### REL-04 — `docs/impact.md` does not describe the new diagnostics
+- **Status:** open · **Severity:** low
+- **Analysis:** CHANGELOG, README, CLAUDE.md, `docs/roadmap.md` and `analysis.LIMITS` were
+  re-read against the final code and corrected (deployment fail-closed rules, the SQL column
+  check scope, the dialect skip, the MongoDB handle rule, the unmodelled-route downgrade and
+  the SQL sanitisers). `docs/impact.md` still does not mention `SQL_UNKNOWN_COLUMN`,
+  `SQL_DIALECT_NOT_POSTGRES`, `API_METHOD_MISMATCH` or the MongoDB handle rule.
+- **Required:** add a short section for each to `docs/impact.md`, linking to `LIMITS` rather
+  than repeating it.
+- **Why:** `docs/impact.md` is the reference for the graph's diagnostics.
+
+### REL-05 — Logical commits and the pull request
+- **Status:** in progress · **Severity:** medium
+- **Analysis:** the branch is committed in dependency order, grouped by area (docstrings,
+  SQL, JS/TS, graph pipeline, scan checks and deployment, outputs and provenance, lens and
+  docs build, documentation), and pushed as a pull request against `master`.
+- **Required:** each commit compiles; commit messages and the PR text name no evaluation
+  target; the PR lists the REL-01 results and the GitHub issues it resolves.
+- **Why:** reviewable history, and a bisectable branch if a regression appears in a consumer.
+
+---
+
+## 2. PostgreSQL and data layer
+
+Every SQL task comes from the SQL/data-layer audit. SQL-01 to SQL-12 and SQL-14 are in the
+Resolved table. A second audit of those fixes (2026-09-14) found a quadratic MongoDB handle
+check, a completeness hole for psql statements, T-SQL scripts reported as parse errors, and
+several over-broad `search_path`/foreign-DDL/prose rules (A-SQL-1 to A-SQL-13). All of them
+are fixed with tests except the parts kept below. `tests.test_sql`, `tests.test_columns`,
+`tests.test_postgres` and `tests.test_schema_references` pass.
+
+### SQL-13 — Strict package scoping loses recall for a root-level schema
+- **Status:** deferred · **Severity:** low
+- **Analysis:** a Prisma schema or `CREATE TABLE` catalog checks only queries in its own
+  package. A root schema does not check a nested package that has its own `package.json`.
+  This trades recall for precision on purpose.
+- **Required:** document it in `analysis.LIMITS`. Optionally add an `[impact]` setting that
+  maps packages to a shared schema.
+- **Why:** users should know when a query is not checked, not assume it is.
+
+### SQL-15 — All-lowercase prose still passes the SQL gate
+- **Status:** open · **Severity:** low
+- **Analysis:** a statement keyword counts only when it is all upper or all lower case,
+  unless other SQL punctuation is present, which rejects "Delete from history". But
+  all-lowercase UI copy such as "delete from history" or "select name from list" is still
+  accepted as SQL, and can create a store edge for a table named `history` or `list`.
+- **Required:** reject gated text that has no SQL punctuation (`;`, `(`, `=`, `*`, `,`, a
+  quote or a placeholder), unless the named table is known from DDL, a Prisma schema or an ORM
+  model. Test with lowercase UI strings, and with genuine short lowercase queries such as
+  `select * from users` and `delete from sessions where id = $1`, which must still pass.
+- **Why:** i18n catalogs and UI copy are full of short lowercase phrases. A false store edge
+  links unrelated code to a table in impact queries.
+
+### SQL-16 — MongoDB handles passed around without evidence are missed
+- **Status:** open · **Severity:** low–medium
+- **Analysis:** to stop false collections (SQL-02), a `db` bound as an untyped parameter, or
+  with a non-driver type, is not a handle even in a file that imports the driver. So
+  `constructor(private db: any)`, plain-JS `function save(db) { db.users.insertOne(x) }`,
+  `(await getDb()).collection('orders')` and a `req.app.locals.db` set in another file give
+  no collection. This is a deliberate recall loss, now listed in `LIMITS`.
+- **Required:** follow same-file call sites where cheap (a parameter whose every caller
+  passes a known handle counts) and functions whose return value is `<client>.db(...)`.
+  Otherwise add an `[impact] mongo_handles` setting (receiver names to trust) like
+  `client_receivers`.
+- **Why:** plain-JS services pass the database handle around untyped. Without a way to
+  recover these, impact queries for a collection miss its writers.
+
+### SQL-17 — `collection()` receivers are re-read from source lines
+- **Status:** open · **Severity:** low
+- **Analysis:** `JSFacts` does not keep the receiver of `db.collection('x')`, so the scanner
+  reads it back from the source line. A call split across lines (`db\n.collection('orders')`,
+  `this.db\n.collection(...)`) records no collection. Comments, `db = null` and several
+  receivers on one line are handled since the second audit.
+- **Required:** record the receiver expression, and its binding where known, on the
+  collection fact in `core/javascript.py`. Then drop the line re-read, and test multi-line
+  and member-chain receivers.
+- **Why:** the syntax path exists precisely so that decisions do not depend on line text.
+
+### SQL-18 — Two diverging lists of test directories
+- **Status:** in progress · **Severity:** low
+- **Analysis:** `core.files.is_test_path` (precision choices) and `is_test_code` (the
+  completeness exemption) are shared. `bootstrap._TEST_DIRS` (`tests`, `test`, `__tests__`,
+  `spec`, `specs`) is still a separate list, and JS liveness does not use either.
+- **Required:** use the shared helpers in bootstrap (which picks the tests directory to
+  configure, a narrower question) and in the JS rules, with a table test.
+- **Why:** one concept with several definitions drifts, and each drift is a class of false
+  warning in one checker but not another.
+
+### SQL-19 — The foreign-DDL scan re-walks the tree and can disable catalogs silently
+- **Status:** open · **Severity:** low
+- **Analysis:** `columns._foreign_ddl_tables` walks the repository again (with a second git
+  ignore listing) instead of reusing the admitted inventory. Files past `max_files` are
+  skipped without a note. When it disables the DDL catalogs (an unreadable or over-size
+  migration, a computed `ALTER TABLE` target), no diagnostic says so, so the column check
+  goes quiet with no visible cause.
+- **Required:** reuse `ScanState.admitted_paths`, and report an info diagnostic naming the
+  file whenever DDL catalogs are disabled or the walk is truncated.
+- **Why:** a check that silently stops checking looks like a clean result.
+
+### SQL-20 — A `search_path` change hides every unqualified reference in its file
+- **Status:** open · **Severity:** low
+- **Analysis:** DDL is now positional (a `CREATE TABLE` before the file's `SET search_path`
+  still declares), but references are not: every unqualified reference in a file whose SQL
+  sets `search_path` is unchecked, including those before the `SET`.
+- **Required:** check references that precede the first `SET search_path` in the same file,
+  against the catalog as it stood at that point.
+- **Why:** recall. Migration-style scripts often set `search_path` halfway through.
+
+---
+
+## 3. JavaScript / TypeScript
+
+Every JS task comes from the JS/TS audit. JS-01 to JS-05 and JS-20 are in the Resolved table.
+A second audit of those fixes (2026-09-14) found SQL dropped from long `+` chains, remaining
+exponential SQL rebuilding, HTML escapers accepted as SQL sanitisers, and ordinary code
+(test mocks, `new Map().get`) hiding warnings repository-wide (A-JS-1 to A-JS-17). Those
+are fixed with tests except where JS-25 to JS-28 below say otherwise. JS-06 to JS-19 were
+not started, apart from the `typeof`/`Number.isInteger` guards noted in JS-06.
+
+### JS-06 — Allow-list guards are too narrow
+- **Status:** open · **Severity:** medium
+- **Analysis:** only ternaries over a named `const` table count as guards. These still flag:
+  - `if (!ALLOWED.includes(sort)) throw …;`
+  - `['name','date'].includes(sort) ? sort : 'name'`
+  - `Object.keys(COLS).includes(sort)`
+- **Required:** accept inline literal arrays, `Object.keys/values(<literal table>)`, and
+  early-exit guards earlier in the same block.
+- **Why:** these are the standard ways to allow-list a sort column.
+- **State (2026-09-14):** the `Number.isInteger`/`typeof` guards landed with JS-05. Inline literal arrays, `Object.keys/values(<table>)` and early-exit guards were not implemented or probed.
+
+### JS-07 — A backslash silently drops a query
+- **Status:** open · **Severity:** medium
+- **Analysis:** any `\` in the text abandons the query with no diagnostic. The classic
+  `'… WHERE a = \'' + req.query.a + '\''` produces no interpolation, no risk, no
+  `DYNAMIC_SQL` and no incomplete marker.
+- **Required:** decode simple JS escapes, bail only on unknown ones, and record the taint even
+  when the SQL text cannot be rebuilt.
+- **Why:** a silent false negative on the exact pattern the security check exists for.
+
+### JS-08 — The single-repository base URL fallback is applied too broadly
+- **Status:** open · **Severity:** medium
+- **Analysis:**
+  - `$.get('/api/orders')` beside an unrelated `axios.create({baseURL:'/v1'})` resolves to
+    `/v1/api/orders`, and Angular `HttpClient` does the same.
+  - `api.get('/api/orders')` with base `/api` resolves to `/api/api/orders`.
+  - Each is a false missing-handler report.
+- **Required:**
+  - Never apply the fallback to jQuery or Angular `HttpClient`.
+  - Do not prepend a base the URL already starts with.
+  - Scope the fallback to the nearest package.
+- **Why:** the fallback exists for untraceable clients, not for every receiver.
+
+### JS-09 — Configured-origin suffix matching creates false links
+- **Status:** open · **Severity:** medium
+- **Analysis:** added during the audit pass so that `${process.env.API_URL}/orders` can match
+  `/api/orders`. Probes:
+  - ``${process.env.STRIPE_API_URL}/v1/charges`` links to a local `GET /api/v1/charges`.
+  - ``${process.env.NEXT_PUBLIC_API_URL}${path}`` links `probable` to an unrelated
+    `/api/users/{dynamic}`.
+  - `/orders` links ambiguously to both `/api/orders` and `/admin/orders`.
+- **Required:**
+  - Require at least one literal segment in the matched path.
+  - Always mark suffix matches `ambiguous`.
+  - Apply them only to origin names that denote this repository's API, never a vendor or
+    other service.
+  - Test with several handlers and with a vendor origin.
+- **Why:** a false link hides a genuinely missing handler behind a plausible edge.
+
+### JS-10 — Hook results assumed to be HTTP clients
+- **Status:** open · **Severity:** medium
+- **Analysis:**
+  - `usePageTitles().get('/settings')` produces a `CALLS_API` edge and a warning.
+  - `useSearch().get(k)` and `useCartStore().delete(k)` produce `DYNAMIC_HTTP_REQUEST` noise.
+  - The exclusion list is hand-picked names.
+- **Required:** treat a hook result as a client only when the hook traces to a client factory,
+  or when it is listed in `client_receivers`. Unresolved hook receivers emit nothing.
+- **Why:** framework semantics, not name lists, keep the rule valid for any codebase.
+
+### JS-11 — Test-runner globals treated as clients
+- **Status:** open · **Severity:** medium
+- **Analysis:** Protractor or WebdriverIO `browser.get('/login')` in an e2e spec produces an
+  `API_CALL_WITHOUT_HANDLER` warning. Cypress `cy` and Playwright `page` have the same shape.
+- **Required:** exclude test and e2e paths, and exclude well-known runner and DOM globals,
+  from free-receiver clients.
+- **Why:** navigation in a browser test is not an API call.
+
+### JS-12 — `client_receivers` overrides local bindings
+- **Status:** open · **Severity:** medium
+- **Analysis:** with `client_receivers = ["api"]`, an Express
+  `const api = express.Router(); api.get('/orders', listOrders)` itself becomes a client call
+  with a warning.
+- **Required:** apply the setting only to free, parameter or hook-bound receivers, never to a
+  router-factory binding.
+- **Why:** a configuration meant for untraceable clients must not reclassify route
+  registrations.
+
+### JS-13 — Liveness misjudges dynamic imports, barrels and Expo Router
+- **Status:** open · **Severity:** medium
+- **Analysis:** each of these wrongly demotes live calls to info:
+  - A literal `import('./Settings')` through `React.lazy` or `next/dynamic` counts as "never
+    imported".
+  - Any `index.ts` barrel counts as an entry. That turns judgements on and marks a `bin/`
+    script's module dead.
+  - Expo Router `app/_layout.tsx` is dead.
+- **Required:**
+  - Count literal dynamic imports.
+  - Do not treat re-export-only `index` files as entries.
+  - Read `package.json` `main`/`module`/`bin`/`exports`.
+  - Add the Expo Router conventions.
+  - Correct the `LIMITS` dead-code sentence.
+- **Why:** demotion hides live warnings, so it must be conservative.
+
+### JS-14 — `params` counted as request input in any default export
+- **Status:** open · **Severity:** low
+- **Analysis:** `export default async function buildReport(db, { params })` produces
+  `SQL_INJECTION_RISK`.
+- **Required:** only routed files (Next route/page, `+server`, Remix `app/routes`, SvelteKit)
+  supply request `params`. Document the exact recognised shapes in `LIMITS`.
+- **Why:** precision of a security finding.
+
+### JS-15 — `axios(url)` call form not recognised
+- **Status:** open · **Severity:** low
+- **Analysis:** `axios('/api/orders')` and `axios('/api/orders', {method:'post'})` produce no
+  request, plus a false "requires runtime values" diagnostic.
+- **Required:** support a string first argument with an optional config object.
+- **Why:** it is a documented axios form.
+
+### JS-16 — Environment and localhost base URLs handled inconsistently
+- **Status:** open · **Severity:** low
+- **Analysis:**
+  - `baseURL: process.env.API_URL` gives an `exact` local base, while the template form gives
+    a configured origin.
+  - `baseURL: 'http://localhost:8000'` makes every call external.
+- **Required:** treat both as configured origins, with `probable` resolution.
+- **Why:** a development proxy to the repository's own backend is the common case.
+
+### JS-17 — The configured-origin marker collides with a real URL
+- **Status:** open · **Severity:** low
+- **Analysis:** the internal marker `//configured` matches the literal
+  `//configured.example.com/api`.
+- **Required:** use a sentinel that cannot be a URL, in both the extractor and the scanner.
+- **Why:** correctness of an internal protocol.
+
+### JS-18 — Parameter defaults used for non-URL values
+- **Status:** open · **Severity:** low
+- **Analysis:** added during the audit pass. `{ id = 'me' }` at the template head gives
+  `me/profile`, which is then reported as external.
+- **Required:** use a default only when it starts with `/` or a URL scheme.
+- **Why:** only a base-URL default describes the request target.
+
+### JS-19 — Method-mismatch check ignores catch-all routes
+- **Status:** open · **Severity:** low
+- **Analysis:** a PATCH to a GET-only `[...slug]` route is reported as a missing handler
+  instead of a method mismatch.
+- **Required:** reuse `_serves` in `_methods_serving`.
+- **Why:** the more specific diagnostic tells the reader what to fix.
+
+### JS-25 — Two SQL-rebuilding shapes are still quadratic
+- **Status:** open · **Severity:** low–medium
+- **Analysis:** the second JS audit's fixes made reused bindings, `sql = sql + …` chains and
+  sibling blocks linear. Two shapes remain quadratic:
+  - one shared `let q` assigned in N callbacks (4,000 took 20 s);
+  - interleaved `sql += …; await pool.query(sql)`, where each query's text grows
+    (n = 2,000 took 19.6 s).
+- **Required:** look up assignments per declaration instead of slicing every assignment after
+  the declaring scope's start, and share the rebuilt prefix between successive queries of the
+  same binding. Add timing tests with generous limits (TEST-01).
+- **Why:** generated test suites and migration scripts have exactly these shapes.
+
+### JS-26 — Common route registration shapes are not recognised
+- **Status:** open · **Severity:** medium
+- **Analysis:** these register server routes but are neither modelled nor counted as
+  unmodelled backends, so every client call to them stays an `API_CALL_WITHOUT_HANDLER`
+  warning:
+  - `module.exports = function (app) { app.get('/api/orders', orders.list); }` (a
+    non-inline handler on a parameter);
+  - `app.route('/api/orders').get(…)` chains;
+  - hapi `server.route({ method, path, handler })`;
+  - `fastify.route({ method, url, handler })`.
+- **Required:** recognise `.route(path).<verb>()` chains, `.route({...})` objects, and
+  handlers passed by reference on a router-named parameter of an exported function; test
+  each. `LIMITS` already names them as not recognised.
+- **Why:** false warnings on standard Express, hapi and Fastify code.
+
+### JS-27 — Unmodelled-route downgrades are repository-wide
+- **Status:** open · **Severity:** low–medium
+- **Analysis:** one unmodelled registration anywhere outside test paths lowers every
+  `API_CALL_WITHOUT_HANDLER` and `API_METHOD_MISMATCH` in the repository to info, even in a
+  package that has nothing to do with it. That includes a mismatch on a path a modelled
+  handler serves, which can remove the only live `stack/api-method-mismatch` finding.
+- **Required:** scope the downgrade to the caller's nearest package (or its configured backend
+  package). Keep a mismatch a warning unless an unmodelled registration's path could match
+  the called path.
+- **Why:** a monorepo with one legacy router should not silence every gap in every app.
+
+### JS-28 — `pool.query(format('… %s', x))` is not seen as SQL
+- **Status:** open · **Severity:** low
+- **Analysis:** a query built by a formatting call passed straight to the driver is not rebuilt,
+  so neither a table edge nor an injection risk is recorded for it. pg-format `%I`/`%L` are
+  safe, but `%s` and `util.format` splice text.
+- **Required:** rebuild `format(literal, …)` arguments the way template literals are rebuilt,
+  with `%s` as a spliced value and `%I`/`%L` as quoted parameters; test both.
+- **Why:** a missed injection shape in a security check.
+
+### JS-21 — Known misses: Nuxt, Angular private fields, Hono base paths
+- **Status:** deferred · **Severity:** low
+- **Analysis:** these are misses only; no false results were observed.
+  - Nuxt `this.$axios.get`.
+  - Angular `#http = inject(HttpClient)`, and `constructor(http) { this.http = http }`.
+  - `new Hono().basePath('/api')` chains.
+- **Required:** trace each shape to its client or router, with tests.
+- **Why:** coverage for common frameworks. Out of scope for this branch.
+
+### JS-22 — Grammar gaps make an analysis incomplete
+- **Status:** deferred · **Severity:** medium
+- **Analysis:** `export type * from '…'` and `interface I<in out T>` produce
+  `JAVASCRIPT_PARSE_ERROR`, which is in the incomplete set. The installed tree-sitter
+  TypeScript grammar does not support these newer TypeScript syntax forms.
+- **Required:** upgrade the grammar, or add a retry that strips the unsupported syntax, as is
+  already done for `import type`. Record grammar versions in the build stamp (OUT-02).
+- **Why:** valid TypeScript should not make an analysis incomplete.
+
+### JS-23 — Claimed behaviour without tests
+- **Status:** open · **Severity:** low
+- **Analysis:** these have no test:
+  - `.svelte`, `.astro` and `.mdx` disabling dead-code judgements (only `.vue` is tested);
+  - Vue `inject`;
+  - Remix `clientLoader`;
+  - `client_receivers` against route registrations;
+  - taint performance;
+  - the route-name heuristics;
+  - suffix matching with several handlers.
+- **Required:** add one regression test per claim.
+- **Why:** project rule: a documented capability needs an implementation and a regression
+  test.
+
+---
+
+## 4. Deployment-aware exposure
+
+Every DEP task comes from the deployment audit, which rated the original feature **3/10**.
+Deployment detection *lowers* finding priority ("undeployed"), so a wrong demotion hides risk.
+The first audit found at least 25 realistic layouts where a running application was
+demoted, because the design *failed open*.
+
+**State (2026-09-14):** the fail-closed rewrite is finished. DEP-01 to DEP-15 are in the
+Resolved table. A second audit of the rewrite ran 60 earlier probes plus new ones and found 14
+more issues (A-DEP-1 to A-DEP-14). A-DEP-1 to A-DEP-12 are fixed. Every probe layout is a
+table row in `tests/test_deploy_probes.py` `DeploymentProbeTests.test_every_probe_layout`
+(107 rows), and there are separate tests for run-time router discovery, reads outside the
+root, linear time on long lines, and seeded fuzzing. What is still open is listed below; all
+of it errs toward *blocking* a demotion, which loses precision but never hides risk.
+
+The probe setup: two FastAPI apps with an unauthenticated `POST` (`app/main.py`,
+`legacy/server.py`), usually a Procfile running `app.main:app`, plus the manifest under test.
+A correct result demotes only what nothing deploys.
+
+### DEP-16 — Unresolved apps in auxiliary files block the demotion
+- **Status:** open · **Severity:** low–medium
+- **Analysis:** auxiliary files (dev scripts, tests, CI, `--reload` servers) never make a
+  deployment known, but an application name in one of them that does not resolve still
+  blocks. Examples: `scripts/dev.sh` running `uvicorn main:app --reload` in a repository with
+  two `main.py`, or `tests/run_e2e.sh` running a module that does not exist. Either one
+  switches the demotion off for the whole repository.
+- **Required:** in auxiliary files, mark every candidate of an ambiguous name live instead of
+  blocking, and ignore a module that does not exist. Keep blocking for names chosen at run
+  time (`uvicorn $APP_MODULE`), because the unknown app could be any file.
+- **Why:** usefulness. The feature stays safe but turns itself off in common layouts.
+
+### DEP-17 — A development compose override hides the Dockerfile's command
+- **Status:** open · **Severity:** low
+- **Analysis:** a Dockerfile that a compose service builds is read only through that service.
+  When the service overrides the command with a `--reload` (auxiliary) command, the image's
+  own `CMD` is never recorded as a deployment, so nothing is known and nothing is demoted.
+- **Required:** record the Dockerfile's own command as well when the building service
+  overrides it.
+- **Why:** precision in the common "production Dockerfile plus dev compose" layout.
+
+### DEP-18 — One run-time import anywhere switches reachability off
+- **Status:** open · **Severity:** low
+- **Analysis:** to fix DEP-09 safely, any reachable file that imports modules chosen at run
+  time (`pkgutil.iter_modules`, `walk_packages`, `runpy`, `spec_from_file_location`, a
+  non-constant `import_module`/`__import__`) now makes reachability unknown for the whole
+  repository. Nothing is then marked `unreachable` or `undeployed`.
+- **Required:** a narrower rule. Mark every file under the importing module's package, or under
+  the package a constant `iter_modules(x.__path__)` names, as live, and keep the rest of the
+  analysis. Add a probe that shows an unrelated `legacy/` is still demoted.
+- **Why:** plugin-style routers are common, and the broad rule removes the feature for those
+  repositories.
+
+### DEP-19 — CI and container publishing
+- **Status:** open · **Severity:** low
+- **Analysis:**
+  - A CI workflow that pushes an image (`docker push`) blocks by design, because the image
+    may run elsewhere with another command. This switches the feature off for every
+    repository that publishes images, and it is not documented.
+  - A GitHub Actions step running `docker run … uvicorn …` (a self-hosted runner deploying
+    in place) is not a CI deploy command, so it does not block.
+- **Required:** document the push rule in `LIMITS` and the README. Treat `docker run` with a
+  server command in CI as a blocking deploy line, and add probes for both.
+- **Why:** accurate documentation, and one remaining fail-open shape.
+
+---
+
+## 5. Outputs, provenance and completeness
+
+### OUT-02 — Grammar versions and a reproduction procedure
+- **Status:** open · **Severity:** low
+- **Analysis:** `tool_build.extras` records tree-sitter, sqlglot, fastapi and pdoc versions,
+  but not the tree-sitter JavaScript and TypeScript grammar versions. No document explains how
+  to reproduce a report from its stamp.
+- **Required:** add the grammar distributions to `_EXTRAS`, and document reproduction:
+  - check out `commit`;
+  - compare `source_sha256`;
+  - install matching extras;
+  - compare `config_sha256`.
+- **Why:** extraction output depends on the grammar version (see JS-22). This is roadmap P0
+  item 3.
+
+### OUT-05 — Git timeouts in the artefact commands
+- **Status:** open · **Severity:** low
+- **Analysis:** git calls in `artefacts/` now have timeouts; `affected_paths` has 600 s. A
+  timeout raises `SubprocessError`. Inside the installed hooks, `|| true` swallows it, so a hook
+  never breaks the git operation. The interactive `repolens artefacts` commands would show a
+  traceback instead of a message.
+- **Required:** catch timeout errors in the CLI entry points and print a clear message with a
+  non-zero exit.
+- **Why:** actionable errors instead of stack traces.
+
+### OUT-06 — Pre-existing lint findings
+- **Status:** open · **Severity:** low
+- **Analysis:** `ruff check --select F,E9,B` still reports findings that exist on `master`,
+  including:
+  - `B904` and `B905` in `lens/build.py`;
+  - `B023` in `report/runner.py` (a closure over a loop variable);
+  - `B008` for FastAPI `Depends` defaults, which is idiomatic.
+
+  `pyproject.toml` has no lint configuration.
+- **Required:**
+  - Fix `B023` (a latent bug class) and `B904`.
+  - Add a `[tool.ruff]` section that ignores `B008` for FastAPI.
+  - Optionally run ruff in CI.
+- **Why:** it keeps new warnings visible.
+
+### OUT-07 — Deployment manifests are read even when git ignores them
+- **Status:** open · **Severity:** low
+- **Analysis:** after OUT-03, the Python checks skip untracked gitignored files, but
+  `scan/deploy.py` finds manifests with its own `os.walk` (two sites). A gitignored
+  `docker-compose.override.yml` or a local `.env`-generated unit file is still read as
+  deployment evidence. After the fail-closed rewrite that can only block a demotion, never
+  cause a wrong one, so the effect is lost precision, not hidden risk.
+- **Required:** once DEP-14/DEP-15 are done, filter the manifest walk through
+  `python_ast.not_gitignored` (or `core.git.under_ignored` with the run's cached listing).
+  Test with an ignored override file.
+- **Why:** one `respect_gitignore` switch should mean the same thing for every reader.
+
+### OUT-08 — Should unreadable test files also leave the analysis complete?
+- **Status:** decision · **Severity:** low
+- **Analysis:** OUT-04 exempted link diagnostics in test code from completeness. A test file
+  that fails to parse (`PYTHON_PARSE_ERROR`, `JAVASCRIPT_PARSE_ERROR`) or is skipped
+  (`FILE_SKIPPED`) still makes the analysis incomplete, because its facts are lost: the test →
+  code edges used by impact queries, and any SQL or requests in it. On the large evaluation
+  repository no parse error was in test code, so this has not come up in practice yet.
+- **Required:** the maintainer decides. If test files should be exempt too, add those codes to
+  the same `_in_test_code` rule and list the exemption in `LIMITS` ("impact queries may miss
+  tests that could not be read").
+- **Why:** it is a trade-off between an honest completeness flag and a flag that turns red for
+  code that is never deployed.
+
+### OUT-09 — Report summary, overview map and output size on large repositories
+- **Status:** open · **Severity:** medium
+- **Analysis:** on a graph of about 60,000 nodes, `analyze` wrote a 132 MB `analysis.json`
+  and a 24,000-line `report.md` (GitHub issue #8). `report.md` now opens with completeness,
+  the incomplete reasons, the build stamp and total counts. It still has no per-code count
+  table and no top findings, and it lists every finding and diagnostic in full. The default
+  map is a node list ranked by kind and degree, not route → handler → store chains;
+  regex-only stores were removed from it. `analysis.json` holds the whole graph with no bound.
+- **Required:**
+  - Open `report.md` with a per-code count table and the top P0/P1 findings, and cap rows per
+    code as `report.html` does, pointing to `analysis.json` for the rest.
+  - Draw the default overview from the most-connected endpoint → handler → store chains.
+  - Offer a way to write the graph separately or leave it out.
+- **Why:** output nobody can read on a large repository is not a result.
+
+### OUT-10 — `repolens report` outputs carry no configuration hash
+- **Status:** open · **Severity:** low
+- **Analysis:** `analyze` and `impact doctor` stamp `config_sha256` (GitHub issue #10), but
+  `report/runner.py` writes the build stamp without a configuration hash, so two reports from
+  one build with different `repolens.toml` settings look alike.
+- **Required:** compute the same configuration fingerprint in the report runner and write it
+  in the Markdown, HTML and SARIF (`driver.properties`) outputs, with a test.
+- **Why:** configuration changes results without changing the build.
+
+---
+
+## 6. Performance
+
+Figures come from profiling a full `analyze` of the large evaluation repository: 609 s
+profiled, 5 min 23 s unprofiled, before the import-resolution fix.
+
+### PERF-02 — `wiring.route_exposure` is computed twice
+- **Status:** open · **Severity:** low
+- **Analysis:** two calls to `route_exposure` cost 38 s in total, of which `_route_exposure`
+  is 28 s. `ParseCache.derived` should make the second call free.
+- **Required:** find out why the derived key differs between the security and performance
+  runs (a `run_inputs` field that differs?), and share the result.
+- **Why:** about 15–20 s saved on large repositories.
+
+### PERF-03 — Schema-reference string scan
+- **Status:** open · **Severity:** low
+- **Analysis:** `scanner._python_strings` and `_schema_references` cost 33 s across 2,275
+  Python files.
+- **Required:** pre-filter each string with a cheap substring test for the configured schema
+  names before running the regex.
+- **Why:** the scan runs on every Python string literal.
+
+### PERF-04 — Function-body fingerprints
+- **Status:** open · **Severity:** low
+- **Analysis:** `python_scan._add_definition` spends about 15–18 s in `ast.dump` producing
+  structural-duplicate fingerprints for 27,681 functions.
+- **Required:** skip trivial bodies, and hash a cheaper normalised token stream instead of a
+  full dump.
+- **Why:** measurable time for an info-level diagnostic.
+
+### PERF-05 — Serialising the analysis several times
+- **Status:** open · **Severity:** low
+- **Analysis:** `json.dumps` ran 6 times for 18 s in total, and `dataclasses.asdict` also
+  shows up. `Analysis.to_dict()` is probably built again for each output (JSON, Markdown, HTML,
+  API).
+- **Required:** build the payload once per `main` and reuse it for every output.
+- **Why:** a straightforward 10–15 s saving.
+
+### PERF-06 — Python files parsed twice
+- **Status:** open · **Severity:** low
+- **Analysis:** 3,252 `ast.parse` calls for about 2,275 Python files, 17 s in total. The graph
+  scanner and the `scan/` checks parse independently.
+- **Required:** let the graph scan populate or share the `ParseCache`, keyed the same way
+  (path plus SHA-256 of the bounded read).
+- **Why:** about 1,000 redundant parses on a large repository.
+
+---
+
+## 7. Documentation and genericity
+
+### DOC-02 — A dated audit document for this pass
+- **Status:** open · **Severity:** low
+- **Analysis:** `docs/audit/2026-09-12-professional-foundation.md` is a snapshot at the 0.3.0
+  merge. This branch's audit produced ratings per area:
+
+  | Area | Rating |
+  |---|---|
+  | HTML escaping | 9 |
+  | Git hardening, before the fixes | 9 |
+  | SQL statement precision | 9 |
+  | Deployment detection, before the fixes | 3 |
+  | JS sanitisers, before the fixes | 4 |
+
+  None of this is recorded in the repository.
+- **Required:** after REL-01, write `docs/audit/2026-09-13-stack-depth.md` with the method,
+  final per-area confidence ratings, and the residual limitations.
+- **Why:** the project keeps its audited scope in `docs/audit/` beside `analysis.LIMITS`.
+
+### DOC-03 — Verify the skipped-test statement in CLAUDE.md
+- **Status:** open · **Severity:** low
+- **Analysis:** `CLAUDE.md` says that without the extras "about a third of the suite skips".
+  The last bare-environment measurement predates several hundred new tests.
+- **Required:** measure in a bare virtualenv (part of REL-01), and adjust the wording.
+- **Why:** contributors decide whether a green run is meaningful based on that sentence.
+
+### TEST-01 — Wall-clock limits in tests can flake under load
+- **Status:** open · **Severity:** low
+- **Analysis:** `tests/test_javascript_graph.py` `test_a_long_plus_chain_does_not_lose_the_file`
+  asserts a 10 s limit. During concurrent edits and a parallel suite run, it once took 118 s.
+  That run coincided with `core/javascript.py` being rewritten mid-run, and the same scan
+  profiled at 0.3 s afterwards. The JS-02 and JS-03 performance tests will need similar limits.
+- **Required:** assert work that does not depend on the machine where possible, for example
+  the number of `untrusted` or `url_value` calls through a counter or mock. Keep wall-clock
+  assertions generous (10× the measured time), and name the measured baseline in the test.
+- **Why:** a flaky test on a shared CI runner gets retried or disabled, and then the
+  regression it guards returns unnoticed.
+
+---
+
+## 8. Checks, FeatureTrace, Python imports and release tooling
+
+Tasks from the verification of the open GitHub issues (#6, #8, #10, #13, #14, #15) and
+the mount investigation on the large evaluation repository.
+
+### SCAN-01 — Grouped aggregates reported as unbounded fetches
+- **Status:** open · **Severity:** medium
+- **Analysis:** `performance/unbounded-sql-fetch` treats an aggregate-only projection with no
+  `GROUP BY` as bounded, but not a `GROUP BY` whose projection is only group keys and
+  aggregates (GitHub issue #6). A field sample of these findings found none actionable: counts
+  per status, sums per month or per category. A query filtered by a tenant or owner key is
+  also reported the same as `SELECT *` over a whole table.
+- **Required:**
+  - Treat a `GROUP BY` query whose projection is only group keys plus aggregates as bounded,
+    or at least low confidence with a note naming the grouping.
+  - Add an optional `[scan.performance] scope_key_patterns` setting (default empty, like
+    `scope_dependency_patterns`) that lowers confidence for a `WHERE` on a matching column.
+  - Test both, plus a genuinely unbounded `SELECT` that still fires.
+- **Why:** low-value findings bury the real unbounded reads and teach people to ignore the rule.
+
+### PY-01 — Any file or folder named like a package makes its imports local
+- **Status:** open · **Severity:** low–medium
+- **Analysis:** `python_scan._local_python_names` collects every path segment of every
+  admitted `.py` file. A top-level import whose name matches any of them anywhere
+  (`from fastapi import …` next to a vendored tool's `impact/fastapi.py`, `import redis`
+  next to `app/cache/redis.py`) is treated as a local resolution gap instead of an
+  `external:` binding. Call resolution then name-matches its members against local
+  definitions, and anything that relied on the binding loses it (the aliased-router case in
+  the Resolved table was one).
+- **Required:** a name is local only when it is importable as a top-level module from a
+  Python root the import index knows (`python_roots`, a directory holding the importing
+  file's package, or the repository root), not when it appears as any path segment. Test
+  with a nested same-named module and a real local top-level package.
+- **Why:** false `probable` call edges into unrelated local code, and missed facts that
+  depend on the binding.
+
+### FT-01 — FeatureTrace maps match basenames by substring
+- **Status:** open · **Severity:** medium
+- **Analysis:** `featuretrace/render.py` binds a data-flow step to a node when
+  `Path(rel_path).name in step`, a substring test, so a step naming `documents_store.py`
+  also binds `store.py`, and `data.py` binds `a.py`. `Related:` edges match on basename
+  across directories (GitHub issue #15). There are no FeatureTrace tests.
+- **Required:** match a whole relative path first, then a basename on path-segment and word
+  boundaries; refuse an ambiguous basename with an audit note. Add render tests.
+- **Why:** wrong edges in committed maps mislead the reader the map exists for.
+
+### FT-02 — An untracked `Related:` target is called nonexistent
+- **Status:** open · **Severity:** low
+- **Analysis:** `featuretrace/audit.py` `dangling_refs` resolves references against tracked
+  files, so a new file that exists but is not yet added to git is reported as "references a
+  path that does not exist". A gitignored path that is tracked counts as present.
+- **Required:** when the path exists on disk but is untracked, say "exists but is not tracked
+  by git"; test both messages.
+- **Why:** the current message sends people looking for a file that is there.
+
+### FT-03 — Cross-tag `Related:` references are listed but never drawn
+- **Status:** decision · **Severity:** low
+- **Analysis:** a reference to a file under another tag is counted in the audit by design,
+  but the per-tag map builds `node_by_path` from that tag's nodes only, so the edge is not
+  rendered and the map looks smaller than the markers say.
+- **Required:** the maintainer decides between drawing external stub nodes in per-tag maps
+  and emitting a distinct advisory. Then add tests.
+- **Why:** a map that silently drops declared links under-reports a feature's reach.
+
+### JS-24 — Open-ended request URLs link to every handler under the prefix
+- **Status:** open · **Severity:** low
+- **Analysis:** a call such as `` `/items${query}` `` is matched as an open-ended prefix, so it
+  gets `ambiguous` edges to `/items`, `/items/{id}` and `/items/export/csv` alike.
+- **Required:** when the trailing value is query-like (built with `URLSearchParams`, or a
+  binding whose literal starts with `?` or `&`), match the exact path only; keep prefix
+  matching for path-like tails.
+- **Why:** inflated impact results for the most common way to append filters.
+
+### REL-08 — Continuous integration for this repository
+- **Status:** open · **Severity:** medium
+- **Analysis:** there is no `.github/workflows` here (only the template shipped for
+  consumers), so the suite with and without extras, `repolens docs coverage --check` and
+  `repolens docs build` never run on the tool itself (GitHub issue #14). A read of the
+  public symbols found 20 still undocumented, which breaks a consumer's docstring ratchet
+  when it vendors the tool.
+- **Required:** a workflow that runs the suite in a bare environment and with all extras,
+  `compileall`, the docs coverage ratchet with a committed baseline, and `docs build` without
+  the `api` extra. Document the remaining public symbols.
+- **Why:** the tool's own quality gates should not first fail in a consumer's CI.
+
+### REL-09 — `repolens vendor verify`
+- **Status:** open · **Severity:** low
+- **Analysis:** `docs/installation.md` documents a `VENDORED.json` record (upstream commit and
+  tree hash) and a manual check; `docs/roadmap.md` lists the command as planned (GitHub issue
+  #14).
+- **Required:** a command that reads `VENDORED.json`, recomputes the tree hash of the vendored
+  directory without the record, and exits non-zero on a difference; test it on a temporary
+  git repository.
+- **Why:** proving a vendored copy is unmodified should not take a hand diff.
+
+---
+
+## Resolved
+
+Implemented and covered by tests during this audit pass (verified together under REL-01).
+
+| Item | What changed | Test |
+|---|---|---|
+| Git config could run commands | Every git call goes through `core.git.run_git`, which overrides `core.fsmonitor`, drops `GIT_*` variables and has a timeout. The dirty flag uses `diff-index`/`diff-files`, which run no clean filters, instead of `git status`; unknown is reported as `+unknown` or `dirty: null`. | `tests/test_git_hardening.py` |
+| HTML page size unbounded with many distinct rules | Once the row budget is spent, rule and diagnostic groups collapse into one line, and tool notes are capped. 100k distinct rules plus 100k notes gave 1.5 MB instead of 27.9 MB. | `tests/test_html_report.py` |
+| `repolens report` had no HTML output or build stamp | It writes `report.html`, and the Markdown and SARIF carry the build. | `tests/test_scan.py` (`test_the_report_writes_a_stamped_html_page_beside_markdown_and_sarif`) |
+| Oversized `package.json` or `tsconfig` looked complete | Interpreted manifests stay `FILE_SKIPPED`, which is incomplete. | scan input tests |
+| Stamp hash changed with editor swap files | `source_sha256` hashes only shipped file types and skips dotfiles. | `tests/test_provenance.py` |
+| Target `SyntaxWarning`s printed during scans | Suppressed at every `ast.parse` of target code. | probe |
+| `${base}/path` with a parameter default lost its base | The literal default base is used (`probable`). See JS-18 for the remaining restriction. | `test_a_base_url_parameter_default_is_the_requested_base` |
+| Aliased `APIRouter as _X` left mounts unresolved | Import aliases of constructor classes are recognised. | `test_a_router_built_from_an_aliased_import_is_mounted` |
+| Import resolution spent minutes in `realpath` | Lexical, memoised resolution against the admitted inventory. | `test_candidates_resolve_against_the_admitted_inventory_without_the_filesystem` |
+| Regex fallback claimed any `db.x.find` as Mongo | Requires the same MongoDB handle evidence as the syntax path. | `test_the_regex_fallback_needs_the_same_mongodb_handle_evidence` |
+| A bare `&` in JSX text was a `JAVASCRIPT_PARSE_ERROR` (incomplete) | Tolerated in JSX text and `.jsx` files (found while fixing JS-01 to JS-05). | `test_a_bare_ampersand_in_a_jsx_file_is_not_a_parse_error` |
+| Docs over-claims and consumer-specific leftovers | Corrected the package.json deployment wording and the "every output" claim; added gitignore and deployment `LIMITS` entries; removed a consumer-only pin; neutralised domain identifiers in comments and tests. | docs review, name sweep |
+| DEP-01 Unrecognised start commands were skipped | In a non-auxiliary manifest, an unknown or dynamic program blocks. In-repository scripts with a shebang are followed; `uwsgi` and `waitress-serve` app specs are resolved. | `tests/test_deploy_probes.py` rows `Procfile bin/start` … `cheroot` |
+| DEP-02 Module resolution took the first same-named file | Demotes only when the app name resolves to exactly one file. `WORKDIR` is mapped through `COPY`, and a Dockerfile is read with both its folder and the repository root as build context. | probe rows for `COPY api/ .`, unmapped `WorkingDirectory`, compose `build.dockerfile`, `COPY srv/ /app/`; `tests/test_scan.py` `test_an_image_that_copies_no_code_cannot_name_its_module` |
+| DEP-03 Many deployment formats were not detected | Vercel, SAM, Azure Functions, Cloud Foundry, Terraform, Cloud Build, Kubernetes JSON and YAML (also flow style and `values*.yaml`), App Engine services, `fly.<env>.toml`, Bicep, systemd drop-ins, `.in` templates, `Dockerfile-*`/`Containerfile*`, pm2 and circus all block, and so does a server line in a Makefile, justfile, Taskfile, Ansible task, `web.config`, `startup.txt` or `.cmd`/`.bat`/`.ps1` script. | probe rows (A-DEP-4 group) |
+| DEP-04 Unreadable deployment files did not block | Too large, binary or invalid UTF-8 files block. Compose YAML the line reader cannot follow (flow style, a service header with a value, quoted or mis-indented keys, service keys outside `services:`, a service with no image/build/command) blocks. CRLF files are read. A 64 KiB command line blocks, and any exception while reading blocks. | probe rows (A-DEP-1, A-DEP-5 groups), `test_random_manifests_never_raise` |
+| DEP-05 Servers started from Python scripts were missed | `uvicorn.Config`, aliased imports and `subprocess` are handled. A run script that changes `sys.path` or the working directory, or passes `app_dir=`, blocks. | probe rows (A-DEP-7 group) |
+| DEP-06 Shell options stopped command parsing | `-o`/`+o` values are skipped and in-repository scripts are followed. | probe rows `bash -o pipefail -c` … |
+| DEP-07 Compose anchors, `extends:` and image-only services were ignored | They block, except a command-less service or final Dockerfile stage on an image that cannot serve the app (`_INERT_IMAGES`: plain OS/interpreter images, postgres, redis, nginx, …). | probe rows (A-DEP-3, A-DEP-12 groups) |
+| DEP-08 Ambiguous app specs | Option values with colons are not taken as the app; more than one app-like positional blocks. | probe row `gunicorn --dogstatsd-tags` |
+| DEP-09 Dynamic router imports broke reachability | `wiring` follows constant `import_module`/`__import__` (relative names too). A reachable file that imports modules chosen at run time makes reachability unknown, so nothing is demoted (narrowing it is DEP-18). | `test_routers_found_at_run_time_are_not_called_unreachable`, probe rows |
+| DEP-10 Supervisor continuation lines | A key is set only on lines with `=`. | probe row `supervisor continuation` |
+| DEP-11 Docstrings over-claimed | The `deploy.py` and `wiring.py` docstrings, README, CLAUDE.md, CHANGELOG, `LIMITS`, the settings comment and the config template describe the fail-closed rules and the real read bounds (`max_file_bytes` for parsed manifests, 64 MiB in 1 MiB chunks for lexical checks). | docs review |
+| DEP-12 Deploy fixtures looked lifted from a real layout | Renamed to `api.service`, `scripts/notes.sh`, `svc/server_copy.py`, port 8000, `/srv/example/worker`. | name sweep |
+| DEP-13 Deployment detection default | Stays on (maintainer decision, 2026-09-14), now that the probes are tests. | — |
+| DEP-14 Three deployment tests failed after the rewrite | The fixtures now match the fail-closed rules: an entrypoint that is in the repository still demotes, and one that is not blocks. A Dockerfile that copies code gives the module its root, and one with no `COPY` blocks. | `tests/test_scan.py` DeploymentTests |
+| DEP-15 Audit probes were only temporary scripts | Every probe is a table row; the two rows that used to fail are ordinary rows now. | `tests/test_deploy_probes.py` |
+| A-DEP-6/8/10 Symlinks, OS errors and reads outside the root | A manifest symlink or linked directory leaving the root blocks. `OSError` in path checks means "not a file", `discover` failures mean no demotion, and a shebang is read only inside the root with `O_NOFOLLOW`. | `test_nothing_is_opened_through_a_directory_that_leaves_the_root`, probe rows |
+| A-DEP-9 Quadratic work on crafted manifests | Bounded patterns, one package.json line index, list-built continuations, incremental bracket depth. A 20k-character rsync line went from 1.47 s to 0 s; 20k package.json scripts from 34 s to 0.6 s. | `test_long_lines_stay_linear` |
+| REL-07 Interrupted JS and deployment fix agents | The deployment rewrite was finished and tested (see the DEP rows), and the JS/TS work was re-audited and finished; the task list was the resume point. | full suite |
+| OUT-01 `linkage.mmd` carried no build stamp | It ends with a `%% produced by …` Mermaid comment. | `tests/test_html_report.py` (analyze writes the stamp) |
+| DOC-01 Field-report labels in test docstrings | The `RL-nn` prefixes are gone; each docstring describes the behaviour it tests. | `grep -rn "RL-[0-9]" tests/` is empty |
+| DOC-04 Domain vocabulary in source docstrings | Scanner examples use `billing.*`, and the tenant-scoping explanation in `scan/security.py` uses organisations. A hardcoded domain word in the identity-parameter filter became the `[scan.security] scope_dependency_patterns` setting (default empty). | `tests/test_scan.py` `ScopeDependencyTests`, name sweep |
+| PERF-01 Re-measure the large repository | A full `analyze` of the large evaluation repository took 124 s on 2026-09-14, down from 5 min 23 s, with no files written to the target. PERF-02 to PERF-06 remain. | measured run (REL-01 records the final one) |
+| REL-06 Author attribution in `LICENSE` and `pyproject.toml` | Both name "Repository Lens contributors" (maintainer decision, 2026-09-14). | — |
+| OUT-03 The Python checks ignored `respect_gitignore` | Maintainer decision (2026-09-14): skip gitignored files that are not part of the project. `scan.python_ast.python_files` and the `migrations.migration_files` fallback drop untracked gitignored files through `not_gitignored`. One switch serves both the graph and the checks: `respect_gitignore`, read from `[impact]` and `.impact-tracer.json` into `ScanSettings.respect_gitignore` and included in `run_inputs`. The git listing is `core.git.untracked_ignored`, shared with the graph scan and cached per run. If git cannot list ignored files, every file is read. Under `analyze` the checks already used the graph's inventory, so the gap was only in `repolens scan`/`report`. Deployment manifests are still read when ignored (OUT-07). | `tests/test_scope_rules.py` `GitignoredPythonFilesTests` (ignored directory and pattern, tracked-but-ignored file kept, migrations, `respect_gitignore = false`, the `.impact-tracer.json` layer, non-boolean value rejected, unusable repository reads everything) |
+| OUT-04 Router mounts in test code made the analysis incomplete | Maintainer decision (2026-09-14): test code must not make an analysis incomplete, in any language. `UNRESOLVED_LOCAL_IMPORT`, `UNRESOLVED_ROUTER_MOUNT` and `ROUTER_MOUNT_CYCLE` whose evidence is in test code (`core.files.is_test_code`: a `tests/`, `test/`, `__tests__/`, `e2e/` or `cypress/` directory, or a test file name) stay in the output but are left out of `incomplete_reasons`. `spec/`, `fixtures/` and `testdata/` on their own are application code for this rule; the broader `is_test_path` serves only precision choices. Parse errors and skipped files in test code still count (OUT-08). | `tests/test_scope_rules.py` `TestCodeCompletenessTests` |
+| SQL-01 `GRANT;` crashed the file and lost later statements | Any exception parsing one statement is a located `SQL_PARSE_ERROR`; GRANT/REVOKE patterns tightened. The reader's own splitting helper runs outside that handler, so a repolens bug is not reported as the target's parse error. | `tests/test_sql.py` `test_a_statement_the_parser_raises_a_non_parse_error_on_stays_local`, `test_a_failure_in_the_readers_own_helper_is_not_reported_as_the_targets_parse_error` |
+| SQL-02 Mongo collection claims were too trusting | A receiver bound in the file decides: `<client>.db(...)`, `mongoose.connection.db`, a driver-typed parameter, or a local import exporting a handle. `collection()` uses the same check. Comments and `db = null` do not bind. Answers are cached per file and receiver (1000 call sites: 14 s → 0.13 s). | `tests/test_columns.py` `test_a_driver_import_does_not_make_every_db_binding_a_mongodb_handle`, `test_clearing_comments_nested_arguments_and_other_receivers_do_not_hide_a_handle`, `test_mongodb_handle_checks_do_not_repeat_per_call_site`; `test_the_regex_fallback_needs_the_same_mongodb_handle_evidence` |
+| SQL-03 Package-scoped DDL suppression caused false column warnings | ALTER additions, reshaped tables and computed-target dynamic DDL apply repository-wide; `CREATE TABLE` catalogs stay per package. Run-time DDL in test code does not taint the catalog. | `test_alter_table_and_dynamic_ddl_in_another_package_apply_to_the_shared_database`, `test_run_time_ddl_in_test_code_does_not_disable_the_catalog` |
+| SQL-04 Migrations in languages the scanner does not read | `columns._foreign_ddl_tables` reads Rails, Laravel, EF Core, Ecto, Go/Java/Rust SQL strings and Liquibase lexically. Catalogs are disabled only for a computed `ALTER TABLE` target or a migration naming no table; UI copy, comments and query builders mentioning "create table" are ignored. | `test_migrations_in_languages_the_scanner_does_not_read_disable_the_tables_they_name`, `test_a_computed_table_name_in_an_unread_language_disables_every_ddl_catalog`, `test_words_that_only_mention_schema_changes_disable_nothing` |
+| SQL-05 `SET search_path` was ignored | Unqualified names are unchecked where SQL sets `search_path` (not in string literals, comments or function `SET` clauses), repository-wide for role/database defaults and SQL strings or `-c search_path=` options in code. A `CREATE TABLE` before the `SET` still declares. See SQL-20. | `test_search_path_changes_leave_unqualified_names_unchecked`, `test_an_unqualified_create_under_a_changed_search_path_declares_nothing`, `test_only_a_search_path_the_sql_itself_sets_redirects_names` |
+| SQL-06 Prisma `view` blocks treated as complete | A view's columns are unknown. | `test_a_prisma_view_has_unknown_columns` |
+| SQL-07 Test queries checked against production DDL | References in `core.files.is_test_path` paths are not checked. | `test_queries_in_tests_specs_and_e2e_suites_are_not_checked` |
+| SQL-08 Valid PostgreSQL misreported as another dialect | Ambiguous signals (`GO` once, `TOP (n)`, `NVARCHAR(`, `IDENTITY(n,n)`) are weak and need a second signal. Strong T-SQL signals (`GO` twice, `USE x;`, `SET NOCOUNT`, `EXEC sp_`, bracketed names, `SELECT TOP n`) name common scripts on their own. | `test_valid_postgresql_that_resembles_another_dialect_is_postgresql`, `test_common_t_sql_scripts_are_named_without_a_second_weak_signal` |
+| SQL-09 The prose gate accepted UI copy | Capitalised verbs need SQL punctuation in the first statement after the verb; TRUNCATE is cased; COPY needs FROM/TO plus a path, STDIN, STDOUT or PROGRAM. Lowercase prose remains (SQL-15). | `test_capitalised_statement_verbs_without_sql_punctuation_are_ui_copy`, `test_prose_commas_later_sentences_and_copy_without_a_source_are_not_sql` |
+| SQL-10 Prisma provider decided for the whole repository | Per package, from `columns.POSTGRES_PRISMA_PROVIDERS` (CockroachDB included); a package with an unsupported provider does not borrow another package's tables. | `test_each_package_maps_prisma_accessors_with_its_own_provider`, `test_cockroachdb_is_checked_like_postgresql`, `test_a_package_with_an_unsupported_provider_does_not_borrow_another_packages_table` |
+| SQL-11 Statement splitter edge cases | `t.end` no longer closes an atomic body; unterminated `COPY … FROM stdin` data ends at end of file; psql variables are not substituted in `E'…'` strings or after `[`; rows after `\copy … FROM stdin` are data. A psql statement that does not parse is `SQL_PARSE_ERROR`, not `DYNAMIC_SQL`. | `test_a_column_named_end_is_not_the_end_of_an_atomic_body`, `test_copy_data_without_a_terminator_runs_to_the_end_of_the_text`, `test_escape_strings_and_array_slices_are_not_variables`, `test_rows_after_a_psql_copy_from_stdin_are_data`, `test_a_psql_statement_that_does_not_parse_is_a_parse_error_not_dynamic_sql` |
+| SQL-12 Inaccurate comments | Prisma `/* */` claim removed; the `incomplete_reasons` comment corrected. | the Prisma accessor test uses `//` comments |
+| SQL-14 `LIMITS` lacked the column-check scope | `LIMITS` now states the column-check scope, the dialect skip and the MongoDB handle limit; CLAUDE.md, the README and the CHANGELOG match. | docs review |
+| SQL fixture vocabulary | Test fixtures renamed to neutral names (`billing.payments`, `inventory`, `reservations`, `channelType`, `labelText`, `noteKind`). | name sweep |
+| Two target-code parses still printed `SyntaxWarning`s | The string-annotation re-parse in `impact/fastapi.py` and the `python -c` parse in `scan/deploy.py` suppress target warnings like every other `ast.parse` of target code (GitHub issue #13). | `tests/test_python_graph.py` `test_a_string_annotation_with_an_invalid_escape_prints_no_warning`, `tests/test_deploy_probes.py` `test_python_dash_c_code_with_an_invalid_escape_prints_no_warning` |
+| JS-01 Every call to an Express/Koa/Hono/Fastify/Nest backend was a warning | Literal routes of an Express/Fastify/Hono/Polka/Elysia server the same file starts listening on are `probable` endpoints. When code outside test paths registers routes that are not modelled (routers, NestJS controllers, file-based handlers, Remix/React Router `loader`/`action` in a module importing those packages, a Python module that builds a Flask/Django/… app), both gap codes are info and name the evidence. Look-alike receivers, catch-alls on a listening server and bare framework imports do not count. Remaining: JS-26, JS-27. | `tests/test_javascript_graph.py` `test_routes_in_unmodelled_backends_make_handler_gaps_info`, `test_a_listening_server_s_literal_routes_are_endpoints`, `UnmodelledRouteEvidenceTests` |
+| JS-02 Taint analysis was exponential on reused bindings | `untrusted()` and `sql_spellings` are memoised per binding (and depth); a result cut short by the depth limit is reused only at that depth or deeper, so answers do not depend on query order. `sql = sql + …` at n=160: 40 s → 0.01 s. Remaining: JS-25. | `test_taint_through_reused_bindings_is_linear`, `test_self_assigned_sql_is_spelled_in_linear_time`, `test_taint_does_not_depend_on_which_query_is_read_first` |
+| JS-03 Binding lookups were quadratic | Declarations are looked up per function and per block (`let`/`const` in `statement_block`/`for`); an assignment counts only when no scope in between redeclares the name. Remaining: JS-25. | `test_many_functions_sharing_parameter_names_parse_in_linear_time`, `test_sibling_blocks_declaring_the_same_name_parse_in_linear_time`, `test_an_assignment_to_another_variable_of_the_same_name_does_not_taint` |
+| JS-04 Long `+` chains exceeded the recursion limit | Left-nested chains are folded in a loop for URLs and SQL, so a long SQL concatenation keeps its query and every spliced value; right-nested URL concatenation stops after 64 levels. | `test_a_long_plus_chain_does_not_lose_the_file`, `test_a_long_plus_chain_keeps_its_query_and_every_hole`, `test_a_right_nested_url_concatenation_does_not_lose_the_file` |
+| JS-05 Common safe SQL idioms were reported as injection risks | Numeric conversions and operators, node-postgres/pg-format quoting, mysql/sqlstring `escape`/`escapeId` on a SQL-connection receiver, index-only placeholder callbacks, one-argument `fill`, and `typeof`/`Number.isInteger` guards are safe. HTML/CSS escapers, locally defined `escape`, `util.format` and callbacks reading the element, the array, `arguments` or `this` are not. | `SqlInterpolationTests.test_sanitisers_and_their_look_alikes` (75 table rows) |
+| JS-20 Test docstring and fixtures derived from a real application | Docstring made generic; fixtures renamed to catalog/invoices/orders/reports/customers; one source comment example neutralised. | name sweep |
+| JS-audit clean-ups | `.all()` registrations are labelled `router.all()`; the unused `JSFacts.hook_bindings` field is removed. | `UnmodelledRouteEvidenceTests` |
+| REL-02 `SCANNER_REVISION` bump | Bumped from 7 to 8 after the last extraction change; the CHANGELOG upgrade note says "went from 2 to 8". | `tests.test_impact` |
+| REL-03 Generated API contracts | Unchanged by the later fixes; the committed OpenAPI and Postman documents match a fresh export. | `tests.test_api.ApiTests.test_generated_contracts_match_the_committed_documents` |
+| An aliased router import was lost when a local file shared the framework's name | `_FastAPI._constructors` also reads aliases from the import statements, because a vendored `fastapi.py` anywhere makes `from fastapi import APIRouter as _R` an unbound local import. Found as the one remaining `UNRESOLVED_ROUTER_MOUNT` on the large evaluation repository. | `tests/test_python_graph.py` `test_an_aliased_router_import_survives_a_local_file_named_like_the_framework` |

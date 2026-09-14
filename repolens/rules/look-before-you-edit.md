@@ -14,8 +14,10 @@ whether its concept already has a registered owner.
   radius is an upper bound, never proof.
 - **"Tested" is a name match** — a test file that mentions the function. It is not
   coverage.
-- **JavaScript and TypeScript records are extracted by a regex** over declarations. There
-  is no frontend call graph.
+- **JavaScript and TypeScript records come from the parser `[lens] javascript_parser`
+  names.** `"regex"` (the default) reads declarations only: no frontend call graph.
+  `"tree-sitter"` adds name-based callees and needs `repolens[stack]`. The digest records
+  which one built it; `--check` refuses (exit 2) to compare across parsers.
 - **Everything is read from the source tree.** The lens cannot tell you that the table a
   function reads has never held a row, or that another page computes the same figure with
   a different filter. Before trusting a number a function produces, run it against real
