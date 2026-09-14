@@ -22,6 +22,9 @@ MARKER_PREFIXES = (
 #: below the header, not inside it.
 PARSE_WINDOW = 20
 KNOWN_FIELDS = frozenset(["Layer", "Data flow", "Related", "Toggle", "Collection", "Table", "Tests"])
+#: A `Related:` value saying no file was found (`none found (draft)`, which `featuretrace propose` writes
+#: because the audit requires the field). It names no file, so it is never an edge or a tour entry.
+NO_RELATED_RE = re.compile(r"^none(?: found)?\s*(?:\(draft\))?\.?$", re.IGNORECASE)
 _DESCRIPTION_RE = re.compile(r"@featuretrace:[A-Za-z0-9_.-]+\s*[—–-]+\s*(.+)")
 _LEADERS = ("#", "//", "*", "<!--")
 
@@ -221,7 +224,7 @@ def parse_marker_block(settings: FTSettings, path: Path, lines: list[str],
         description=description,
         layer=layer,
         data_flow_raw=extract_field(block_lines, "Data flow") or "",
-        related_raw=extract_multifield(block_lines, "Related"),
+        related_raw=[item for item in extract_multifield(block_lines, "Related") if not NO_RELATED_RE.match(item)],
         toggle=extract_field(block_lines, "Toggle"),
         # One node per STORE, never one per source line.
         collections=[tok for raw in extract_multifield(block_lines, "Collection")

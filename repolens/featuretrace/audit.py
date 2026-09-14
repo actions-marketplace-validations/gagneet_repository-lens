@@ -1,8 +1,9 @@
-"""Audit FeatureTrace markers: complete, near the top of the file, and truthful.
+"""Audit FeatureTrace markers: complete, near the top of the file, and with references that resolve.
 
 Every marker needs `Data flow:`, `Related:`, `Layer:` and — when the repository
 declares scope values — a scope qualifier. Beyond presence, three checks ask whether
-what a marker says is TRUE:
+what a marker refers to holds up. None of them checks that the declared data flow is
+what the code does; `repolens analyze` evidence is the place to compare that:
 
 * a referenced path must exist in the committed tree (or be deliberately gitignored);
 * a `Collection:`/`Table:` value must be a store identifier, not prose;
@@ -28,7 +29,10 @@ from .settings import UNKNOWN, FTSettings, from_config
 
 # Longest-first alternation is load-bearing: with `ts` before `tsx`, every `.tsx`
 # reference truncates to a `.ts` path that does not exist.
-REF_PATH_RE = re.compile(r"[A-Za-z0-9_./-]+\.(?:tsx|ts|jsx|js|py|md|yaml|yml|json|html)\b")
+# A segment may hold Next.js route syntax: `[orderId]`, `[[...slug]]`, `(group)`, `(.)photo`, `@slot`.
+# Brackets and parentheses count only as a whole group, so `call(app/x.ts)` still names `app/x.ts`.
+_REF_SEGMENT = r"(?:[A-Za-z0-9_.@-]|\[\[?[A-Za-z0-9_.-]+\]\]?|\([A-Za-z0-9_.]*\))+"
+REF_PATH_RE = re.compile(rf"(?:{_REF_SEGMENT}/)*{_REF_SEGMENT}\.(?:tsx|ts|jsx|js|py|md|yaml|yml|json|html)\b")
 
 #: A field label at the start of a line, after any comment leader. Bounds the
 #: `Related:` list, which continues over indented lines until the next label.

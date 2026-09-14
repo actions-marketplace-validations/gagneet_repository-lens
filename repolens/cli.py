@@ -12,6 +12,7 @@ from .core.console import utf8_console
 COMMANDS: dict[str, tuple[str, str]] = {
     "featuretrace map": ("repolens.featuretrace.maps", "generate FeatureTrace maps; --check gates staleness"),
     "featuretrace audit": ("repolens.featuretrace.audit", "audit marker quality; --check is the ratchet"),
+    "featuretrace propose": ("repolens.featuretrace.propose", "draft markers from the evidence graph as a patch; --apply writes them"),
     "lens": ("repolens.lens.build", "build the function index; --lookup NAME; --check gates staleness"),
     "lens similar": ("repolens.lens.similar", "search the index by behaviour before writing a helper"),
     "owners": ("repolens.owners.registry", "check the capability index; --impact; --check"),

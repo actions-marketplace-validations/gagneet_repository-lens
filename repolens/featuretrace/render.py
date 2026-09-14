@@ -158,12 +158,7 @@ def mermaid_flow(settings: FTSettings, nodes: list[MarkerNode], tag: str) -> str
     emitted: set[tuple[str, ...]] = set()
     for node in nodes:
         for item in node.related_raw:
-            rel_name = Path(item.split()[0]).name if "/" in item else item.split()[0]
-            target_id: Optional[str] = None
-            for rel_path, nid in node_by_path.items():
-                if Path(rel_path).name == rel_name or rel_path in item:
-                    target_id = nid
-                    break
+            target_id = _related_target(item, node_by_path)
             if target_id and target_id != node.node_id:
                 edge_key = tuple(sorted([node.node_id, target_id]))
                 if edge_key not in emitted:
@@ -326,6 +321,22 @@ def tour(settings: FTSettings, nodes: list[MarkerNode], tag: str) -> str:
             step += 1
 
     return "\n".join(lines)
+
+
+def _related_target(item: str, node_by_path: dict[str, str]) -> Optional[str]:
+    """The node a `Related:` entry names: its whole relative path first, then a unique path ending in it.
+
+    A path such as `app/api/orders/route.ts` never binds another directory's `route.ts`, and a bare
+    basename binds only when exactly one marked file has it."""
+    token = item.split()[0] if item.split() else ""
+    if not token:
+        return None
+    if token in node_by_path:
+        return node_by_path[token]
+    suffix = token if "/" in token else f"/{token}"
+    candidates = [nid for rel_path, nid in node_by_path.items()
+                  if rel_path.endswith(suffix) or ("/" not in token and rel_path == token)]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def graph_json(settings: FTSettings, nodes: list[MarkerNode], tag: str) -> str:
