@@ -7,9 +7,25 @@ All notable changes to repolens are recorded here. The format follows
 
 ## [Unreleased]
 
-Work on `feat/stack-depth-audit`, not yet merged. `pyproject.toml` still says 0.3.0.
+The stack-depth audit (merged as PR #16) and the follow-ups from a field evaluation on a large
+repository. `pyproject.toml` still says 0.3.0.
 
 ### Added
+
+**Field-evaluation follow-ups**
+- `[impact] api_origins` lists configured origins (`PAYMENTS_API_URL`) that are this
+  repository's API although their names say otherwise.
+- `ARTIFACT_STORE_UNCONFIRMED` (info) counts and names the router/datastore artifact's
+  `postgres_unverified_refs` that match no table the scan found.
+- `[scan.performance] scope_key_patterns` (default empty) lowers an
+  `performance/unbounded-sql-fetch` finding one severity step when every statement's
+  `WHERE` compares a matching column with a value. The note is kept out of the fingerprint.
+- JS/TS route registrations: `.route(path).<verb>()` chains, hapi/Fastify
+  `.route({ method, path | url, handler })` objects and a router-named parameter given a
+  handler by reference (`module.exports = function (app) { app.get(p, orders.list) }`) count
+  as unmodelled routes, so client calls to them are info, not warnings.
+- Dead-code judgements treat as entries the files a package.json names in `main`, `module`,
+  `browser`, `bin` or `exports`, and every file under `app/` in a package using Expo Router.
 
 **JavaScript / TypeScript and Next.js graph**
 - Declarations include object-literal and class-field members. Every ES and CommonJS
@@ -166,6 +182,39 @@ Work on `feat/stack-depth-audit`, not yet merged. `pyproject.toml` still says 0.
   `repolens vendor verify` command is listed in the roadmap as planned.
 
 ### Changed
+- A configured origin is this repository's API only when its name, after a framework prefix
+  (`NEXT_PUBLIC_`, `VITE_`, ...), is made of words such as API, BACKEND, SERVER, BASE or URL,
+  or it is listed in `api_origins`. `${process.env.STRIPE_API_URL}/v1/charges` is now an
+  `EXTERNAL_API_REFERENCE` instead of a link to a local `/api/v1/charges`. `EXTERNAL_API_REFERENCE`
+  names the origin. `baseURL: process.env.API_URL` and `localhost`/`127.0.0.1` origins are
+  configured origins (`probable`) instead of an exact local base and an external URL.
+- A call matched only after skipping the path a configured origin may carry needs a literal
+  segment and is always `ambiguous`. A URL of only runtime segments (`${API_URL}${path}`) and
+  an open-ended or runtime-segment URL that more than `max_ambiguous_targets` handlers could
+  serve (a `/api${url}` request wrapper) are `DYNAMIC_HTTP_REQUEST`: not linked and not a gap.
+  Such an endpoint stores `matched_handler_count`, not the list of every handler id.
+- A query-string tail (`/items${query}` where `query` is `?a=1` or "", `new URLSearchParams`,
+  `"?" + x`) matches only its exact path, not every handler under the prefix.
+- The base URL assumed for an untraced client is the one its package declares, else the
+  repository's one. It is not added to a URL that already starts with it, and jQuery, Angular
+  `HttpClient`, bare axios/ky, browser-test globals (`browser`, `cy`, `page`, `driver`) and
+  unbound receivers in test code never get it.
+- JS/TS SQL allow-list guards accept inline literal arrays, objects and Sets,
+  `Object.keys`/`Object.values` of a literal table, the consequence of `if (guard)` and the
+  code after an `if (!guard)` that throws, returns, breaks or continues. `if
+  (!Number.isInteger(n)) throw` now proves `n`.
+- JS string and template escapes are decoded. A query or URL with a backslash used to be
+  dropped without a diagnostic; `'… = \'' + req.query.a + '\''` is now a quoted splice and
+  `SQL_INJECTION_RISK`.
+- Literal dynamic `import()` (`React.lazy`, `next/dynamic`) and side-effect imports load the
+  whole module for dead-code judgements, and a re-export-only `index` barrel is no longer an
+  entry file.
+- Store references matched only by a pattern in test code or fixtures link only to stores
+  other evidence found, so a vendored tool's test SQL no longer creates tables. Unvalidated
+  artifact table names link only to tables the scan found by more than a pattern.
+- `performance/unbounded-sql-fetch` no longer reports a `GROUP BY` whose select list is only
+  group keys, aggregates and constants, in SQL text or SQLAlchemy `select(...)`/`query(...)`
+  with `.group_by(...)` and `func.*` aggregates.
 - A call to a path that is served only for other methods is `API_METHOD_MISMATCH` (a
   likely 405), and a live one is the finding `stack/api-method-mismatch` in a new `stack`
   tool run. A call to a path with no handler at all stays `API_CALL_WITHOUT_HANDLER`.
@@ -271,6 +320,13 @@ Work on `feat/stack-depth-audit`, not yet merged. `pyproject.toml` still says 0.
   vendoring repository runs is not failed by repolens's own code.
 
 ### Fixed
+- The internal configured-origin marker was the text `//configured`, so a literal base
+  `//configured.example.com/api` was read as a configured origin. It is now a NUL-delimited
+  sentinel no URL can contain.
+- A parameter default at the head of a URL is used as the base only when it starts with `/`
+  or a URL scheme: `{ id = "me" }` no longer turns `${id}/profile` into `me/profile`.
+- A PATCH to a GET-only catch-all route is `API_METHOD_MISMATCH`, not
+  `API_CALL_WITHOUT_HANDLER`.
 - `[impact] backend_api_prefix` is no longer applied twice. A route whose resolved path
   already starts with the prefix keeps its path, and the scan reports
   `API_PREFIX_ALREADY_RESOLVED`.
@@ -283,6 +339,11 @@ Work on `feat/stack-depth-audit`, not yet merged. `pyproject.toml` still says 0.
   3000-term concatenation no longer raises `RecursionError`.
 
 ### Upgrade notes
+- **Scanner revision 9**: cached impact indexes are rebuilt. Expect fewer edges and stores:
+  calls behind another service's origin become `EXTERNAL_API_REFERENCE` (list your own in
+  `api_origins`), request wrappers are no longer linked to every handler (those handlers may
+  now report `API_HANDLER_WITHOUT_STATIC_CALLER`), and tables only test code or an artifact's
+  unvalidated list named are gone.
 - **`backend_api_prefix`**: remove it from `[impact]` or `.impact-tracer.json` when the
   application declares the prefix itself (`APIRouter(prefix=...)`,
   `include_router(..., prefix=...)`, a mount). Keep it only for a prefix the code does not

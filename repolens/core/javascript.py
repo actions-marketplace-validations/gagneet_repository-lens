@@ -76,7 +76,9 @@ class Request:
     dynamic: bool
     line: int
     receiver: str = ""     # client binding for `<receiver>.get(...)`; "" for fetch-style calls
-    configured_origin: bool = False  # the URL starts with an env/base-URL value
+    #: The name of the env/base-URL value the URL starts with (`NEXT_PUBLIC_API_URL`), or ""
+    #: when it starts with none. The scanner decides whether that origin is this repository's API.
+    configured_origin: str = ""
     style: str = "fetch"
     #: The receiver is, at this call site, the result of a hook or injection
     #: (`const { api } = useSession()`, `inject(HttpClient)`): a client whose declaration
@@ -175,6 +177,47 @@ _WRAPPERS = frozenset({"as_expression", "satisfies_expression", "parenthesized_e
 
 
 _URL_SCHEME = re.compile(r"^(?:[a-z][a-z0-9+.-]*:)?//", re.I)
+#: A client base behind a configured origin is written `<_CONFIGURED>name<NUL>path`. NUL cannot
+#: appear in a URL the scanner reads (escapes are decoded to U+FFFD there), so no literal base
+#: can be taken for the marker.
+_CONFIGURED = "\0configured-origin:"
+_JS_ESCAPE = re.compile(r"\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|\r\n|[\s\S])")
+_SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\ufffd",
+                   "\n": "", "\r\n": "", "\r": "", "\u2028": "", "\u2029": ""}
+
+
+def decode_escapes(raw: str) -> str:
+    """The value of JS string or template source text: `\\'` is a quote, `\\n` a newline,
+    `\\u{1F600}` its character, a line continuation nothing, and any other escaped character
+    itself. NUL and lone surrogates become U+FFFD, so the text stays printable and encodable."""
+    if "\\" not in raw:
+        return raw
+
+    def character(match) -> str:
+        escape = match.group(1)
+        if escape[0] == "u" and len(escape) > 1:
+            code = int(escape[2:-1] if escape[1] == "{" else escape[1:], 16)
+            return chr(code) if code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF and code else "\ufffd"
+        if escape[0] == "x" and len(escape) == 3:
+            return chr(int(escape[1:], 16)) if escape[1:] != "00" else "\ufffd"
+        return _SIMPLE_ESCAPES.get(escape, escape)
+
+    return _JS_ESCAPE.sub(character, raw)
+
+
+def configured_base(name: str, path: str) -> str:
+    """The client base marker for `path` behind the configured origin `name` (see `split_configured`)."""
+    return f"{_CONFIGURED}{name}\0{path}"
+
+
+def split_configured(base: str) -> tuple[str, str] | None:
+    """(origin name, path) of a base written by `configured_base`, else None."""
+    if not base.startswith(_CONFIGURED):
+        return None
+    name, _, path = base[len(_CONFIGURED):].partition("\0")
+    return name, path
+
+
 _CHARACTER_REFERENCE = re.compile(rb"&(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#[xX][0-9A-Fa-f]+);")
 _FUNCTION_SCOPES = frozenset({"program", "function_declaration", "function_expression", "arrow_function",
                               "method_definition", "generator_function_declaration", "generator_function"})
@@ -338,7 +381,7 @@ def parse_source(text: str, suffix: str) -> JSFacts:
             if initial.type == "string" or (initial.type == "template_string" and not any(
                     child.type == "template_substitution" for child in initial.named_children)):
                 # A template without substitutions is the same constant as a quoted string.
-                constants[value(name)] = value(initial)[1:-1]
+                constants[value(name)] = decode_escapes(value(initial)[1:-1])
             elif initial.type in {"template_string", "binary_expression"}:
                 url_constants[value(name)] = initial
 
@@ -368,7 +411,7 @@ def parse_source(text: str, suffix: str) -> JSFacts:
                 or initial is None or initial.type not in {"string", "template_string"}
                 or any(child.type == "template_substitution" for child in initial.named_children)):
             return None
-        return value(initial)[1:-1]
+        return decode_escapes(value(initial)[1:-1])
 
     def module_url_constant(identifier) -> bool:
         return (identifier is not None and identifier.type == "identifier" and value(identifier) in url_constants
@@ -394,8 +437,7 @@ def parse_source(text: str, suffix: str) -> JSFacts:
                     if right is None or not (right.type == "string" or (right.type == "template_string" and not any(
                             child.type == "template_substitution" for child in right.named_children))):
                         return None
-                    text = value(right)[1:-1]
-                    return None if "\\" in text else text
+                    return decode_escapes(value(right)[1:-1])
             stack.extend(child for child in current.named_children if child is not None)
         return None
 
@@ -404,14 +446,59 @@ def parse_source(text: str, suffix: str) -> JSFacts:
         return ("process.env." in spelled or "import.meta.env" in spelled
                 or bool(_ORIGIN_NAME.search(spelled.rsplit(".", 1)[-1])))
 
-    def template(node, placeholder=None) -> tuple[str, bool, bool] | None:
-        """(text, has substitutions, starts with a configured origin). Substitutions are
-        replaced by byte span, never by a regex that breaks on nested expressions."""
-        pieces, at, dynamic, origin = [], node.start_byte + 1, False, False
+    def origin_name(node) -> str:
+        """The name an origin-like expression reads: `NEXT_PUBLIC_API_URL` for
+        `process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"`, else "origin"."""
+        node = unwrap(node)
+        while (node is not None and node.type == "binary_expression"
+               and value(node.child_by_field_name("operator")) in {"||", "??"}):
+            node = unwrap(node.child_by_field_name("left"))
+        names = re.findall(r"[A-Za-z_$][\w$]*", value(node)) if node is not None else []
+        return names[-1] if names else "origin"
+
+    def empty_string(node) -> bool:
+        return node is not None and node.type in {"string", "template_string"} and value(node) in {'""', "''", "``"}
+
+    def query_like(node, depth: int = 0) -> bool:
+        """A value that only appends a query string: text starting with `?` or `&`,
+        `new URLSearchParams(...)`, `"?" + x`, a ternary between such a value and "", or a
+        binding every assignment of which is one. It adds no path segments to a URL."""
+        node = unwrap(node)
+        if node is None or depth > 4:
+            return False
+        kind = node.type
+        if kind in {"string", "template_string"}:
+            return value(node)[1:2] in {"?", "&"}
+        if kind == "new_expression":
+            return value(node.child_by_field_name("constructor")) == "URLSearchParams"
+        if kind == "binary_expression" and value(node.child_by_field_name("operator")) == "+":
+            return query_like(node.child_by_field_name("left"), depth + 1)
+        if kind == "call_expression":
+            function = node.child_by_field_name("function")
+            return (function is not None and function.type == "member_expression"
+                    and value(function.child_by_field_name("property")) == "toString"
+                    and query_like(function.child_by_field_name("object"), depth + 1))
+        if kind == "ternary_expression":
+            branches = [unwrap(node.child_by_field_name(name)) for name in ("consequence", "alternative")]
+        elif kind == "identifier":
+            found = bindings(node)
+            if not found or any(kind_ != "=" for kind_, _, _ in found):
+                return False
+            branches = [unwrap(initial) for _, _, initial in found]
+        else:
+            return False
+        queries = [query_like(branch, depth + 1) for branch in branches]
+        return any(queries) and all(query or empty_string(branch) for query, branch in zip(queries, branches, strict=True))
+
+    def template(node, placeholder=None) -> tuple[str, bool, str] | None:
+        """(decoded text, has substitutions, the configured origin it starts with or "").
+        Substitutions are replaced by byte span, never by a regex that breaks on nested expressions."""
+        pieces, at, dynamic, origin = [], node.start_byte + 1, False, ""
         for index, child in enumerate(c for c in node.named_children if c.type == "template_substitution"):
-            before = data[at:child.start_byte].decode("utf-8")
+            raw_before = data[at:child.start_byte].decode("utf-8")
+            before = decode_escapes(raw_before)
             expression = child.named_children[0] if child.named_children else None
-            head = index == 0 and not before and expression is not None
+            head = index == 0 and not raw_before and expression is not None
             # A module constant is its literal value, unless it is an absolute URL whose
             # name marks it as the configured origin (`${API_BASE_URL}`), which keeps that meaning.
             constant = module_constant(expression) if placeholder is None else None
@@ -423,18 +510,25 @@ def parse_source(text: str, suffix: str) -> JSFacts:
                 # `${API_URL}/items` where API_URL is `${process.env.X}/api`: keep the `/api`.
                 origin = resolved[2]
                 pieces.append(resolved[0])
-            elif head and placeholder is None and (default := parameter_default(expression)) is not None:
-                # A component rendered without that prop requests the default base.
+            elif (head and placeholder is None and (default := parameter_default(expression)) is not None
+                  and (default.startswith("/") or _URL_SCHEME.match(default))):
+                # A component rendered without that prop requests the default base. Only a base
+                # describes the target: `{ id = "me" }` at the head is a path segment, not a base.
                 dynamic = True
                 pieces.extend((before, default))
             elif head and origin_like(expression):
-                origin = True
+                origin = origin_name(expression)
+            elif (placeholder is None and not head and "?" not in "".join(pieces) + before
+                  and query_like(expression)):
+                # `/items${query}` where query is `?status=open` or "": the path is exactly /items.
+                dynamic = True
+                pieces.extend((before, "?{dynamic}"))
             else:
                 dynamic = True
                 pieces.append(before)
                 pieces.append(placeholder(index) if placeholder else "{dynamic}")
             at = child.end_byte
-        pieces.append(data[at:node.end_byte - 1].decode("utf-8"))
+        pieces.append(decode_escapes(data[at:node.end_byte - 1].decode("utf-8")))
         return "".join(pieces), dynamic, origin
 
     def literal(node) -> tuple[str, bool] | None:
@@ -442,20 +536,17 @@ def parse_source(text: str, suffix: str) -> JSFacts:
         if node is None or node.type not in {"string", "template_string"}:
             return None
         if node.type == "string":
-            raw, dynamic = value(node)[1:-1], False
+            raw, dynamic = decode_escapes(value(node)[1:-1]), False
         else:
             raw, dynamic, origin = template(node)
             if origin:
                 raw, dynamic = "{dynamic}" + raw, True
-        # Escaped URLs/SQL need a language string decoder; don't assert a target.
-        if "\\" in raw:
-            return None
         return raw, dynamic
 
     url_nesting: list = []
 
-    def url_value(node) -> tuple[str, bool, bool] | None:
-        """(path, dynamic, configured origin) for a string, template or `BASE + "/x"`."""
+    def url_value(node) -> tuple[str, bool, str] | None:
+        """(path, dynamic, configured origin name or "") for a string, template or `BASE + "/x"`."""
         node = unwrap(node)
         if node is None:
             return None
@@ -478,7 +569,7 @@ def parse_source(text: str, suffix: str) -> JSFacts:
             head = url_values[binary.id] = joined_url(binary, head)
         return head
 
-    def joined_url(node, head) -> tuple[str, bool, bool] | None:
+    def joined_url(node, head) -> tuple[str, bool, str] | None:
         """`left + right` given the left operand's url_value. A right operand is evaluated
         recursively, so `"/a" + ("/b" + (...))` nested past `_MAX_URL_NESTING` is unresolved."""
         left = node.child_by_field_name("left")
@@ -492,20 +583,20 @@ def parse_source(text: str, suffix: str) -> JSFacts:
         if head and tail and not tail[2]:
             return head[0] + tail[0], head[1] or tail[1], head[2]
         if tail and not tail[2] and origin_like(left):
-            return tail[0], tail[1], True
+            return tail[0], tail[1], origin_name(left)
+        if head and "?" not in head[0] and query_like(node.child_by_field_name("right")):
+            return head[0] + "?{dynamic}", True, head[2]  # `"/api/items" + query`: only a query string
         # `"/api/items/" + id` is a dynamic segment; `"/api" + path` could be any
         # number of segments, so it is not a route at all.
         if head and not head[2] and head[0].endswith("/"):
-            return head[0] + "{dynamic}", True, False
+            return head[0] + "{dynamic}", True, ""
         return None
 
-    def evaluate_url(node) -> tuple[str, bool, bool] | None:
+    def evaluate_url(node) -> tuple[str, bool, str] | None:
         if node.type == "string":
-            raw = value(node)[1:-1]
-            return None if "\\" in raw else (raw, False, False)
+            return decode_escapes(value(node)[1:-1]), False, ""
         if node.type == "template_string":
-            raw, dynamic, origin = template(node)
-            return None if "\\" in raw else (raw, dynamic, origin)
+            return template(node)
         if node.type == "identifier":
             name = value(node)
             if module_url_constant(node) and name not in resolving:
@@ -515,10 +606,15 @@ def parse_source(text: str, suffix: str) -> JSFacts:
                 finally:
                     resolving.discard(name)
             constant = module_constant(node)
-            if constant is None or "\\" in constant or (_URL_SCHEME.match(constant) and origin_like(node)):
+            if constant is None or (_URL_SCHEME.match(constant) and origin_like(node)):
                 return None
-            return constant, False, False
+            return constant, False, ""
         return None
+
+    def client_origin(node) -> str:
+        """The configured origin a non-literal client base names (`baseURL: process.env.API_URL`), or ""."""
+        node = unwrap(node)
+        return origin_name(node) if node is not None and node.type != "string" and origin_like(node) else ""
 
     def string_key(node) -> str:
         return value(node).strip("\"'`") if node is not None else ""
@@ -831,6 +927,9 @@ def parse_source(text: str, suffix: str) -> JSFacts:
             pieces, holes, quotes = [], [], 0
             for piece in spelling:
                 if isinstance(piece, str):
+                    # Source text: `'… = \'' + x + '\''` quotes the value. Decoded escapes never
+                    # hold NUL (U+FFFD instead), which marks a hole here.
+                    piece = decode_escapes(piece)
                     pieces.append(piece)
                     quotes += piece.count("'")
                 else:
@@ -838,8 +937,6 @@ def parse_source(text: str, suffix: str) -> JSFacts:
                     pieces.append("\0")
             spelled.append(("".join(pieces), holes))
         text = max((text for text, _ in spelled), key=len)
-        if "\\" in text:
-            return None
         start = max((int(number) for number in re.findall(r"\$(\d+)", text)), default=0)
         first, *rest = text.split("\0")
         text = first + "".join(f"${start + index + 1}{piece}" for index, piece in enumerate(rest))
@@ -876,34 +973,47 @@ def parse_source(text: str, suffix: str) -> JSFacts:
                 return True
         return False
 
-    def literal_table(node) -> bool:
-        """A `const` object, array or Set whose entries are all literals: an allow-list lookup."""
-        node = unwrap(node)
-        if node is None or node.type != "identifier":
+    def literal_entries(table) -> bool:
+        """An object, array, `new Set([...])`, `new Map([...])`, `Object.freeze(...)` or
+        `Object.keys/values(<literal table>)` whose entries are all literals."""
+        table = unwrap(table)
+        if table is not None and table.type in {"call_expression", "new_expression"}:
+            callee = value(table.child_by_field_name("function") or table.child_by_field_name("constructor"))
+            arguments = table.child_by_field_name("arguments")
+            if arguments is None or len(arguments.named_children) != 1:
+                return False
+            if callee in {"Object.keys", "Object.values"}:
+                return literal_table(arguments.named_children[0])
+            if callee not in {"Object.freeze", "Set", "Map"}:
+                return False
+            table = unwrap(arguments.named_children[0])
+        if table is None or table.type not in {"object", "array"}:
             return False
+        for entry in table.named_children:
+            leaf = unwrap(entry.child_by_field_name("value")) if entry.type == "pair" else unwrap(entry)
+            if leaf is not None and leaf.type == "array" and table.type == "array":  # `new Map([["a", "x"]])`
+                if all(unwrap(item) is not None and unwrap(item).type in {"string", "number"} for item in leaf.named_children):
+                    continue
+            if leaf is None or leaf.type not in {"string", "number", "true", "false", "null"} or entry.type == "spread_element":
+                return False
+        return True
+
+    def literal_table(node) -> bool:
+        """An allow-list lookup: an inline literal table (`["name", "date"]`), or a `const`
+        bound only to one (see `literal_entries`)."""
+        node = unwrap(node)
+        if node is None:
+            return False
+        if node.type != "identifier":
+            return literal_entries(node)
         found = bindings(node)
         if not found:
             return False
         for kind_, anchor, initial in found:
             holder = anchor.parent if anchor is not None else None
-            if kind_ != "=" or holder is None or holder.type != "lexical_declaration" or value(holder.children[0]) != "const":
+            if (kind_ != "=" or holder is None or holder.type != "lexical_declaration"
+                    or value(holder.children[0]) != "const" or not literal_entries(initial)):
                 return False
-            table = unwrap(initial)
-            if table is not None and table.type in {"call_expression", "new_expression"}:
-                callee = table.child_by_field_name("function") or table.child_by_field_name("constructor")
-                arguments = table.child_by_field_name("arguments")
-                if value(callee) not in {"Object.freeze", "Set", "Map"} or arguments is None or len(arguments.named_children) != 1:
-                    return False
-                table = unwrap(arguments.named_children[0])
-            if table is None or table.type not in {"object", "array"}:
-                return False
-            for entry in table.named_children:
-                leaf = unwrap(entry.child_by_field_name("value")) if entry.type == "pair" else unwrap(entry)
-                if leaf is not None and leaf.type == "array" and table.type == "array":  # `new Map([["a", "x"]])`
-                    if all(unwrap(item) is not None and unwrap(item).type in {"string", "number"} for item in leaf.named_children):
-                        continue
-                if leaf is None or leaf.type not in {"string", "number", "true", "false", "null"} or entry.type == "spread_element":
-                    return False
         return True
 
     def allow_listed(condition):
@@ -968,6 +1078,62 @@ def parse_source(text: str, suffix: str) -> JSFacts:
         for field_name in ("consequence", "alternative"):
             if same(parent.child_by_field_name(field_name), child):
                 return value(unwrap(child)) == guarded and (field_name == "alternative") == negated
+        return False
+
+    # Per block or program: [("after", if statement, value) for `if (!OK.includes(x)) throw …`,
+    # ("inside", consequence, value) for `if (OK.includes(x)) { … }`].
+    block_guards: dict[int, list[tuple[str, object, str]]] = {}
+
+    def exits(statement) -> bool:
+        """`statement` always leaves the block: throw, return, break or continue, or a block ending in one."""
+        statement = unwrap(statement)
+        if statement is None:
+            return False
+        if statement.type in {"throw_statement", "return_statement", "break_statement", "continue_statement"}:
+            return True
+        if statement.type == "statement_block":
+            children = [child for child in statement.named_children if child.type != "comment"]
+            return bool(children) and exits(children[-1])
+        return False
+
+    def guards(block) -> list[tuple[str, object, str]]:
+        if block.id not in block_guards:
+            found = []
+            for statement in block.named_children:
+                if statement.type != "if_statement":
+                    continue
+                guarded, negated = allow_listed(statement.child_by_field_name("condition"))
+                consequence = statement.child_by_field_name("consequence")
+                if guarded is None or consequence is None:
+                    continue
+                if not negated:
+                    found.append(("inside", consequence, guarded))
+                elif statement.child_by_field_name("alternative") is None and exits(consequence):
+                    found.append(("after", statement, guarded))
+            block_guards[block.id] = found
+        return block_guards[block.id]
+
+    def statement_guarded(node) -> bool:
+        """`node` is a value an `if` proves allow-listed where it is used: inside the consequence
+        of `if (OK.includes(x))`, or after `if (!OK.includes(x)) throw …` in an enclosing block,
+        with no assignment to it after the proof."""
+        if node.type not in {"identifier", "member_expression", "subscript_expression"}:
+            return False
+        spelled, current = value(node), node
+        while current.parent is not None:
+            block = current.parent
+            if block.type in {"statement_block", "program"}:
+                for shape, anchor, guarded in guards(block):
+                    if guarded != spelled:
+                        continue
+                    proven = (anchor.end_byte <= node.start_byte if shape == "after"
+                              else anchor.start_byte <= node.start_byte < anchor.end_byte)
+                    since = anchor.end_byte if shape == "after" else anchor.start_byte
+                    if proven and not (node.type == "identifier" and any(
+                            kind_ in {"=", "+="} and anchor_ is not None and since <= anchor_.start_byte < node.start_byte
+                            for kind_, anchor_, _ in bindings(node))):
+                        return True
+            current = block
         return False
 
     def imported_from(name: str) -> str | None:
@@ -1063,7 +1229,7 @@ def parse_source(text: str, suffix: str) -> JSFacts:
         stack = [unwrap(node)]
         while stack:
             current = stack.pop()
-            if current is None or guarded_branch(current):
+            if current is None or guarded_branch(current) or statement_guarded(current):
                 continue
             if depth > 48:
                 truncations[0] += 1
@@ -1238,11 +1404,12 @@ def parse_source(text: str, suffix: str) -> JSFacts:
             return ""
         if not server_import:
             server_import.append(bool(_SERVER_IMPORT.search(text)))
-        other_value = False
+        other_value = parameter = False
         for kind_, _anchor, initial in bindings(receiver):
             target = unwrap(initial)
             if target is not None and target.type == "await_expression" and target.named_children:
                 target = unwrap(target.named_children[0])
+            parameter = parameter or kind_ == "param"
             if kind_ != "=" or target is None or target.type not in {"call_expression", "new_expression"}:
                 other_value = other_value or kind_ in {"=", "part"}
                 continue
@@ -1259,7 +1426,56 @@ def parse_source(text: str, suffix: str) -> JSFacts:
             return ""
         handler = any(unwrap(arg) is not None and unwrap(arg).type in {"arrow_function", "function_expression", "function"}
                       for arg in args[1:])
-        return "router" if handler or server_import[0] else ""
+        # `module.exports = function (app) { app.get("/orders", orders.list); }`: a router handed in
+        # by the caller, given a handler by reference.
+        by_reference = parameter and any(unwrap(arg) is not None and unwrap(arg).type in {"identifier", "member_expression"}
+                                         for arg in args[1:])
+        return "router" if handler or by_reference or server_import[0] else ""
+
+    def chained_route(function, args) -> tuple[str, str, str] | None:
+        """(method or ANY, literal path or "", receiver) for `app.route("/x").get(h).post(h)` and
+        hapi/Fastify `server.route({ method, path | url, handler })` on a router-named receiver
+        or in a file importing a server framework; None for any other call."""
+        if function is None or function.type != "member_expression":
+            return None
+        method = value(function.child_by_field_name("property"))
+        target = unwrap(function.child_by_field_name("object"))
+        if not server_import:
+            server_import.append(bool(_SERVER_IMPORT.search(text)))
+
+        def router_named(receiver) -> bool:
+            return receiver is not None and (value(receiver) in _ROUTER_NAMES or server_import[0])
+
+        def literal_path(node) -> str:
+            path = url_value(node) if node is not None else None
+            return path[0] if path and not path[1] and not path[2] else ""
+
+        if method == "route" and len(args) == 1:
+            pairs = object_pairs(args[0])
+            if (not pairs or not router_named(target) or pairs.get("method", False) is False
+                    or not {"path", "url"} & set(pairs) or not {"handler", "options", "config"} & set(pairs)):
+                return None
+            verb = literal(pairs["method"]) if pairs["method"] is not None else None
+            verb_name = verb[0].upper() if verb and not verb[1] and verb[0].lower() in HTTP_METHODS else "ANY"
+            return verb_name, literal_path(pairs.get("path") or pairs.get("url")), value(target)
+        if method not in HTTP_METHODS and method != "all":
+            return None
+        current = target
+        while current is not None and current.type == "call_expression":
+            callee = current.child_by_field_name("function")
+            arguments = current.child_by_field_name("arguments")
+            if callee is None or callee.type != "member_expression" or arguments is None:
+                return None
+            name = value(callee.child_by_field_name("property"))
+            receiver = unwrap(callee.child_by_field_name("object"))
+            if name == "route":
+                if len(arguments.named_children) != 1 or not router_named(receiver):
+                    return None
+                return "ANY" if method == "all" else method.upper(), literal_path(arguments.named_children[0]), value(receiver)
+            if name not in HTTP_METHODS and name != "all":
+                return None
+            current = receiver
+        return None
 
     schemas: dict[str, str] = {}
     for node, owner in order:
@@ -1268,7 +1484,8 @@ def parse_source(text: str, suffix: str) -> JSFacts:
         if kind == "import_statement":
             _collect_import(facts, node, line, value, literal)
         elif kind == "variable_declarator":
-            _declarator_facts(facts, node, line, value, unwrap, literal, object_pairs, declarator_name, schemas, url_value)
+            _declarator_facts(facts, node, line, value, unwrap, literal, object_pairs, declarator_name, schemas, url_value,
+                              client_origin)
         elif kind in {"class_declaration", "abstract_class_declaration"}:
             _entity_facts(facts, node, line, value, literal, object_pairs)
         elif kind == "new_expression":
@@ -1307,7 +1524,7 @@ def parse_source(text: str, suffix: str) -> JSFacts:
         # Tagged templates are call_expression nodes with template_string arguments.
         if arguments is not None and arguments.type == "template_string":
             sql = template(arguments, placeholder=lambda index: f"${index + 1}")
-            if sql and "\\" not in sql[0] and SQL_KEYWORDS.search(sql[0]):
+            if sql and SQL_KEYWORDS.search(sql[0]):
                 # postgres.js/Prisma bind substitutions as parameters; they are not SQL text.
                 facts.queries.append((owner, sql[0], line, False, sql[1] or sql[2]))
             continue
@@ -1332,9 +1549,12 @@ def parse_source(text: str, suffix: str) -> JSFacts:
             if holder is not None and ((holder.type == "export_statement" and any(c.type == "default" for c in holder.children))
                                        or (holder.type == "assignment_expression"
                                            and value(holder.child_by_field_name("left")) == "module.exports")):
-                facts.clients["default"] = _factory_base(called, [unwrap(arg) for arg in args], object_pairs, url_value)
+                facts.clients["default"] = _factory_base(called, [unwrap(arg) for arg in args], object_pairs, url_value,
+                                                         client_origin)
         _request_facts(facts, node, owner, called, args, line, url_value, options_method, object_pairs, literal,
                        hook_bound, route_shape)
+        if (chained := chained_route(function, args)) is not None:
+            facts.route_registrations.append((chained[0], chained[1], line, "router", chained[2]))
         parts = called.split(".")
         method = parts[-1]
         if args and method in {"query", "execute", "raw", "unsafe", "$queryRawUnsafe", "$executeRawUnsafe"}:
@@ -1668,15 +1888,18 @@ def _required_names(pattern, value) -> list[tuple[str, str]]:
     return names
 
 
-def _factory_base(called: str, args, object_pairs, url_value) -> str:
-    """The base URL a client factory call configures: the literal path, `//configured<path>`
-    behind a configured origin, or "" when it has none or it is not literal."""
+def _factory_base(called: str, args, object_pairs, url_value, client_origin) -> str:
+    """The base URL a client factory call configures: the literal path, `configured_base(name,
+    path)` behind a configured origin, or "" when it has none or it is not literal."""
     pairs = object_pairs(args[0]) if args else None
     option = pairs.get(CLIENT_FACTORIES[called]) if pairs else None
     base = url_value(option) if option is not None else None
-    # A base behind a configured origin (`${process.env.API}/api`) keeps its path and is
-    # written with the `//configured` marker, which the scanner reads as a configured origin.
-    return "" if base is None or base[1] else f"//configured{base[0]}" if base[2] else base[0]
+    if base is None and option is not None and (name := client_origin(option)):
+        # `baseURL: process.env.API_URL`: an origin with no literal path, like the template form.
+        return configured_base(name, "")
+    # A base behind a configured origin (`${process.env.API}/api`) keeps its path and the
+    # origin's name, which the scanner reads to decide whether it is this repository's API.
+    return "" if base is None or base[1] else configured_base(base[2], base[0]) if base[2] else base[0]
 
 
 def _bound_names(pattern, value) -> list[str]:
@@ -1698,7 +1921,7 @@ def _bound_names(pattern, value) -> list[str]:
 
 
 def _declarator_facts(facts: JSFacts, node, line: int, value, unwrap, literal, object_pairs,
-                      declarator_name, schemas: dict[str, str], url_value) -> None:
+                      declarator_name, schemas: dict[str, str], url_value, client_origin) -> None:
     name = declarator_name(node)
     target = unwrap(node.child_by_field_name("value"))
     if not name or target is None:
@@ -1718,7 +1941,7 @@ def _declarator_facts(facts: JSFacts, node, line: int, value, unwrap, literal, o
     first = first[0] if first and not first[1] else None
     last = called.rsplit(".", 1)[-1]
     if called in CLIENT_FACTORIES:
-        facts.clients[name] = _factory_base(called, args, object_pairs, url_value)
+        facts.clients[name] = _factory_base(called, args, object_pairs, url_value, client_origin)
     elif last == "pgSchema" and first:
         schemas[name] = first
     elif first and (last in {"pgTable", "pgView", "pgMaterializedView"}

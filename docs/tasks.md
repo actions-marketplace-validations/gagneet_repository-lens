@@ -1,7 +1,7 @@
 # Open tasks: stack-depth audit follow-ups
 
-This list tracks every known open issue and piece of pending work on the
-`feat/stack-depth-audit` branch after the audit of 2026-09-13. Each task records the
+This list tracks every known open issue and piece of pending work after the stack-depth
+audit of 2026-09-13 (merged as PR #16) and the field evaluation of 2026-09-14. Each task records the
 analysis behind it (what was observed, with the probe input and output), what resolving it
 requires, why it matters, and how to verify it.
 
@@ -35,13 +35,12 @@ The evaluation targets are deliberately not named.
 
 ## Index
 
-58 open tasks on 2026-09-14: 2 decision, 50 open, 3 in progress, 3 deferred. 62 items are in the Resolved table.
+43 open tasks on 2026-09-14: 3 decision, 35 open, 2 in progress, 3 deferred. 79 items are in the Resolved table.
 
 | ID | Task | Status | Severity |
 |---|---|---|---|
 | [REL-01](#rel-01--final-verification-pass) | Final verification pass | in progress | high |
 | [REL-04](#rel-04--docsimpactmd-does-not-describe-the-new-diagnostics) | `docs/impact.md` does not describe the new diagnostics | open | low |
-| [REL-05](#rel-05--logical-commits-and-the-pull-request) | Logical commits and the pull request | in progress | medium |
 | [SQL-13](#sql-13--strict-package-scoping-loses-recall-for-a-root-level-schema) | Strict package scoping loses recall for a root-level schema | deferred | low |
 | [SQL-15](#sql-15--all-lowercase-prose-still-passes-the-sql-gate) | All-lowercase prose still passes the SQL gate | open | low |
 | [SQL-16](#sql-16--mongodb-handles-passed-around-without-evidence-are-missed) | MongoDB handles passed around without evidence are missed | open | low–medium |
@@ -49,22 +48,10 @@ The evaluation targets are deliberately not named.
 | [SQL-18](#sql-18--two-diverging-lists-of-test-directories) | Two diverging lists of test directories | in progress | low |
 | [SQL-19](#sql-19--the-foreign-ddl-scan-re-walks-the-tree-and-can-disable-catalogs-silently) | The foreign-DDL scan re-walks the tree and can disable catalogs silently | open | low |
 | [SQL-20](#sql-20--a-search_path-change-hides-every-unqualified-reference-in-its-file) | A `search_path` change hides every unqualified reference in its file | open | low |
-| [JS-06](#js-06--allow-list-guards-are-too-narrow) | Allow-list guards are too narrow | open | medium |
-| [JS-07](#js-07--a-backslash-silently-drops-a-query) | A backslash silently drops a query | open | medium |
-| [JS-08](#js-08--the-single-repository-base-url-fallback-is-applied-too-broadly) | The single-repository base URL fallback is applied too broadly | open | medium |
-| [JS-09](#js-09--configured-origin-suffix-matching-creates-false-links) | Configured-origin suffix matching creates false links | open | medium |
-| [JS-10](#js-10--hook-results-assumed-to-be-http-clients) | Hook results assumed to be HTTP clients | open | medium |
-| [JS-11](#js-11--test-runner-globals-treated-as-clients) | Test-runner globals treated as clients | open | medium |
-| [JS-12](#js-12--client_receivers-overrides-local-bindings) | `client_receivers` overrides local bindings | open | medium |
-| [JS-13](#js-13--liveness-misjudges-dynamic-imports-barrels-and-expo-router) | Liveness misjudges dynamic imports, barrels and Expo Router | open | medium |
+| [JS-10](#js-10--hook-results-assumed-to-be-http-clients) | Hook results assumed to be HTTP clients | decision | medium |
 | [JS-14](#js-14--params-counted-as-request-input-in-any-default-export) | `params` counted as request input in any default export | open | low |
 | [JS-15](#js-15--axiosurl-call-form-not-recognised) | `axios(url)` call form not recognised | open | low |
-| [JS-16](#js-16--environment-and-localhost-base-urls-handled-inconsistently) | Environment and localhost base URLs handled inconsistently | open | low |
-| [JS-17](#js-17--the-configured-origin-marker-collides-with-a-real-url) | The configured-origin marker collides with a real URL | open | low |
-| [JS-18](#js-18--parameter-defaults-used-for-non-url-values) | Parameter defaults used for non-URL values | open | low |
-| [JS-19](#js-19--method-mismatch-check-ignores-catch-all-routes) | Method-mismatch check ignores catch-all routes | open | low |
 | [JS-25](#js-25--two-sql-rebuilding-shapes-are-still-quadratic) | Two SQL-rebuilding shapes are still quadratic | open | low–medium |
-| [JS-26](#js-26--common-route-registration-shapes-are-not-recognised) | Common route registration shapes are not recognised | open | medium |
 | [JS-27](#js-27--unmodelled-route-downgrades-are-repository-wide) | Unmodelled-route downgrades are repository-wide | open | low–medium |
 | [JS-28](#js-28--poolqueryformat-s-x-is-not-seen-as-sql) | `pool.query(format('… %s', x))` is not seen as SQL | open | low |
 | [JS-21](#js-21--known-misses-nuxt-angular-private-fields-hono-base-paths) | Known misses: Nuxt, Angular private fields, Hono base paths | deferred | low |
@@ -89,14 +76,49 @@ The evaluation targets are deliberately not named.
 | [DOC-02](#doc-02--a-dated-audit-document-for-this-pass) | A dated audit document for this pass | open | low |
 | [DOC-03](#doc-03--verify-the-skipped-test-statement-in-claudemd) | Verify the skipped-test statement in CLAUDE.md | open | low |
 | [TEST-01](#test-01--wall-clock-limits-in-tests-can-flake-under-load) | Wall-clock limits in tests can flake under load | open | low |
-| [SCAN-01](#scan-01--grouped-aggregates-reported-as-unbounded-fetches) | Grouped aggregates reported as unbounded fetches | open | medium |
 | [PY-01](#py-01--any-file-or-folder-named-like-a-package-makes-its-imports-local) | Any file or folder named like a package makes its imports local | open | low–medium |
 | [FT-01](#ft-01--featuretrace-maps-match-basenames-by-substring) | FeatureTrace maps match basenames by substring | open | medium |
 | [FT-02](#ft-02--an-untracked-related-target-is-called-nonexistent) | An untracked `Related:` target is called nonexistent | open | low |
 | [FT-03](#ft-03--cross-tag-related-references-are-listed-but-never-drawn) | Cross-tag `Related:` references are listed but never drawn | decision | low |
-| [JS-24](#js-24--open-ended-request-urls-link-to-every-handler-under-the-prefix) | Open-ended request URLs link to every handler under the prefix | open | low |
 | [REL-08](#rel-08--continuous-integration-for-this-repository) | Continuous integration for this repository | open | medium |
 | [REL-09](#rel-09--repolens-vendor-verify) | `repolens vendor verify` | open | low |
+
+---
+
+## Field evaluation, 2026-09-14
+
+A full `repolens analyze` of the large read-only evaluation checkout (6,934 tracked files, 2,417
+Python and 929 JS/TS, a Next.js frontend calling a FastAPI backend, PostgreSQL and MongoDB), with every
+extra installed and writing only to a scratch directory, before and after the fixes below. The
+target's `git status` was the same before and after each run. Every run was incomplete for the
+same real syntax error in an archived script (`PYTHON_PARSE_ERROR`).
+
+| Measure | Before (master `a7638f7`) | After |
+|---|---|---|
+| Run time, peak memory | 2 min, 1.6 GB | 2 min, 1.6 GB |
+| `analysis.json` / `report.md` | 130 MB / 3.5 MB | 130 MB / 3.5 MB (OUT-09) |
+| PostgreSQL tables (regex- or artifact-only) | 270 (56) | 221 (8) |
+| Most handlers one call was matched to | 782 | 10 |
+| `CALLS_API` edges | 1,084 | 998 |
+| `API_CALL_WITHOUT_HANDLER` | 0 | 0 |
+| Findings (P2 + P3) | 1,767 (153 + 1,614) | 1,710 (153 + 1,557) |
+| `API_HANDLER_WITHOUT_STATIC_CALLER` | 1,969 | 1,989 |
+
+What the run showed, and the task each observation maps to:
+- A request wrapper `` `${origin}/api${url}` `` matched every one of 782 handlers under `/api`,
+  and edges went to an arbitrary 12 of them (JS-24).
+- 864 of 1,084 calls took their base URL from the single-base fallback, and 865 come from a
+  client the scanner did not trace, mostly one handed over by a hook (JS-08, JS-10).
+- A vendored copy of an analysis tool, tests included, is scanned as target code. Its SQL test
+  fixtures created 11 tables such as `schema.mv` and `schema.v` (SQL-21).
+- 38 tables came only from a generated artifact's list of unvalidated names (`schema.view`,
+  `schema.fact_`, `schema.generate`) (SQL-22).
+- 403 `performance/unbounded-sql-fetch` findings, many of them grouped aggregates (SCAN-01).
+- 17,926 of 20,554 diagnostics are info-level `AMBIGUOUS_CALL`, and the whole graph is written
+  to `analysis.json` (OUT-09).
+- Not exercised: no JS/TS code splices values into SQL (`SQL_INJECTION_RISK` 0 in both runs), so
+  JS-25/JS-28 found nothing; there is no Prisma schema and only two tracked `.sql` files, so
+  `SQL_UNKNOWN_COLUMN` had almost no catalog to check against.
 
 ---
 
@@ -141,15 +163,6 @@ The evaluation targets are deliberately not named.
 - **Required:** add a short section for each to `docs/impact.md`, linking to `LIMITS` rather
   than repeating it.
 - **Why:** `docs/impact.md` is the reference for the graph's diagnostics.
-
-### REL-05 — Logical commits and the pull request
-- **Status:** in progress · **Severity:** medium
-- **Analysis:** the branch is committed in dependency order, grouped by area (docstrings,
-  SQL, JS/TS, graph pipeline, scan checks and deployment, outputs and provenance, lens and
-  docs build, documentation), and pushed as a pull request against `master`.
-- **Required:** each commit compiles; commit messages and the PR text name no evaluation
-  target; the PR lists the REL-01 results and the GitHub issues it resolves.
-- **Why:** reviewable history, and a bisectable branch if a regression appears in a consumer.
 
 ---
 
@@ -247,60 +260,20 @@ Every JS task comes from the JS/TS audit. JS-01 to JS-05 and JS-20 are in the Re
 A second audit of those fixes (2026-09-14) found SQL dropped from long `+` chains, remaining
 exponential SQL rebuilding, HTML escapers accepted as SQL sanitisers, and ordinary code
 (test mocks, `new Map().get`) hiding warnings repository-wide (A-JS-1 to A-JS-17). Those
-are fixed with tests except where JS-25 to JS-28 below say otherwise. JS-06 to JS-19 were
-not started, apart from the `typeof`/`Number.isInteger` guards noted in JS-06.
-
-### JS-06 — Allow-list guards are too narrow
-- **Status:** open · **Severity:** medium
-- **Analysis:** only ternaries over a named `const` table count as guards. These still flag:
-  - `if (!ALLOWED.includes(sort)) throw …;`
-  - `['name','date'].includes(sort) ? sort : 'name'`
-  - `Object.keys(COLS).includes(sort)`
-- **Required:** accept inline literal arrays, `Object.keys/values(<literal table>)`, and
-  early-exit guards earlier in the same block.
-- **Why:** these are the standard ways to allow-list a sort column.
-- **State (2026-09-14):** the `Number.isInteger`/`typeof` guards landed with JS-05. Inline literal arrays, `Object.keys/values(<table>)` and early-exit guards were not implemented or probed.
-
-### JS-07 — A backslash silently drops a query
-- **Status:** open · **Severity:** medium
-- **Analysis:** any `\` in the text abandons the query with no diagnostic. The classic
-  `'… WHERE a = \'' + req.query.a + '\''` produces no interpolation, no risk, no
-  `DYNAMIC_SQL` and no incomplete marker.
-- **Required:** decode simple JS escapes, bail only on unknown ones, and record the taint even
-  when the SQL text cannot be rebuilt.
-- **Why:** a silent false negative on the exact pattern the security check exists for.
-
-### JS-08 — The single-repository base URL fallback is applied too broadly
-- **Status:** open · **Severity:** medium
-- **Analysis:**
-  - `$.get('/api/orders')` beside an unrelated `axios.create({baseURL:'/v1'})` resolves to
-    `/v1/api/orders`, and Angular `HttpClient` does the same.
-  - `api.get('/api/orders')` with base `/api` resolves to `/api/api/orders`.
-  - Each is a false missing-handler report.
-- **Required:**
-  - Never apply the fallback to jQuery or Angular `HttpClient`.
-  - Do not prepend a base the URL already starts with.
-  - Scope the fallback to the nearest package.
-- **Why:** the fallback exists for untraceable clients, not for every receiver.
-
-### JS-09 — Configured-origin suffix matching creates false links
-- **Status:** open · **Severity:** medium
-- **Analysis:** added during the audit pass so that `${process.env.API_URL}/orders` can match
-  `/api/orders`. Probes:
-  - ``${process.env.STRIPE_API_URL}/v1/charges`` links to a local `GET /api/v1/charges`.
-  - ``${process.env.NEXT_PUBLIC_API_URL}${path}`` links `probable` to an unrelated
-    `/api/users/{dynamic}`.
-  - `/orders` links ambiguously to both `/api/orders` and `/admin/orders`.
-- **Required:**
-  - Require at least one literal segment in the matched path.
-  - Always mark suffix matches `ambiguous`.
-  - Apply them only to origin names that denote this repository's API, never a vendor or
-    other service.
-  - Test with several handlers and with a vendor origin.
-- **Why:** a false link hides a genuinely missing handler behind a plausible edge.
+are fixed with tests except where JS-25 to JS-28 below say otherwise. The field evaluation of
+2026-09-14 led to JS-06 to JS-09, JS-11 to JS-13, JS-16 to JS-19, JS-24 and JS-26 being fixed
+(see Resolved); JS-10 now needs a decision.
 
 ### JS-10 — Hook results assumed to be HTTP clients
-- **Status:** open · **Severity:** medium
+- **Status:** decision · **Severity:** medium
+- **Field evidence (2026-09-14):** on the evaluation repository 865 of 998 linked calls go
+  through a client the scanner did not trace, mostly `const { api } = useAuth()` from a React
+  context. The fix as written below would drop every one of those links unless the repository
+  sets `client_receivers = ["api"]`. The choice is between (a) that fix, with the setting
+  documented as required for the context pattern; (b) tracing a `useX` hook to a context
+  provider whose value is built by a client factory, and keeping the current behaviour
+  otherwise; or (c) (b), and dropping untraced hook results only when no client factory exists
+  in the caller's package.
 - **Analysis:**
   - `usePageTitles().get('/settings')` produces a `CALLS_API` edge and a warning.
   - `useSearch().get(k)` and `useCartStore().delete(k)` produce `DYNAMIC_HTTP_REQUEST` noise.
@@ -308,40 +281,6 @@ not started, apart from the `typeof`/`Number.isInteger` guards noted in JS-06.
 - **Required:** treat a hook result as a client only when the hook traces to a client factory,
   or when it is listed in `client_receivers`. Unresolved hook receivers emit nothing.
 - **Why:** framework semantics, not name lists, keep the rule valid for any codebase.
-
-### JS-11 — Test-runner globals treated as clients
-- **Status:** open · **Severity:** medium
-- **Analysis:** Protractor or WebdriverIO `browser.get('/login')` in an e2e spec produces an
-  `API_CALL_WITHOUT_HANDLER` warning. Cypress `cy` and Playwright `page` have the same shape.
-- **Required:** exclude test and e2e paths, and exclude well-known runner and DOM globals,
-  from free-receiver clients.
-- **Why:** navigation in a browser test is not an API call.
-
-### JS-12 — `client_receivers` overrides local bindings
-- **Status:** open · **Severity:** medium
-- **Analysis:** with `client_receivers = ["api"]`, an Express
-  `const api = express.Router(); api.get('/orders', listOrders)` itself becomes a client call
-  with a warning.
-- **Required:** apply the setting only to free, parameter or hook-bound receivers, never to a
-  router-factory binding.
-- **Why:** a configuration meant for untraceable clients must not reclassify route
-  registrations.
-
-### JS-13 — Liveness misjudges dynamic imports, barrels and Expo Router
-- **Status:** open · **Severity:** medium
-- **Analysis:** each of these wrongly demotes live calls to info:
-  - A literal `import('./Settings')` through `React.lazy` or `next/dynamic` counts as "never
-    imported".
-  - Any `index.ts` barrel counts as an entry. That turns judgements on and marks a `bin/`
-    script's module dead.
-  - Expo Router `app/_layout.tsx` is dead.
-- **Required:**
-  - Count literal dynamic imports.
-  - Do not treat re-export-only `index` files as entries.
-  - Read `package.json` `main`/`module`/`bin`/`exports`.
-  - Add the Expo Router conventions.
-  - Correct the `LIMITS` dead-code sentence.
-- **Why:** demotion hides live warnings, so it must be conservative.
 
 ### JS-14 — `params` counted as request input in any default export
 - **Status:** open · **Severity:** low
@@ -358,36 +297,6 @@ not started, apart from the `typeof`/`Number.isInteger` guards noted in JS-06.
 - **Required:** support a string first argument with an optional config object.
 - **Why:** it is a documented axios form.
 
-### JS-16 — Environment and localhost base URLs handled inconsistently
-- **Status:** open · **Severity:** low
-- **Analysis:**
-  - `baseURL: process.env.API_URL` gives an `exact` local base, while the template form gives
-    a configured origin.
-  - `baseURL: 'http://localhost:8000'` makes every call external.
-- **Required:** treat both as configured origins, with `probable` resolution.
-- **Why:** a development proxy to the repository's own backend is the common case.
-
-### JS-17 — The configured-origin marker collides with a real URL
-- **Status:** open · **Severity:** low
-- **Analysis:** the internal marker `//configured` matches the literal
-  `//configured.example.com/api`.
-- **Required:** use a sentinel that cannot be a URL, in both the extractor and the scanner.
-- **Why:** correctness of an internal protocol.
-
-### JS-18 — Parameter defaults used for non-URL values
-- **Status:** open · **Severity:** low
-- **Analysis:** added during the audit pass. `{ id = 'me' }` at the template head gives
-  `me/profile`, which is then reported as external.
-- **Required:** use a default only when it starts with `/` or a URL scheme.
-- **Why:** only a base-URL default describes the request target.
-
-### JS-19 — Method-mismatch check ignores catch-all routes
-- **Status:** open · **Severity:** low
-- **Analysis:** a PATCH to a GET-only `[...slug]` route is reported as a missing handler
-  instead of a method mismatch.
-- **Required:** reuse `_serves` in `_methods_serving`.
-- **Why:** the more specific diagnostic tells the reader what to fix.
-
 ### JS-25 — Two SQL-rebuilding shapes are still quadratic
 - **Status:** open · **Severity:** low–medium
 - **Analysis:** the second JS audit's fixes made reused bindings, `sql = sql + …` chains and
@@ -399,21 +308,6 @@ not started, apart from the `typeof`/`Number.isInteger` guards noted in JS-06.
   the declaring scope's start, and share the rebuilt prefix between successive queries of the
   same binding. Add timing tests with generous limits (TEST-01).
 - **Why:** generated test suites and migration scripts have exactly these shapes.
-
-### JS-26 — Common route registration shapes are not recognised
-- **Status:** open · **Severity:** medium
-- **Analysis:** these register server routes but are neither modelled nor counted as
-  unmodelled backends, so every client call to them stays an `API_CALL_WITHOUT_HANDLER`
-  warning:
-  - `module.exports = function (app) { app.get('/api/orders', orders.list); }` (a
-    non-inline handler on a parameter);
-  - `app.route('/api/orders').get(…)` chains;
-  - hapi `server.route({ method, path, handler })`;
-  - `fastify.route({ method, url, handler })`.
-- **Required:** recognise `.route(path).<verb>()` chains, `.route({...})` objects, and
-  handlers passed by reference on a router-named parameter of an exported function; test
-  each. `LIMITS` already names them as not recognised.
-- **Why:** false warnings on standard Express, hapi and Fastify code.
 
 ### JS-27 — Unmodelled-route downgrades are repository-wide
 - **Status:** open · **Severity:** low–medium
@@ -459,10 +353,8 @@ not started, apart from the `typeof`/`Number.isInteger` guards noted in JS-06.
   - `.svelte`, `.astro` and `.mdx` disabling dead-code judgements (only `.vue` is tested);
   - Vue `inject`;
   - Remix `clientLoader`;
-  - `client_receivers` against route registrations;
   - taint performance;
-  - the route-name heuristics;
-  - suffix matching with several handlers.
+  - the route-name heuristics.
 - **Required:** add one regression test per claim.
 - **Why:** project rule: a documented capability needs an implementation and a regression
   test.
@@ -719,21 +611,6 @@ profiled, 5 min 23 s unprofiled, before the import-resolution fix.
 Tasks from the verification of the open GitHub issues (#6, #8, #10, #13, #14, #15) and
 the mount investigation on the large evaluation repository.
 
-### SCAN-01 — Grouped aggregates reported as unbounded fetches
-- **Status:** open · **Severity:** medium
-- **Analysis:** `performance/unbounded-sql-fetch` treats an aggregate-only projection with no
-  `GROUP BY` as bounded, but not a `GROUP BY` whose projection is only group keys and
-  aggregates (GitHub issue #6). A field sample of these findings found none actionable: counts
-  per status, sums per month or per category. A query filtered by a tenant or owner key is
-  also reported the same as `SELECT *` over a whole table.
-- **Required:**
-  - Treat a `GROUP BY` query whose projection is only group keys plus aggregates as bounded,
-    or at least low confidence with a note naming the grouping.
-  - Add an optional `[scan.performance] scope_key_patterns` setting (default empty, like
-    `scope_dependency_patterns`) that lowers confidence for a `WHERE` on a matching column.
-  - Test both, plus a genuinely unbounded `SELECT` that still fires.
-- **Why:** low-value findings bury the real unbounded reads and teach people to ignore the rule.
-
 ### PY-01 — Any file or folder named like a package makes its imports local
 - **Status:** open · **Severity:** low–medium
 - **Analysis:** `python_scan._local_python_names` collects every path segment of every
@@ -777,15 +654,6 @@ the mount investigation on the large evaluation repository.
 - **Required:** the maintainer decides between drawing external stub nodes in per-tag maps
   and emitting a distinct advisory. Then add tests.
 - **Why:** a map that silently drops declared links under-reports a feature's reach.
-
-### JS-24 — Open-ended request URLs link to every handler under the prefix
-- **Status:** open · **Severity:** low
-- **Analysis:** a call such as `` `/items${query}` `` is matched as an open-ended prefix, so it
-  gets `ambiguous` edges to `/items`, `/items/{id}` and `/items/export/csv` alike.
-- **Required:** when the trailing value is query-like (built with `URLSearchParams`, or a
-  binding whose literal starts with `?` or `&`), match the exact path only; keep prefix
-  matching for path-like tails.
-- **Why:** inflated impact results for the most common way to append filters.
 
 ### REL-08 — Continuous integration for this repository
 - **Status:** open · **Severity:** medium
@@ -879,3 +747,20 @@ Implemented and covered by tests during this audit pass (verified together under
 | REL-02 `SCANNER_REVISION` bump | Bumped from 7 to 8 after the last extraction change; the CHANGELOG upgrade note says "went from 2 to 8". | `tests.test_impact` |
 | REL-03 Generated API contracts | Unchanged by the later fixes; the committed OpenAPI and Postman documents match a fresh export. | `tests.test_api.ApiTests.test_generated_contracts_match_the_committed_documents` |
 | An aliased router import was lost when a local file shared the framework's name | `_FastAPI._constructors` also reads aliases from the import statements, because a vendored `fastapi.py` anywhere makes `from fastapi import APIRouter as _R` an unbound local import. Found as the one remaining `UNRESOLVED_ROUTER_MOUNT` on the large evaluation repository. | `tests/test_python_graph.py` `test_an_aliased_router_import_survives_a_local_file_named_like_the_framework` |
+| REL-05 Logical commits and the pull request | The stack-depth audit branch was merged into `master` as PR #16. | — |
+| SCAN-01 Grouped aggregates reported as unbounded fetches | A `GROUP BY` whose select list is only group keys (by expression, alias, position or unqualified name), aggregates and constants is bounded, in SQL text and in SQLAlchemy `select`/`query` + `group_by` with `func.*`. Other columns, set operations, `ROLLUP`/`CUBE`/`GROUPING SETS` and nested ORM selects are still reported. `[scan.performance] scope_key_patterns` (default empty) lowers the severity one step (confidence is already low) when every statement's `WHERE` compares a matching column with a value; joins do not count. The message names the column; the note is left out of the fingerprint. On the field evaluation: 403 → 346 findings. | `tests/test_unbounded_fetch.py` `GroupedAggregateTests`, `ScopeKeyTests`; `tests/test_postgres.py` `UnboundedFetchTests` |
+| JS-06 Allow-list guards were too narrow | `literal_table` accepts inline literal arrays, objects and Sets and `Object.keys`/`Object.values` of a literal table. `statement_guarded` accepts a value inside the consequence of `if (guard)`, or after an `if (!guard)` in an enclosing block whose consequence throws, returns, breaks or continues, when no assignment to it follows the guard. | `tests/test_javascript_graph.py` `OriginAndMatchingTests.test_allow_list_guards_beyond_a_named_ternary`, `SANITISER_CASES` (`if (!Number.isInteger(n)) throw` row) |
+| JS-07 A backslash silently dropped a query | `javascript.decode_escapes` decodes JS string and template escapes (`\'`, `\n`, `\x..`, `\u....`, `\u{...}`, line continuations; NUL and lone surrogates become U+FFFD) for URLs, module constants, parameter defaults, tagged templates and SQL text, and quotes are counted on the decoded text. No backslash bail-out remains. | `OriginAndMatchingTests.test_escaped_string_text_is_decoded_not_dropped` |
+| JS-08 The single base URL fallback was applied too broadly | `scanner._untraced_bases`: `client_api_base`, else the one base the caller's package declares (`columns.PackageRoots`), else the repository's one. An assumed base is not prepended to a URL that already starts with it, and `$`, `jQuery`, `axios`, `ky` and `this.<field>` (Angular `HttpClient`) never get one. | `OriginAndMatchingTests.test_the_assumed_base_is_per_package_and_never_added_twice` |
+| JS-09 Configured-origin suffix matching created false links | `Request.configured_origin` carries the origin's name. `scanner._own_origin` accepts a name whose words, after a framework prefix, are all API/BACKEND/SERVER/BASE/URL-like, or one listed in the new `[impact] api_origins`; any other origin is `EXTERNAL_API_REFERENCE` naming it. Suffix matches need a literal segment and are always `ambiguous`; a URL of only runtime segments is `DYNAMIC_HTTP_REQUEST`. | `OriginAndMatchingTests.test_a_vendor_origin_is_external_and_suffix_matches_are_ambiguous`, `test_api_origins_names_an_origin_whose_words_do_not` |
+| JS-11 Test-runner globals treated as clients | `browser`, `cy`, `page`, `driver`, `window`, `document`, `location`, `history`, `navigator`, the storages, `globalThis` and `self` are never untraced clients, nor is any unbound receiver in an `is_test_path` file. | `OriginAndMatchingTests.test_browser_test_runner_navigation_is_not_an_api_call` |
+| JS-12 `client_receivers` overrode local bindings | Did not reproduce on the merged tree: extraction classifies a receiver bound from a router factory (`express.Router()`) as a route registration, and `_resolve_js_requests` skips registrations before it consults `client_receivers`. Regression test added. | `OriginAndMatchingTests.test_client_receivers_do_not_turn_route_registrations_into_calls` |
+| JS-13 Liveness misjudged dynamic imports, barrels and Expo Router | Imports that bind no name (literal `import()`, side-effect imports) are recorded as namespace uses. A re-export-only `index` file is not an entry. `_package_entries` adds files a package.json names in `main`/`module`/`browser`/`bin`/`exports` (with extension and `index` resolution) and every file under `app/` of a package using Expo Router. `LIMITS` corrected. | `LivenessEntryTests.test_loaded_code_is_not_judged_dead` (7 layouts plus one module that stays dead) |
+| JS-16 Environment and localhost base URLs handled inconsistently | `baseURL: process.env.X` is a configured origin with an empty path. A `localhost`, `127.0.0.1`, `0.0.0.0` or `[::1]` origin in a base or URL is this repository, `probable`, without suffix matching. | `OriginAndMatchingTests.test_an_environment_or_localhost_client_base_is_a_configured_origin` |
+| JS-17 The configured-origin marker collided with a real URL | The marker is `\0configured-origin:<name>\0<path>` (`javascript.configured_base`/`split_configured`); a literal `//configured.example.com/api` base is external. | same test |
+| JS-18 Parameter defaults used for non-URL values | A default at the head of a URL is a base only when it starts with `/` or a URL scheme. | `OriginAndMatchingTests.test_only_a_base_url_parameter_default_is_a_base` |
+| JS-19 Method-mismatch check ignored catch-all routes | `_methods_serving` uses `_serves`. | `OriginAndMatchingTests.test_a_patch_to_a_get_only_catch_all_route_is_a_method_mismatch` |
+| JS-24 Open-ended request URLs linked to every handler under the prefix | A query-like tail (text starting with `?`/`&`, `new URLSearchParams`, `"?" + x`, a ternary with `""`, or a binding of those) is spelled `?{dynamic}`, so only the exact path matches. An open-ended or runtime-segment match with more than `max_ambiguous_targets` handlers is not linked: it is `DYNAMIC_HTTP_REQUEST` with the count, and the endpoint stores `matched_handler_count` instead of every handler id. Field evaluation: 782 → 10. | `OriginAndMatchingTests.test_query_string_tails_match_only_their_path`, `test_a_request_wrapper_open_to_every_handler_is_not_linked` |
+| JS-26 Common route registration shapes were not recognised | `chained_route` records `.route(path).<verb>()` chains and hapi/Fastify `.route({ method, path, handler })` objects (`url` for `path`, `options` or `config` for `handler`) on a router-named receiver or in a file importing a server framework; `route_shape` counts a router-named parameter given a handler by reference. All are unmodelled routes. | `UnmodelledRouteEvidenceTests.test_route_chains_route_objects_and_parameter_routers_are_unmodelled_routes` (4 shapes, 3 look-alikes) |
+| SQL-21 Pattern-only store references in test code created stores | Found in the field evaluation: a vendored tool's SQL test fixtures created 11 tables. Regex store matches in `is_test_path` files are recorded on `ScanState.test_store_references` and linked by `_link_test_store_references` (after every other pass, before `mark_unverified_stores`) only to stores other evidence created. | `tests/test_schema_references.py` `TestCodeAndArtifactStoreTests.test_a_pattern_match_in_test_code_links_only_to_a_store_found_elsewhere` |
+| SQL-22 Unvalidated artifact table names became tables | Found in the field evaluation: 38 tables (`schema.view`, `schema.fact_`) came only from the router/datastore artifact's `postgres_unverified_refs`. Such a name now links only to a table the scan found by more than a pattern match; the rest are listed in one `ARTIFACT_STORE_UNCONFIRMED` (info). | `TestCodeAndArtifactStoreTests.test_unvalidated_artifact_names_link_only_to_tables_the_scan_found` |

@@ -36,6 +36,9 @@ class Config:
     # Receiver names that are HTTP clients the scanner cannot trace (`this.http`-style
     # wrappers passed in as arguments). Bindings from hooks (`useAuth()`) are found without it.
     client_receivers: list[str] = field(default_factory=list)
+    # Names of configured origins (`PAYMENTS_API_URL`) that are this repository's API although
+    # their words say otherwise. `NEXT_PUBLIC_API_URL`, `BACKEND_URL` or `baseUrl` need no entry.
+    api_origins: list[str] = field(default_factory=list)
     # Skip untracked files git ignores (backups, build output); tracked files are always read.
     respect_gitignore: bool = True
     max_ambiguous_targets: int = 12
@@ -66,7 +69,8 @@ class Config:
                for ext in self.extensions):
             raise ValueError("extensions must contain suffixes such as .py or .cs")
         self.extensions = {ext.lower() for ext in self.extensions}
-        for name in ("exclude_dirs", "exclude_paths", "pg_schemas", "roles", "toggle_calls", "client_receivers"):
+        for name in ("exclude_dirs", "exclude_paths", "pg_schemas", "roles", "toggle_calls", "client_receivers",
+                     "api_origins"):
             values = getattr(self, name)
             if not isinstance(values, (set, frozenset, list, tuple)) or any(not isinstance(v, str) for v in values):
                 raise ValueError(f"{name} must be a list of strings")
@@ -156,7 +160,7 @@ class Config:
         self.max_ambiguous_targets = integer("max_ambiguous_targets", self.max_ambiguous_targets)
         self.max_file_bytes = integer("max_file_bytes", self.max_file_bytes)
         self.max_files = integer("max_files", self.max_files)
-        for key in ("pg_schemas", "roles", "toggle_calls", "client_receivers"):
+        for key in ("pg_schemas", "roles", "toggle_calls", "client_receivers", "api_origins"):
             if key in raw:
                 setattr(self, key, string_list(key))
         if "mongo_receiver" in raw:

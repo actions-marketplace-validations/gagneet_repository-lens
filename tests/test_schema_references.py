@@ -127,6 +127,44 @@ class SchemaReferenceTests(unittest.TestCase):
                                          "billing.after_comment", "billing.stock"})
 
 
+class TestCodeAndArtifactStoreTests(unittest.TestCase):
+    """Stores that only test code, fixtures or an unvalidated artifact name are not stores."""
+
+    def test_a_pattern_match_in_test_code_links_only_to_a_store_found_elsewhere(self):
+        graph = scan({
+            "src/db.js": 'export const q = "SELECT id FROM billing.invoices";\n',
+            "tests/queries.js": 'export const a = "SELECT id FROM billing.invoices";\n'
+                                'export const b = "SELECT id FROM billing.fixture_only";\n',
+            "tools/vendored-tool/tests/probe.js": 'export const c = "SELECT id FROM billing.v";\n',
+        })
+        self.assertEqual(tables(graph), {"billing.invoices"})
+        sources = {graph.nodes[e.source].label for e in graph.edges
+                   if e.kind == "TOUCHES_STORE" and graph.nodes[e.target].label == "billing.invoices"}
+        self.assertEqual(sources, {"src/db.js", "tests/queries.js"})
+
+    def test_unvalidated_artifact_names_link_only_to_tables_the_scan_found(self):
+        artifact = {"routers": [
+            {"file": "backend/ledger.py", "wired": True, "routes": [], "postgres_tables": ["billing.accounts"]},
+            {"file": "backend/router.py", "wired": True, "routes": [],
+             "postgres_unverified_refs": ["billing.accounts", "billing.view", "billing.fact_", "billing.maybe"]},
+        ]}
+        graph = scan({
+            "docs/architecture/router_datastore_map.json": json.dumps(artifact),
+            "backend/ledger.py": "def ledger():\n    return None\n",
+            "backend/router.py": "def handler():\n    return None\n",
+            "src/db.js": 'export const q = "SELECT id FROM billing.maybe";\n',
+        })
+        self.assertEqual(tables(graph), {"billing.accounts", "billing.maybe"})
+        linked = {(graph.nodes[e.source].label, graph.nodes[e.target].label, e.resolution) for e in graph.edges
+                  if e.kind == "TOUCHES_STORE" and e.origin == "generated_static_artifact"}
+        self.assertEqual(linked, {("backend/ledger.py", "billing.accounts", "declared"),
+                                  ("backend/router.py", "billing.accounts", "ambiguous")})
+        [issue] = [i for i in graph.issues if i.code == "ARTIFACT_STORE_UNCONFIRMED"]
+        self.assertEqual(issue.severity, "info")
+        self.assertIn("3 unvalidated PostgreSQL name(s)", issue.message)
+        self.assertIn("billing.fact_, billing.maybe, billing.view", issue.message)
+
+
 class UnverifiedStoreTests(unittest.TestCase):
     def graph(self) -> Graph:
         graph = Graph("/repo")

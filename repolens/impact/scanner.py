@@ -25,11 +25,11 @@ from .state import (MONGO_NOT_COLLECTIONS, MONGO_READ_METHODS, MONGO_WRITE_METHO
                     PendingCall, ScanState, _add_store_edge, _endpoint_id, _file_id, _rel,
                     _symbol_id, mongo_operation, normalise_route, with_api_prefix)
 from .python_scan import PythonVisitor, _resolve_orm_references, _scan_python  # noqa: F401
-from .render import mark_unverified_stores
+from .render import mark_unverified_stores, unverified_stores
 from ..core import javascript
 from ..core.files import is_test_path
 
-SCANNER_REVISION = 8
+SCANNER_REVISION = 9
 
 
 FEATURE_RE = re.compile(r"@featuretrace:([A-Za-z0-9_.-]+)")
@@ -259,8 +259,9 @@ def _scan_javascript_syntax(state: ScanState, path: Path, text: str, file_node: 
             target_id = _file_id(target)
             graph.add_node(Node(target_id, "file", target, path=target))
             graph.add_edge(Edge(file_node, target_id, "IMPORTS", "exact", f"{rel}:{line}", origin="tree-sitter"))
-            if local:
-                state.imports.setdefault(rel, {})[local] = (target, exported)
+            # `import("./Settings")` in `React.lazy` or `next/dynamic`, and `import "./setup"`, bind
+            # no name but load the whole module; the NUL key can never be a receiver or callee.
+            state.imports.setdefault(rel, {})[local or f"\0{module}"] = (target, exported)
         elif expected_local:
             if PurePosixPath(module.split("?", 1)[0]).suffix.lower() in _ASSET_SUFFIXES:
                 continue  # a stylesheet, image or font: bundler input, not a missing module
@@ -521,63 +522,152 @@ def _client_base(state: ScanState, rel: str, receiver: str) -> str | None:
     return state.http_clients.get(origin) if origin else None
 
 
+#: Framework prefixes of public environment variables: `NEXT_PUBLIC_API_URL` names `API_URL`.
+_ORIGIN_PREFIXES = (("next", "public"), ("nuxt", "public"), ("expo", "public"), ("react", "app"), ("vue", "app"),
+                    ("vite",), ("gatsby",), ("public",))
+#: Words an origin's name is made of when it denotes this repository's own API. Any other word
+#: (`STRIPE_API_URL`, `AUTH_SERVICE_URL`, `supabaseUrl`) names another service.
+_OWN_ORIGIN_WORDS = frozenset({
+    "api", "apis", "backend", "server", "service", "base", "app", "site", "web", "rest", "http", "https",
+    "internal", "local", "gateway", "proxy", "graphql", "origin", "url", "uri", "host", "endpoint", "domain",
+    "address", "addr", "root", "path", "prefix", "v1", "v2", "v3", "v4"})
+#: A development origin on this machine: the repository's own backend behind a dev proxy.
+_LOCAL_ORIGIN = re.compile(r"^(?:https?:)?//(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?=[/?#]|$)", re.I)
+#: Globals whose `.get(url)` is not a request to this repository's API: browser-test runners
+#: (Protractor/WebdriverIO `browser`, Cypress `cy`, Playwright `page`, Selenium `driver`) and DOM objects.
+_NOT_CLIENT_GLOBALS = frozenset({"browser", "cy", "page", "driver", "window", "document", "location", "history",
+                                 "navigator", "localStorage", "sessionStorage", "globalThis", "self"})
+#: Receivers that send a URL as written: axios/ky defaults, jQuery, and Angular's injected HttpClient
+#: (`this.http`). A base URL assumed for an untraced client is never theirs.
+_UNBASED_RECEIVERS = frozenset({"axios", "ky", "$", "jQuery"})
+
+
+def _own_origin(state: ScanState, name: str) -> bool:
+    """Whether a configured origin named `name` is this repository's API: listed in
+    `[impact] api_origins`, or spelled only with words such as API, BACKEND, SERVER or BASE
+    after a framework prefix."""
+    if name.lower() in {origin.lower() for origin in state.config.api_origins}:
+        return True
+    words = [word.lower() for word in re.findall(r"[A-Z]?[a-z0-9]+|[A-Z0-9]+(?![a-z])", name)]
+    for prefix in _ORIGIN_PREFIXES:
+        if tuple(words[:len(prefix)]) == prefix and len(words) > len(prefix):
+            words = words[len(prefix):]
+            break
+    return all(word in _OWN_ORIGIN_WORDS for word in words)
+
+
+def _base_target(state: ScanState, base: str, *, trusted: bool = False) -> tuple[str, str] | None:
+    """(path, configured origin name or "") that a client base puts requests under, or None
+    when the base is another service's: a literal absolute URL that is not this machine, or
+    a configured origin whose name is not this repository's API (unless `trusted`)."""
+    configured = javascript.split_configured(base)
+    if configured is not None:
+        name, path = configured
+        return (path, name) if trusted or _own_origin(state, name) else None
+    if local := _LOCAL_ORIGIN.match(base):
+        return base[local.end():], "localhost"
+    if _URL_SCHEME.match(base):
+        return None
+    return base, ""
+
+
+def _untraced_bases(state: ScanState):
+    """For a file, (base, description) assumed for a client whose declaration cannot be followed.
+
+    `[impact] client_api_base` when set. Otherwise the one base URL the caller's package
+    declares, or, when that package declares none, the one the repository declares; with
+    several candidates the base is unknown. Only bases of this repository's API count."""
+    from .columns import PackageRoots
+
+    explicit = state.config.client_api_base
+    if explicit:
+        if _URL_SCHEME.match(explicit) and not _LOCAL_ORIGIN.match(explicit):
+            # Configured explicitly, so an absolute value still names this repository's API.
+            explicit = javascript.configured_base("client_api_base", "/" + explicit.split("//", 1)[1].partition("/")[2])
+        return lambda _rel: (explicit, "[impact] client_api_base")
+    roots = PackageRoots(state)
+    by_package: dict[str, set[str]] = defaultdict(set)
+    for (rel, _name), base in state.http_clients.items():
+        if base and _base_target(state, base) is not None:
+            by_package[roots.of(rel)].add(base)
+    everywhere = set().union(*by_package.values()) if by_package else set()
+
+    def untraced(rel: str) -> tuple[str, str]:
+        package = roots.of(rel)
+        candidates = by_package.get(package) or everywhere
+        if len(candidates) != 1:
+            return "", ""
+        [base] = candidates
+        configured = javascript.split_configured(base)
+        shown = f"<{configured[0]}>{configured[1]}" if configured else base
+        owner = "this package's" if package and by_package.get(package) else "the repository's"
+        return base, f"{owner} only client base URL ({shown})"
+
+    return untraced
+
+
+def _external_reference(state: ScanState, source: str, evidence: str, origin: str = "") -> None:
+    # A fully qualified URL belongs to a different service unless configured explicitly.
+    # It must not alias a same-path handler in this repository.
+    named = f" (behind `{origin}`, which does not name this repository's API)" if origin else ""
+    state.graph.issues.append(Issue(
+        "EXTERNAL_API_REFERENCE", "info", f"HTTP target is external or relative to runtime configuration{named}.",
+        [source], evidence,
+        "Review service origin and base-path configuration; list an origin in [impact] api_origins if it is this API."))
+
+
 def _resolve_js_requests(state: ScanState) -> None:
     graph = state.graph
-    # A client handed over at run time (`const { api } = useAuth()`, or a name listed in
-    # [impact] client_receivers) cannot be traced to its declaration. Its base URL is
-    # [impact] client_api_base when set; otherwise, when the repository declares exactly one
-    # client base URL, that one is assumed; otherwise it is unknown. A literal absolute base
-    # (`https://api.example.com`) is another service's client, never this repository's API.
-    bases = sorted({base for base in state.http_clients.values()
-                    if base and (base.startswith("//configured") or not _URL_SCHEME.match(base))})
-    if state.config.client_api_base:
-        untraced_base, untraced_source = state.config.client_api_base, "[impact] client_api_base"
-        if _URL_SCHEME.match(untraced_base) and not untraced_base.startswith("//configured"):
-            # Configured explicitly, so an absolute value still names this repository's API.
-            untraced_base = "//configured/" + untraced_base.split("//", 1)[1].partition("/")[2]
-    elif len(bases) == 1:
-        untraced_base = bases[0]
-        untraced_source = f"the repository's only client base URL ({untraced_base.replace('//configured', '<configured origin>')})"
-    else:
-        untraced_base, untraced_source = "", ""
+    untraced_base = _untraced_bases(state)
     for rel, file_node, request in state.js_requests:
         if request.style == _UNMODELLED_ROUTE:
             continue  # a server route registration, read by _detect_endpoint_gaps
         source = _symbol_id(rel, request.owner) if request.owner else file_node
         source = source if source in graph.nodes else file_node
+        evidence = f"{rel}:{request.line}"
         url, resolution = request.url, "exact"
         details = [f"HTTP request syntax ({request.style}); runtime dispatch unverified"]
-        configured = request.configured_origin
+        origin = request.configured_origin
         if request.receiver:
-            base = _client_base(state, rel, request.receiver)
+            base, assumed, trusted = _client_base(state, rel, request.receiver), False, False
             if base is None:
-                if request.receiver in {"axios", "ky"}:
+                if request.receiver in _UNBASED_RECEIVERS or request.receiver.startswith("this."):
                     base = ""
-                elif (request.hook_bound or (rel, request.receiver) in state.js_untraced_clients
-                      or request.receiver in state.config.client_receivers):
+                elif (request.hook_bound or request.receiver in state.config.client_receivers
+                      or ((rel, request.receiver) in state.js_untraced_clients
+                          and request.receiver not in _NOT_CLIENT_GLOBALS and not is_test_path(rel))):
                     if not (request.url.startswith("/") or request.configured_origin):
                         continue  # `params.get("q")` on a hook result is not a request
-                    base, resolution = untraced_base, "probable"
+                    (base, described), assumed, resolution = untraced_base(rel), True, "probable"
+                    trusted = described == "[impact] client_api_base"
                     details.append(f"client `{request.receiver}` was not traced to a declaration; "
-                                   + (f"base URL from {untraced_source}" if untraced_base else "its base URL is unknown"))
+                                   + (f"base URL from {described}" if base else "its base URL is unknown"))
                 else:
                     continue  # `router.get("/x", handler)` and other non-client receivers
             if base and not _URL_SCHEME.match(url):
-                if base.startswith("//configured"):
-                    # The marker javascript._factory_base writes for a base behind a configured origin.
-                    base, configured = base[len("//configured"):], True
-                # A literal absolute base stays absolute, so the request is an external reference.
-                url = base.rstrip("/") + "/" + url.lstrip("/")
+                target = _base_target(state, base, trusted=trusted)
+                if target is None:
+                    configured = javascript.split_configured(base)
+                    _external_reference(state, source, evidence, configured[0] if configured else "")
+                    continue
+                path, base_origin = target
+                prefix = path.rstrip("/")
+                # An assumed base is not added again to a URL that already starts with it.
+                if not (assumed and prefix and (url == prefix or url.startswith(prefix + "/"))):
+                    url = prefix + "/" + url.lstrip("/")
+                origin = origin or base_origin
                 details.append(f"base URL from client `{request.receiver}`")
-        if configured:
+        if not origin and (local := _LOCAL_ORIGIN.match(url)):
+            url, origin = url[local.end():] or "/", "localhost"
+        if origin:
+            if origin != "localhost" and not _own_origin(state, origin) and origin != "client_api_base":
+                _external_reference(state, source, evidence, origin)
+                continue
             resolution = "probable"
-            details.append("URL starts with a configured origin; assumed to be this repository's API")
+            details.append(f"URL starts with a configured origin ({origin}); assumed to be this repository's API")
             url = url if url.startswith("/") else "/" + url
         if not url.startswith("/") or url.startswith("//"):
-            # A fully qualified URL belongs to a different service unless configured
-            # explicitly. It must not alias a same-path handler in this repository.
-            graph.issues.append(Issue("EXTERNAL_API_REFERENCE", "info", "HTTP target is external or relative to runtime configuration.",
-                                      [source], f"{rel}:{request.line}", "Review service origin and base-path configuration."))
+            _external_reference(state, source, evidence)
             continue
         if request.dynamic or request.method == "UNKNOWN":
             resolution = "probable"
@@ -590,15 +680,22 @@ def _resolve_js_requests(state: ScanState) -> None:
             path, resolution = path[:-len("{dynamic}")], "probable"
             details.append("the URL ends in a runtime value joined to its last segment; matched by route prefix")
         route = normalise_route(path)
+        segments = _route_segments(route)
+        if segments and all(segment == "{dynamic}" for segment in segments):
+            # `${API_URL}${path}` or `/${path}`: nothing of the target is spelled, so no handler
+            # can be matched and none can be called missing.
+            graph.issues.append(Issue("DYNAMIC_HTTP_REQUEST", "info", "HTTP URL or method requires runtime values.",
+                                      [source], evidence, "Declare the API mapping or review the request wrapper."))
+            continue
         endpoint = _endpoint_id(request.method, route + "*" if open_tail else route)
         # No path or line: an endpoint node belongs to its handler, and the call site is
         # already the edge's evidence. The first caller must not become its location.
         graph.add_node(Node(endpoint, "endpoint", f"{request.method} {route}{'*' if open_tail else ''}",
                             metadata={"method": request.method, "route": route, "dynamic": request.dynamic,
                                       **({"open_tail": True} if open_tail else {})}))
-        if configured:
+        if origin and origin != "localhost":
             graph.nodes[endpoint].metadata["open_head"] = True
-        graph.add_edge(Edge(source, endpoint, "CALLS_API", resolution, f"{rel}:{request.line}",
+        graph.add_edge(Edge(source, endpoint, "CALLS_API", resolution, evidence,
                             origin="tree-sitter", detail="; ".join(details)))
 
 
@@ -918,10 +1015,13 @@ class _JavaScriptLiveness:
         imports: dict[str, set[str]] = defaultdict(set)
         entries = set()
         callers: list[tuple[str, str]] = []
+        with_code: set[str] = set()
         for edge in graph.edges:
             source, target = graph.nodes.get(edge.source), graph.nodes.get(edge.target)
             if source is None or target is None:
                 continue
+            if edge.kind in {"CONTAINS", "CALLS", "CALLS_API", "RENDERS", "TOUCHES_STORE"}:
+                with_code.add(edge.source)
             if edge.kind == "IMPORTS" and source.path and target.path:
                 imports[source.path].add(target.path)
             elif edge.kind in {"IMPLEMENTED_BY", "HANDLES_API"} and target.path:
@@ -930,10 +1030,19 @@ class _JavaScriptLiveness:
                 callers.append((source.path or "", edge.target))
         for rel, reexports in state.js_reexports.items():
             imports[rel].update(target for target, _, _ in reexports)
+        declared, app_directories = _package_entries(state)
+
+        def entry(node: Node) -> bool:
+            stem = PurePosixPath(node.path).name.split(".")[0].lower()
+            if stem in _ENTRY_STEMS:
+                # A re-export-only `index` barrel is loaded by whoever imports it, not by a runtime.
+                return not (stem == "index" and node.path in state.js_reexports and node.id not in with_code)
+            return (any(directory in "/" + node.path for directory in ("/" + d for d in _ENTRY_DIRECTORIES))
+                    or node.path.startswith(app_directories))
+
+        entries |= declared
         entries |= {n.path for n in graph.nodes.values() if n.kind == "file" and n.path
-                    and n.path.endswith(_JS_SOURCE_SUFFIXES)
-                    and (PurePosixPath(n.path).name.split(".")[0].lower() in _ENTRY_STEMS
-                         or any(directory in "/" + n.path for directory in ("/" + d for d in _ENTRY_DIRECTORIES)))}
+                    and n.path.endswith(_JS_SOURCE_SUFFIXES) and entry(n)}
         # A .vue/.svelte/.astro/.mdx file can import any module, and those imports are not read.
         self.known = bool(entries) and not self._has_unscanned_components(state)
         self.exports = state.js_exports
@@ -990,6 +1099,52 @@ class _JavaScriptLiveness:
         return next(iter_source_files(state.root, config, frozenset()), None) is not None
 
 
+def _manifest_paths(value: object) -> list[str]:
+    """Every string in a package.json `main`/`module`/`browser`/`bin`/`exports` value."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [path for item in value.values() for path in _manifest_paths(item)]
+    if isinstance(value, list):
+        return [path for item in value for path in _manifest_paths(item)]
+    return []
+
+
+def _package_entries(state: ScanState) -> tuple[set[str], tuple[str, ...]]:
+    """(scanned files a package.json names as `main`, `module`, `browser`, `bin` or `exports`,
+    the `app/` directories of packages that use Expo Router, where every file is a route).
+    An unreadable or invalid manifest adds nothing; a named file that was not scanned
+    (`dist/index.js`) is not an entry."""
+    scanned = {_rel(state.root, path) for path in state.files}
+    entries, directories = set(), []
+    for path in state.files:
+        if path.name != "package.json":
+            continue
+        source = read_source(state.root, path, state.config.max_file_bytes)
+        try:
+            manifest = json.loads(source.text) if source.text is not None else None
+        except ValueError:
+            continue
+        if not isinstance(manifest, dict):
+            continue
+        package = PurePosixPath(_rel(state.root, path)).parent.as_posix()
+        package = "" if package == "." else package
+        for key in ("main", "module", "browser", "bin", "exports"):
+            for declared in _manifest_paths(manifest.get(key)):
+                candidate = posixpath.normpath(posixpath.join(package, declared))
+                if candidate.startswith("..") or _URL_SCHEME.match(declared):
+                    continue
+                options = [candidate, *(candidate + suffix for suffix in _JS_SOURCE_SUFFIXES),
+                           *(f"{candidate}/index{suffix}" for suffix in _JS_SOURCE_SUFFIXES)]
+                if found := next((option for option in options if option in scanned), None):
+                    entries.add(found)
+        dependencies = {name for field in ("dependencies", "devDependencies")
+                        if isinstance(manifest.get(field), dict) for name in manifest[field]}
+        if "expo-router" in dependencies or str(manifest.get("main", "")).startswith("expo-router"):
+            directories.append(f"{package}/app/" if package else "app/")
+    return entries, tuple(directories)
+
+
 def _serves(called: list[str], handler: Node, *, open_tail: bool, loose: bool, skip: int = 0) -> bool:
     """Whether `handler`'s route can serve a call with these path segments.
 
@@ -1027,9 +1182,9 @@ def _methods_serving(node: Node, handlers: list[Node]) -> list[str]:
     called = _route_segments(route)
     methods = set()
     for handler in handlers:
-        served = _route_segments(str(handler.metadata.get("route", "")))
-        # As in _match_endpoints: a dynamic handler segment serves any value, a literal one only itself.
-        if len(called) == len(served) and all(c == h or h.startswith("{") for c, h in zip(called, served, strict=True)):
+        # As in _match_endpoints: a dynamic handler segment serves any value, a literal one only
+        # itself, and a catch-all serves everything under its prefix.
+        if _serves(called, handler, open_tail=False, loose=False):
             methods.add(str(handler.metadata.get("method") or ""))
     return sorted(methods - {"", "UNKNOWN", str(node.metadata.get("method"))})
 
@@ -1070,20 +1225,34 @@ def _match_endpoints(state: ScanState) -> None:
             # any literal a handler declares. Tried only when no handler has the call's shape.
             matches = [handler for handler in candidates if _serves(called, handler, open_tail=open_tail, loose=True)]
             reason, loose = "matched, through a runtime segment, to", True
-        if not matches and node.metadata.get("open_head"):
+        suffix = False
+        if not matches and node.metadata.get("open_head") and any(segment != "{dynamic}" for segment in called):
             # `${process.env.API_URL}/items`: the origin may carry a path (`https://host/api`),
-            # so a handler whose route ENDS with the call's segments may serve it.
+            # so a handler whose route ENDS with the call's segments may serve it. Only a call
+            # with a literal segment is matched this way, and never better than `ambiguous`.
             matches = [handler for handler in candidates
                        if any(_serves(called, handler, open_tail=open_tail, loose=False, skip=skip)
                               for skip in range(1, len(_route_segments(str(handler.metadata.get("route", ""))))))]
-            reason, loose = "matched, after the path a configured origin may carry, to", True
+            reason, loose, suffix = "matched, after the path a configured origin may carry, to", True, True
         if not matches:
             continue
-        node.metadata["matched_handlers"] = sorted(handler.id for handler in matches)
         cap = state.config.max_ambiguous_targets
         widened = loose or open_tail
-        resolution = "ambiguous" if widened and len(matches) > 1 else "probable"
-        for handler in sorted(matches, key=lambda item: item.id)[:cap] if widened else matches:
+        if widened and len(matches) > cap:
+            # `/api${path}` in a request wrapper: every handler under /api fits, so a link to
+            # any of them says nothing. The call is reported, not linked and not a gap.
+            node.metadata["matched_handler_count"] = len(matches)
+            for site in sorted({edge.evidence for edge in edges}):
+                graph.issues.append(Issue(
+                    "DYNAMIC_HTTP_REQUEST", "info",
+                    f"{node.label} could be served by {len(matches)} handlers, more than max_ambiguous_targets "
+                    f"({cap}); the URL is too open to link.",
+                    sorted({edge.source for edge in edges if edge.evidence == site}), site,
+                    "Spell more of the path at the call site, or declare the API mapping."))
+            continue
+        node.metadata["matched_handlers"] = sorted(handler.id for handler in matches)
+        resolution = "ambiguous" if suffix or (widened and len(matches) > 1) else "probable"
+        for handler in matches:
             for edge in edges:
                 graph.add_edge(Edge(edge.source, handler.id, "CALLS_API", resolution, edge.evidence, origin=edge.origin,
                                     detail=f"{node.label} {reason} {handler.label}; runtime dispatch unverified"))
@@ -1343,6 +1512,15 @@ def _add_regex_store_edge(graph: Graph, source: str, kind: str, name: str, evide
                     metadata={"unverified": True} if new else None)
 
 
+def _link_test_store_references(state: ScanState) -> None:
+    """Pattern matches in test code link to stores that other evidence already put in the
+    graph. On their own they create none: a test or fixture names sample tables, and a
+    vendored tool's tests name whatever tables its own fixtures use."""
+    for source, kind, name, evidence, detail in state.test_store_references:
+        if stable_id(kind, name) in state.graph.nodes:
+            _add_regex_store_edge(state.graph, source, kind, name, evidence, detail)
+
+
 def _scan_generic(state: ScanState, path: Path, text: str, file_node: str) -> None:
     rel = _rel(state.root, path)
     suffix = path.suffix.lower()
@@ -1364,9 +1542,16 @@ def _scan_generic(state: ScanState, path: Path, text: str, file_node: str) -> No
         state.graph.add_edge(Edge(file_node, tag_id, "DECLARES_CONCEPT", "declared", "featuretrace_marker", origin="declared"))
 
     pg_table_re, mongo_re, role_re, toggle_re = _vocabulary(state.config)
+    if is_test_path(rel):
+        # A pattern match in test code or a fixture (a vendored tool's own tests, sample SQL)
+        # links only to a store other evidence declares; `_link_test_store_references`.
+        def add_store(graph, source, kind, name, evidence, detail=None):
+            state.test_store_references.append((source, kind, name, evidence, detail))
+    else:
+        add_store = _add_regex_store_edge
     for table, evidence in _schema_references(state, rel, suffix, text, pg_table_re) if pg_table_re else ():
-        _add_regex_store_edge(state.graph, file_node, "postgres_table", table, evidence,
-                              "Configured PostgreSQL schema name after a SQL table keyword")
+        add_store(state.graph, file_node, "postgres_table", table, evidence,
+                  "Configured PostgreSQL schema name after a SQL table keyword")
     if suffix == ".py" and not _sql_parser_available() and not pg_table_re:
         # No SQL parser and no schema list: fall back to SQL-shaped string literals.
         # Keywords must be upper case, so a Python `from x import y` never reads as a table.
@@ -1379,8 +1564,8 @@ def _scan_generic(state: ScanState, path: Path, text: str, file_node: str) -> No
                 if first in _SQL_NOT_TABLES or (paren and keyword != "INTO"):
                     continue
                 table = f"{first}.{second}" if second else first
-                _add_regex_store_edge(state.graph, file_node, "postgres_table", table,
-                                      f"{rel}:{line + value.count(chr(10), 0, match.start())}")
+                add_store(state.graph, file_node, "postgres_table", table,
+                          f"{rel}:{line + value.count(chr(10), 0, match.start())}")
     if regex_javascript and mongo_re:
         # Tree-sitter extraction handles collections when it is installed; this fallback
         # still requires a driver method, so `db.connect()` is never a collection, and the
@@ -1389,9 +1574,9 @@ def _scan_generic(state: ScanState, path: Path, text: str, file_node: str) -> No
         for match in mongo_re.finditer(text) if mongo_file else ():
             if match.group(1) in MONGO_NOT_COLLECTIONS:
                 continue
-            _add_regex_store_edge(state.graph, file_node, "mongo_collection", match.group(1),
-                                  f"{rel}:{text.count(chr(10), 0, match.start()) + 1}",
-                                  f"MongoDB driver call ({mongo_operation(match.group(2))})")
+            add_store(state.graph, file_node, "mongo_collection", match.group(1),
+                      f"{rel}:{text.count(chr(10), 0, match.start()) + 1}",
+                      f"MongoDB driver call ({mongo_operation(match.group(2))})")
 
     for role in sorted(set(role_re.findall(text))) if role_re else ():
         role_id = stable_id("policy", f"role:{role}")
@@ -1576,6 +1761,21 @@ def _load_router_datastore_map(state: ScanState) -> None:
             [], configured, "Regenerate or correct the router/datastore JSON artifact.",
         ))
         return
+    pattern_only, unconfirmed = unverified_stores(state.graph), set()
+    try:
+        _load_routers(state, payload, configured, pattern_only, unconfirmed)
+    finally:
+        if unconfirmed:
+            shown = ", ".join(sorted(unconfirmed)[:10]) + (", …" if len(unconfirmed) > 10 else "")
+            state.graph.issues.append(Issue(
+                "ARTIFACT_STORE_UNCONFIRMED", "info",
+                f"{len(unconfirmed)} unvalidated PostgreSQL name(s) in {configured} match no table the scan found "
+                f"and were not added: {shown}.",
+                [], configured, "Regenerate the artifact against the database catalog, or ignore names its "
+                "generator could not validate."))
+
+
+def _load_routers(state: ScanState, payload: dict, configured: str, pattern_only: set[str], unconfirmed: set[str]) -> None:
     for router in payload.get("routers", []):
         router_path = _artifact_rel(state, router.get("file"))
         if not router_path:
@@ -1616,8 +1816,13 @@ def _load_router_datastore_map(state: ScanState) -> None:
                 origin="generated_static_artifact",
             ))
         for name in router.get("postgres_unverified_refs", []):
+            # The generator could not validate these names (`schema.view`, `schema.fact_`), so a
+            # name links only to a table this scan found by other than a pattern match.
             store_id = stable_id("postgres_table", str(name))
-            state.graph.add_node(Node(store_id, "postgres_table", str(name), metadata={"store": str(name), "unverified": True}))
+            known = state.graph.nodes.get(store_id)
+            if known is None or known.kind != "postgres_table" or store_id in pattern_only:
+                unconfirmed.add(str(name))
+                continue
             state.graph.add_edge(Edge(
                 router_id, store_id, "TOUCHES_STORE", "ambiguous", configured,
                 origin="generated_static_artifact", detail="PostgreSQL name not validated against a live catalog",
@@ -1814,7 +2019,8 @@ def _detect_endpoint_gaps(state: ScanState) -> None:
             continue
         called = "CALLS_API" in incoming_kinds[node.id]
         handled = bool({"HANDLES_API", "IMPLEMENTED_BY"} & outgoing_kinds[node.id])
-        if called and not handled and not node.metadata.get("matched_handlers"):
+        if (called and not handled and not node.metadata.get("matched_handlers")
+                and not node.metadata.get("matched_handler_count")):
             if node.metadata.get("method") == "OPTIONS":
                 continue  # a CORS preflight or capability query: frameworks answer it without a handler
             code, severity = "API_CALL_WITHOUT_HANDLER", "warning"
@@ -2049,6 +2255,7 @@ def scan_repository(root: Path, config: Config | None = None, *,
     run_pass("match_endpoints", _match_endpoints, state)
     run_pass("detect_endpoint_gaps", _detect_endpoint_gaps, state)
     run_pass("detect_structural_duplicates", _detect_structural_duplicates, state)
+    run_pass("link_test_store_references", _link_test_store_references, state)
     run_pass("mark_unverified_stores", mark_unverified_stores, graph)
     graph.metadata.update({
         "content_sha256": digest.hexdigest(),

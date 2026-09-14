@@ -52,6 +52,9 @@ class ScanState:
     # (file, receiver) that is a client of unknown declaration: bound from a hook or injection
     # result, or never bound in the file at all (a global `api`).
     js_untraced_clients: set[tuple[str, str]] = field(default_factory=set)
+    # (source node, store kind, name, evidence, detail) matched by a pattern in test code:
+    # linked after the walk, and only to a store other evidence created.
+    test_store_references: list[tuple[str, str, str, str, str | None]] = field(default_factory=list)
     js_models: dict[tuple[str, str], object] = field(default_factory=dict)
     js_model_refs: list[tuple[str, str, str, str, int, str]] = field(default_factory=list)
     js_member_stores: list[tuple[str, str, str, str, str, int]] = field(default_factory=list)

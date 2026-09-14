@@ -785,9 +785,9 @@ class ReviewedExtractionTests(Repo):
         # A template without substitutions is the same constant as a quoted string, and an
         # origin-named absolute constant is a configured origin in either spelling.
         self.assertEqual([(r.owner, r.url, r.configured_origin) for r in facts.requests],
-                         [("a", "/other/items", False), ("b", "/api/items", False),
-                          ("d", "https://svc.example.com/items", False), ("e", "https://svc.example.com/items", False),
-                          ("f", "/items", True), ("g", "/items", True)])
+                         [("a", "/other/items", ""), ("b", "/api/items", ""),
+                          ("d", "https://svc.example.com/items", ""), ("e", "https://svc.example.com/items", ""),
+                          ("f", "/items", "API_URL"), ("g", "/items", "BASE_URL")])
         self.assertIn(6, facts.uncertain_requests)
 
     def test_callback_clients_and_optional_chaining_are_requests(self):
@@ -969,7 +969,7 @@ SANITISER_CASES = [
     ("return pool.query(`SELECT * FROM t LIMIT ${isFinite(n) ? n : 10}`); }", [R]),
     ("return pool.query(`SELECT * FROM t LIMIT ${Number.isInteger(+n) ? n : 10}`); }", [R]),
     ("const lim = Number.isInteger(n) ? n : 10; return pool.query(`SELECT * FROM t LIMIT ${lim}`); }", [""]),
-    ("if (!Number.isInteger(n)) throw new Error(); return pool.query(`SELECT * FROM t LIMIT ${n}`); }", [R]),  # no flow analysis
+    ("if (!Number.isInteger(n)) throw new Error(); return pool.query(`SELECT * FROM t LIMIT ${n}`); }", [""]),  # an early exit
     ("return pool.query(`SELECT * FROM t WHERE a = ${typeof x === 'object' ? x : 1}`); }", [R]),
     # block scope: a `const` in one block is not the same-named `const` in the next (5 is spelled in, no hole)
     ("{ const v = req.query.x; log(v); } { const v = 5; return pool.query(`SELECT * FROM t LIMIT ${v}`); } }", []),
@@ -1106,6 +1106,242 @@ class UnmodelledRouteEvidenceTests(Repo):
                 if name == "express router":
                     message = next(i.message for i in self.graph.issues if i.code == "API_CALL_WITHOUT_HANDLER")
                     self.assertIn("`router.all()` on a router", message)
+
+    def test_route_chains_route_objects_and_parameter_routers_are_unmodelled_routes(self):
+        info = [("API_CALL_WITHOUT_HANDLER", "info"), ("API_METHOD_MISMATCH", "info")]
+        for name, extra in {
+            "exported function, handlers by reference": {
+                "server/orders.js": "module.exports = function (app) { app.get('/api/orders', orders.list); };\n"},
+            "route chain": {
+                "server/orders.js": "const router = require('express').Router();\n"
+                                    "router.route('/api/orders').get(list).post(create);\nmodule.exports = router;\n"},
+            "hapi route object": {
+                "server/orders.js": "exports.plugin = { register(server) {\n"
+                                    "  server.route({ method: 'GET', path: '/api/orders', handler: list });\n} };\n"},
+            "fastify route object": {
+                "server/orders.js": "export default async function (fastify) {\n"
+                                    "  fastify.route({ method: 'POST', url: '/api/orders', handler: create });\n}\n"},
+        }.items():
+            with self.subTest(name):
+                self.fresh()
+                self.assertEqual(self.severities(extra), info)
+        for name, extra in {
+            "a client parameter given an options object": {
+                "web/src/load.ts": "export function load(api) { return api.get('/api/orders', { params: {} }); }\n"},
+            "a route lookup on a non-router": {
+                "web/src/nav.ts": "export const t = navigation.route('/orders').get('title');\n"},
+            "an object without a handler": {
+                "web/src/menu.ts": "export const m = menu.route({ method: 'GET', path: '/orders' });\n"},
+        }.items():
+            with self.subTest(name):
+                self.fresh()
+                self.assertEqual(self.severities(extra), [("API_CALL_WITHOUT_HANDLER", "warning"),
+                                                          ("API_METHOD_MISMATCH", "warning")])
+
+
+@unittest.skipUnless(HAS_STACK, "install repolens[stack]")
+class LivenessEntryTests(Repo):
+    """Code a bundler, package manager or router loads is live, so its gaps stay warnings."""
+
+    def gap(self, files):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        for path, text in files.items():
+            self.write(path, text)
+        self.scan()
+        return [(i.severity, i.message) for i in self.graph.issues if i.code == "API_CALL_WITHOUT_HANDLER"]
+
+    def test_loaded_code_is_not_judged_dead(self):
+        page = {"package.json": "{}", "app/page.tsx": "export default function P(){ return null; }\n"}
+        settings = {"src/Settings.tsx": "export default function Settings(){ fetch('/api/missing'); return null; }\n"}
+        for name, files in {
+            "React.lazy": {**page, **settings, "app/layout.tsx":
+                           "const S = React.lazy(() => import('../src/Settings'));\nexport default function L(){ return null; }\n"},
+            "next/dynamic": {**page, **settings, "app/layout.tsx":
+                             "import dynamic from 'next/dynamic';\nconst S = dynamic(() => import('../src/Settings'));\n"
+                             "export default function L(){ return null; }\n"},
+            "a side-effect import": {**page, **settings, "app/layout.tsx":
+                                     "import '../src/Settings';\nexport default function L(){ return null; }\n"},
+            "package.json bin": {"package.json": '{"bin": {"tool": "bin/cli.js"}}', "bin/cli.js": "require('../lib/run').run();\n",
+                                 "lib/run.js": "exports.run = () => fetch('/api/missing');\n"},
+            "package.json main without extension": {"package.json": '{"main": "lib/start"}', "lib/start.js": "fetch('/api/missing');\n",
+                                                    "app/page.tsx": "export default function P(){ return null; }\n"},
+            "a barrel index is not an entry": {"src/index.ts": "export * from './a';\n", "src/a.ts": "export const a = 1;\n",
+                                               "lib/run.js": "fetch('/api/missing');\n"},
+            "Expo Router": {"package.json": '{"main": "expo-router/entry"}', "app/index.tsx": "export default function H(){ return null; }\n",
+                            "app/_layout.tsx": "export default function Layout(){ fetch('/api/missing'); return null; }\n",
+                            "app/settings.tsx": "export default function S(){ fetch('/api/missing'); return null; }\n"},
+        }.items():
+            with self.subTest(name):
+                self.assertEqual({severity for severity, _ in self.gap(files)}, {"warning"})
+        # A module nothing loads is still judged dead.
+        dead = self.gap({**page, "src/Unused.tsx": "export default function U(){ fetch('/api/missing'); return null; }\n"})
+        self.assertEqual([severity for severity, _ in dead], ["info"])
+
+
+@unittest.skipUnless(HAS_STACK, "install repolens[stack]")
+class OriginAndMatchingTests(Repo):
+    """Which origin a request goes to, which base URL is assumed for it, and how widely an
+    incomplete URL may be matched."""
+
+    def issues(self, code):
+        return [i for i in self.graph.issues if i.code == code]
+
+    def calls(self):
+        return {(self.graph.nodes[e.source].label, self.graph.nodes[e.target].label, e.resolution)
+                for e in self.graph.edges if e.kind == "CALLS_API"}
+
+    def router(self, path, *routes):
+        body = "from fastapi import APIRouter\nrouter = APIRouter()\n"
+        for index, (method, route) in enumerate(routes):
+            body += f"@router.{method}('{route}')\ndef handler_{index}(): return []\n"
+        self.write(path, body)
+
+    def test_a_vendor_origin_is_external_and_suffix_matches_are_ambiguous(self):
+        self.router("backend/routes.py", ("get", "/api/v1/charges"), ("get", "/api/orders"), ("get", "/admin/orders"),
+                    ("get", "/api/users/{user_id}"))
+        self.write("frontend/src/index.jsx",
+                   "export function Pay() { return fetch(`${process.env.STRIPE_API_URL}/v1/charges`); }\n"
+                   "export function Any({ path }) { return fetch(`${process.env.NEXT_PUBLIC_API_URL}${path}`); }\n"
+                   "export function Orders() { return fetch(`${process.env.NEXT_PUBLIC_API_URL}/orders`); }\n")
+        self.scan()
+        self.assertEqual({(s, t, r) for s, t, r in self.calls() if s in {"Pay", "Any"} and not t.endswith("/charges*")}, set())
+        self.assertFalse({c for c in self.calls() if c[0] == "Pay"})
+        [external] = self.issues("EXTERNAL_API_REFERENCE")
+        self.assertIn("`STRIPE_API_URL`", external.message)
+        self.assertEqual([i.evidence for i in self.issues("DYNAMIC_HTTP_REQUEST")], ["frontend/src/index.jsx:2"])
+        self.assertTrue({("Orders", "GET /api/orders", "ambiguous"), ("Orders", "GET /admin/orders", "ambiguous")}
+                        <= self.calls())
+        self.assertEqual(self.issues("API_CALL_WITHOUT_HANDLER"), [])
+
+    def test_api_origins_names_an_origin_whose_words_do_not(self):
+        self.router("backend/routes.py", ("get", "/api/orders"))
+        self.write("frontend/src/index.jsx", "export function A() { return fetch(`${process.env.PAYMENTS_API_URL}/api/orders`); }\n")
+        self.scan()
+        self.assertEqual(self.calls(), set())
+        self.write("repolens.toml", '[impact]\napi_origins = ["PAYMENTS_API_URL"]\n')
+        from repolens.impact.config import Config
+        self.graph = scan_repository(self.root, Config.load(self.root))
+        self.assertEqual(self.calls(), {("A", "GET /api/orders", "probable")})
+
+    def test_an_environment_or_localhost_client_base_is_a_configured_origin(self):
+        self.router("backend/routes.py", ("get", "/orders"), ("get", "/items"))
+        self.write("frontend/src/api.js",
+                   "import axios from 'axios';\n"
+                   "export const api = axios.create({ baseURL: process.env.API_URL });\n"
+                   "export const local = axios.create({ baseURL: 'http://localhost:8000' });\n"
+                   "export const marker = axios.create({ baseURL: '//configured.example.com/api' });\n"
+                   "export const a = () => api.get('/orders');\nexport const b = () => local.get('/items');\n"
+                   "export const c = () => marker.get('/items');\n"
+                   "export const d = () => fetch('http://127.0.0.1:8000/items');\n")
+        self.scan()
+        self.assertEqual({c for c in self.calls() if c[0] in {"a", "b", "c", "d"}},
+                         {("a", "GET /orders", "probable"), ("b", "GET /items", "probable"), ("d", "GET /items", "probable")})
+        self.assertEqual([i.evidence for i in self.issues("EXTERNAL_API_REFERENCE")], ["frontend/src/api.js:7"])
+
+    def test_only_a_base_url_parameter_default_is_a_base(self):
+        facts = javascript.parse_source(
+            "export function P({ id = 'me' }) { return fetch(`${id}/profile`); }\n"
+            "export function Q({ base = '/api' }) { return fetch(`${base}/profile`); }\n", ".jsx")
+        self.assertEqual([(r.url, r.dynamic) for r in facts.requests], [("{dynamic}/profile", True), ("/api/profile", True)])
+
+    def test_query_string_tails_match_only_their_path(self):
+        self.router("backend/routes.py", ("get", "/api/items"), ("get", "/api/items/{item_id}"), ("get", "/api/items/export/csv"))
+        self.write("frontend/src/index.jsx",
+                   "export function A({ params }) {\n"
+                   "  const query = params.toString() ? `?${params}` : '';\n  return fetch(`/api/items${query}`);\n}\n"
+                   "export function B({ status }) { return fetch('/api/items' + (status ? `?status=${status}` : '')); }\n"
+                   "export function C({ suffix }) { return fetch(`/api/items${suffix}`); }\n")
+        self.scan()
+        calls = self.calls()
+        self.assertEqual({t for s, t, _ in calls if s in {"A", "B"}}, {"GET /api/items"})
+        self.assertEqual({t for s, t, _ in calls if s == "C" and not t.endswith("*")},
+                         {"GET /api/items", "GET /api/items/{dynamic}", "GET /api/items/export/csv"})
+
+    def test_a_request_wrapper_open_to_every_handler_is_not_linked(self):
+        self.router("backend/routes.py", *[("get", f"/api/resource{index}") for index in range(13)])
+        self.write("frontend/src/fetcher.js",
+                   "import axios from 'axios';\n"
+                   "export const fetcher = { get: (url) => axios.get(`${process.env.NEXT_PUBLIC_BACKEND_URL"
+                   " || 'http://localhost:8000'}/api${url}`) };\n")
+        self.scan()
+        self.assertEqual({c for c in self.calls() if not c[1].endswith("*")}, set())
+        [issue] = [i for i in self.issues("DYNAMIC_HTTP_REQUEST") if "handlers" in i.message]
+        self.assertIn("GET /api* could be served by 13 handlers", issue.message)
+        self.assertEqual(self.issues("API_CALL_WITHOUT_HANDLER"), [])
+
+    def test_the_assumed_base_is_per_package_and_never_added_twice(self):
+        self.router("backend/routes.py", ("get", "/api/orders"), ("get", "/v1/items"), ("get", "/admin-api/users"),
+                    ("get", "/api/profile"))
+        self.write("web/package.json", "{}")
+        self.write("web/src/lib/api.js", "import axios from 'axios';\nexport const client = axios.create({ baseURL: '/v1' });\n")
+        self.write("web/src/Board.jsx",
+                   "export function Board() {\n  const { api } = useSession();\n  api.get('/v1/items');\n"
+                   "  $.get('/api/orders');\n  return null;\n}\n"
+                   "export class ProfileService {\n  constructor(private http: HttpClient) {}\n"
+                   "  load() { return this.http.get('/api/profile'); }\n}\n")
+        self.write("admin/package.json", "{}")
+        self.write("admin/src/lib/api.js", "import axios from 'axios';\nexport const client = axios.create({ baseURL: '/admin-api' });\n")
+        self.write("admin/src/Users.jsx", "export function Users() { const { api } = useSession(); api.get('/users'); return null; }\n")
+        self.scan()
+        targets = {t for _, t, _ in self.calls()}
+        self.assertTrue({"GET /v1/items", "GET /api/orders", "GET /admin-api/users"} <= targets, targets)
+        self.assertFalse({"GET /v1/v1/items", "GET /v1/api/orders", "GET /v1/api/profile"} & targets)
+        self.assertEqual(self.issues("API_CALL_WITHOUT_HANDLER"), [])
+
+    def test_browser_test_runner_navigation_is_not_an_api_call(self):
+        self.write("e2e/login.spec.js", "it('logs in', () => { browser.get('/login'); api.get('/api/session'); });\n")
+        self.write("src/tour.js", "export function start() { browser.get('/welcome'); driver.get('/start'); }\n")
+        self.scan()
+        self.assertEqual(self.calls(), set())
+        self.assertEqual(self.issues("API_CALL_WITHOUT_HANDLER"), [])
+
+    def test_client_receivers_do_not_turn_route_registrations_into_calls(self):
+        self.write("repolens.toml", '[impact]\nclient_receivers = ["api"]\n')
+        self.write("server/routes.js", "const express = require('express');\nconst api = express.Router();\n"
+                                       "api.get('/orders', listOrders);\napi.post('/orders', create);\nmodule.exports = api;\n")
+        from repolens.impact.config import Config
+        self.graph = scan_repository(self.root, Config.load(self.root))
+        self.assertEqual(self.calls(), set())
+
+    def test_a_patch_to_a_get_only_catch_all_route_is_a_method_mismatch(self):
+        self.write("package.json", "{}")
+        self.write("app/api/docs/[...slug]/route.ts", "export async function GET() { return new Response(); }\n")
+        self.write("app/page.tsx", "export default function P() { fetch('/api/docs/a/b', { method: 'PATCH' }); return null; }\n")
+        self.scan()
+        self.assertEqual([i.code for i in self.graph.issues if i.code in {"API_METHOD_MISMATCH", "API_CALL_WITHOUT_HANDLER"}],
+                         ["API_METHOD_MISMATCH"])
+
+    def test_escaped_string_text_is_decoded_not_dropped(self):
+        source = ("export async function h(req) { await fetch('/api/it\\u0065ms');\n"
+                  "  return pool.query('SELECT * FROM orders WHERE a = \\'' + req.query.a + '\\''); }\n")
+        facts = javascript.parse_source(source, ".ts")
+        self.assertEqual([r.url for r in facts.requests], ["/api/items"])
+        self.assertEqual([text for _, text, *_ in facts.queries], ["SELECT * FROM orders WHERE a = '$1'"])
+        [(_, _, holes)] = facts.sql_interpolations
+        self.assertEqual(holes, [("req.query.a", R, True)])
+
+    def test_allow_list_guards_beyond_a_named_ternary(self):
+        safe = [
+            "if (!['name', 'date'].includes(x)) throw new Error('bad sort'); return pool.query(`SELECT * FROM t ORDER BY ${x}`); }",
+            "const SORT = { name: 'name', date: 'created_at' }; if (!Object.keys(SORT).includes(x)) { return null; }"
+            " return pool.query(`SELECT * FROM t ORDER BY ${x}`); }",
+            "return pool.query(`SELECT * FROM t ORDER BY ${['name', 'date'].includes(x) ? x : 'name'}`); }",
+            "const OK = new Set(['a', 'b']); if (OK.has(x)) { return pool.query(`SELECT * FROM t ORDER BY ${x}`); } }",
+        ]
+        unsafe = [
+            "if (!['name'].includes(x)) console.warn('bad'); return pool.query(`SELECT * FROM t ORDER BY ${x}`); }",
+            "let y = req.query.x; if (!['a'].includes(y)) throw 1; y = req.query.z; return pool.query(`SELECT ${y}`); }",
+            "if (['a'].includes(x)) { log(x); } return pool.query(`SELECT * FROM t ORDER BY ${x}`); }",
+            "if (![n].includes(x)) throw 1; return pool.query(`SELECT * FROM t ORDER BY ${x}`); }",
+        ]
+        for body in safe:
+            with self.subTest(body=body):
+                self.assertEqual(origins(H + body), [""])
+        for body in unsafe:
+            with self.subTest(body=body):
+                self.assertEqual(origins(H + body), [R])
 
 
 if __name__ == "__main__":

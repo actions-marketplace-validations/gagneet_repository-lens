@@ -100,10 +100,11 @@ Put an `[impact]` section in the target repository's `repolens.toml`, place `.im
 
 Application vocabulary is configuration too, and empty by default: `pg_schemas` (schemas whose `<schema>.<table>` names are PostgreSQL tables), `roles` (literal role names), `toggle_calls` (regex fragments for a call whose first argument is a feature toggle) and `mongo_receiver` (default `db`).
 
-Three more keys shape what is read and how HTTP clients resolve:
+Four more keys shape what is read and how HTTP clients resolve:
 
-- `client_api_base`: the base path for an HTTP client the scanner cannot trace to its declaration, such as `const { api } = useAuth()`. When it is unset and the repository declares exactly one client base URL, that one is used.
-- `client_receivers`: receiver names (for example `http`) that are such clients.
+- `client_api_base`: the base path for an HTTP client the scanner cannot trace to its declaration, such as `const { api } = useAuth()`. When it is unset, the one client base URL the caller's package declares is used, or, when that package declares none, the one the repository declares. A URL that already starts with that base does not get it twice, and jQuery, Angular `HttpClient` and bare axios/ky calls never get it.
+- `client_receivers`: receiver names (for example `http`) that are such clients. Browser-test globals (`browser`, `cy`, `page`, `driver`) and unbound receivers in test code are not.
+- `api_origins`: names of configured origins that are this repository's API although their words say otherwise, such as `PAYMENTS_API_URL`. A URL starting with `process.env.NEXT_PUBLIC_API_URL`, `BACKEND_URL`, `baseUrl` or a `localhost` origin needs no entry; any other origin name (`STRIPE_API_URL`) is reported as `EXTERNAL_API_REFERENCE` instead of being matched to local handlers.
 - `respect_gitignore` (default `true`): untracked files that git ignores (backups, build output) are skipped by the graph and by the built-in Python checks; tracked files are always read. When git cannot list them the scan reports `GITIGNORE_UNAVAILABLE` (info) and reads everything.
 
 ```json
