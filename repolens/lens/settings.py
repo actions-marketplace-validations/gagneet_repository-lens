@@ -6,10 +6,17 @@ from pathlib import Path
 
 from ..config import Config, merge
 
+JAVASCRIPT_PARSERS = ("regex", "tree-sitter")
+
 DEFAULTS: dict = {
     "python_roots": ["."],
     "frontend_roots": [],
     "frontend_extensions": [".ts", ".tsx", ".js", ".jsx"],
+    # How frontend declarations are extracted: "regex" or "tree-sitter". Named, never
+    # detected: the committed digest must not depend on which extras a machine has
+    # installed. "regex" is the default because every index committed before this
+    # setting existed was built by it, and it needs nothing installed.
+    "javascript_parser": "regex",
     "tests_dir": "tests",
     "test_extensions": [".py", ".ts", ".tsx", ".js", ".jsx"],
     # Whole path components. `alembic/versions` is a run of two: a migration's
@@ -44,6 +51,7 @@ class LensSettings:
     python_roots: list[str]
     frontend_roots: list[str]
     frontend_extensions: list[str]
+    javascript_parser: str
     tests_dir: str
     test_extensions: list[str]
     skip_parts: list[str]
@@ -67,11 +75,19 @@ class LensSettings:
 def from_config(cfg: Config) -> LensSettings:
     d = merge(DEFAULTS, cfg.section("lens"))
     root = cfg.root
+    parser = d["javascript_parser"]
+    if parser not in JAVASCRIPT_PARSERS:
+        # No "auto": a parser chosen by what happens to be importable makes the committed
+        # digest machine-dependent, and `--check` then reports the machine as staleness.
+        raise SystemExit(f"[lens] javascript_parser must be one of {', '.join(map(repr, JAVASCRIPT_PARSERS))}, "
+                         f"not {parser!r}. It is never detected: a committed index has to "
+                         "come out the same on every machine.")
     return LensSettings(
         root=root,
         python_roots=list(d["python_roots"]),
         frontend_roots=list(d["frontend_roots"]),
         frontend_extensions=list(d["frontend_extensions"]),
+        javascript_parser=parser,
         tests_dir=d["tests_dir"],
         test_extensions=list(d["test_extensions"]),
         skip_parts=list(d["skip_parts"]),

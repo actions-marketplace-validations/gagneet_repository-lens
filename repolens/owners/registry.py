@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import warnings
 import argparse
 import ast
 import hashlib
@@ -96,6 +97,11 @@ class OwnerRegistry:
         self._js_lines: dict[Path, tuple[tuple[int, str], ...]] = {}
 
     def load_registry(self) -> dict:
+        """Read the YAML registry, exiting with an actionable message if it cannot be used.
+
+        Raises `SystemExit` when PyYAML is missing or the document is not a mapping
+        with a `concepts` key.
+        """
         try:
             import yaml
         except ImportError:
@@ -120,16 +126,19 @@ class OwnerRegistry:
     # and the violation lists this feeds are committed.
     @cached_property
     def python_files(self) -> tuple[Path, ...]:
+        """Python files under `python_roots`, minus skipped parts, in POSIX-string order."""
         found = iter_files(self.s.root, self.s.python_roots, [".py"], self.s.skip_parts)
         return tuple(sorted(found, key=lambda p: p.as_posix()))
 
     @cached_property
     def javascript_files(self) -> tuple[Path, ...]:
+        """JS/TS files under `javascript_roots`, minus skipped parts, in POSIX-string order."""
         found = iter_files(self.s.root, self.s.javascript_roots,
                            self.s.javascript_extensions, self.s.skip_parts)
         return tuple(sorted(found, key=lambda p: p.as_posix()))
 
     def source_files(self, language: str) -> tuple[Path, ...]:
+        """The scanned files for `language`; `ValueError` for an unsupported language."""
         if language == "python":
             return self.python_files
         if language == "javascript":
@@ -149,7 +158,9 @@ class OwnerRegistry:
         error is not this check's business to report."""
         if path not in self._trees:
             try:
-                self._trees[path] = ast.parse(self._source(path))
+                with warnings.catch_warnings():  # target code's own SyntaxWarnings are not ours to print
+                    warnings.simplefilter("ignore")
+                    self._trees[path] = ast.parse(self._source(path))
             except (SyntaxError, ValueError, RecursionError):
                 self._trees[path] = None
         return self._trees[path]
@@ -262,6 +273,11 @@ class OwnerRegistry:
         return any(re.search(rf"\b{re.escape(owner)}\b", body) for owner in owner_symbols_)
 
     def delegates(self, language: str, path: Path, symbol: str, owner_symbols_: list[str]) -> bool:
+        """True if `symbol` in `path` references an owner symbol, i.e. forwards to it.
+
+        False for an unsupported language. JavaScript is checked textually over the
+        first 80 code lines from the symbol's declaration.
+        """
         if language == "python":
             return self._delegates_python(path, symbol, owner_symbols_)
         if language == "javascript":
@@ -294,6 +310,10 @@ class OwnerRegistry:
         return best
 
     def symbol_at(self, language: str, path: Path, lineno: int) -> str | None:
+        """Name of the symbol enclosing (Python) or last declared before (JS) `lineno`.
+
+        None when there is none, the file does not parse, or the language is unsupported.
+        """
         if language == "python":
             return self._symbol_at_python(path, lineno)
         if language == "javascript":
@@ -336,6 +356,11 @@ class OwnerRegistry:
         return hits
 
     def scan(self, entry: dict, owner_defined: list[str]) -> list[dict]:
+        """Detector hits for one concept across the files of its language.
+
+        Each hit is a dict with `file`, `line`, `symbol`, `key` and `match`. Empty for
+        an unsupported language or a concept with no detector.
+        """
         language = _language(entry)
         if language == "python":
             return self._scan_source_lines(entry, owner_defined, self.python_files, self._code_lines)
@@ -377,6 +402,7 @@ class OwnerRegistry:
     # ── Schema ───────────────────────────────────────────────────────────────
 
     def validate_schema(self, data: dict) -> list[str]:
+        """Structural problems in the loaded registry, one message per problem; empty if valid."""
         out = []
         concepts = data.get("concepts")
         if not isinstance(concepts, list):
@@ -469,6 +495,11 @@ class OwnerRegistry:
     # ── Evaluation ───────────────────────────────────────────────────────────
 
     def evaluate(self, data: dict) -> dict:
+        """Check every concept against the tree and return the content-stamped report.
+
+        Per concept: whether the owner exists, which declared symbols it no longer
+        defines, and found/new/resolved violations compared with `known_violations`.
+        """
         results = []
         for entry in data["concepts"]:
             exists, defined = self.owner_symbols(entry)
@@ -512,6 +543,11 @@ class OwnerRegistry:
         })
 
     def problems(self, report: dict, schema_problems: list[str] | None = None) -> list[str]:
+        """Messages for everything that fails `--check` in an evaluated report.
+
+        Missing owners or symbols, named tests that do not exist, new violations and
+        fixed violations still listed as known, after any `schema_problems` given.
+        """
         registry = self.s.rel(self.s.registry)
         out = list(schema_problems or [])
         for c in report["concepts"]:
@@ -567,6 +603,7 @@ def _stamped(report: dict) -> dict:
 # ── Rendering ────────────────────────────────────────────────────────────────
 
 def render_text(report: dict) -> str:
+    """Console summary of a report: per-concept state, debt, new and stale violations."""
     lines = ["", "=" * 92, "CANONICAL OWNER REGISTRY — one concept, one owner", "=" * 92]
     for c in report["concepts"]:
         debt = len(c["known_violations"])
@@ -597,6 +634,7 @@ def render_text(report: dict) -> str:
 
 
 def render_json(report: dict) -> str:
+    """The report as indented JSON, the body of the `out_json` artefact."""
     return json.dumps(report, indent=2)
 
 
@@ -605,6 +643,7 @@ def _esc(text: str) -> str:
 
 
 def render_html(report: dict, s: OwnerSettings) -> str:
+    """Standalone HTML page for the `out_html` artefact, one card per concept."""
     rows = []
     for c in report["concepts"]:
         debt = "".join(f"<li><code>{_esc(v)}</code></li>" for v in c["known_violations"])
@@ -673,6 +712,7 @@ a second implementation fails the build.</p>
 
 
 def render_mindmap(report: dict, s: OwnerSettings) -> str:
+    """Markdown with a Mermaid mindmap of concepts, owners and debt, for `out_mindmap`."""
     lines = ["# Canonical owners — capability index", "",
              f"> Generated by `{s.generator_label}`. Do not edit.",
              "", "```mermaid", "mindmap", "  root((one concept<br/>one owner))"]
@@ -788,6 +828,12 @@ def _wrap(text: str, indent: int, width: int = 78) -> str:
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          settings: OwnerSettings | None = None, prog: str | None = None) -> int:
+    """Entry point for `repolens owners`; returns the process exit code.
+
+    Exits 1 without writing anything on schema errors. Otherwise prints the report and
+    either writes the artefacts or, under `--check`, fails on violations or stale
+    artefacts. `--impact` prints what moves with a concept or path instead.
+    """
     utf8_console()
     s = settings or from_config(config or load_config())
     reg = OwnerRegistry(s)

@@ -34,6 +34,7 @@ is neither an improvement nor a regression, and it is printed.
 """
 from __future__ import annotations
 
+import warnings
 import argparse
 import ast
 import json
@@ -70,6 +71,7 @@ class FileResult:
 
     @property
     def missing(self) -> list[Symbol]:
+        """The public symbols in this file that carry no real documentation."""
         return [s for s in self.symbols if not s.documented]
 
 
@@ -105,7 +107,9 @@ def python_file(rel_path: str, source: str, s: DocsSettings) -> FileResult:
     """Public symbols of one Python file."""
     result = FileResult(rel_path, "python")
     try:
-        tree = ast.parse(source)
+        with warnings.catch_warnings():  # target code's own SyntaxWarnings are not ours to print
+            warnings.simplefilter("ignore")
+            tree = ast.parse(source)
     except (SyntaxError, ValueError) as exc:
         result.error = f"does not parse: {exc.__class__.__name__}: {exc}"[:200]
         return result
@@ -257,6 +261,7 @@ def missing_counts(results: list[FileResult], baseline: dict[str, int] | None) -
 
 
 def ratchet_for(s: DocsSettings) -> Ratchet:
+    """The per-file undocumented-symbol ratchet, backed by `[docs] baseline`."""
     return Ratchet(
         label="Docstring coverage",
         baseline_path=s.baseline,
@@ -276,6 +281,7 @@ def ratchet_for(s: DocsSettings) -> Ratchet:
 
 # ── output ───────────────────────────────────────────────────────────────────────
 def summarise(results: list[FileResult]) -> dict:
+    """Per language: files, unmeasured files, symbols, documented symbols and percent."""
     by_lang: dict[str, dict[str, int]] = {}
     for r in results:
         lang = by_lang.setdefault(r.language, {"files": 0, "symbols": 0, "documented": 0,
@@ -306,6 +312,7 @@ def _print_summary(results: list[FileResult], top: int) -> None:
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          settings: DocsSettings | None = None, prog: str | None = None) -> int:
+    """`repolens docs coverage`. Exit 1 only under `--check`/`--update-baseline` rules."""
     ap = argparse.ArgumentParser(prog=prog, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true",
