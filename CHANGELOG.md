@@ -33,6 +33,9 @@ repository. `pyproject.toml` still says 0.3.0.
     default limit of 500 edges, which a diagram cannot raise.
   - A mindmap page (at most 25 leaves per section) and a JSON context pack per group, and an
     index saying whether the analysis was complete.
+  - `debugging.md` links each route area to its static caller, handler and store trace candidates.
+    Each context pack carries the same trace points as data. Repository Lens installs no runtime
+    instrumentation; the guide lists bounded, redacted telemetry fields for teams that add it.
 
   It exits 2 when the analysis is incomplete. It refuses to write through a symlink, or to replace
   or delete a file in the output directory that does not carry its build stamp where the command
@@ -72,6 +75,9 @@ repository. `pyproject.toml` still says 0.3.0.
     `--only` group does not exist. The output directory is guarded as `docs generate`'s is.
   - `--jsdoc` drafts fact-only JSDoc for exported JS/TS route handlers and data-access functions
     that have none, each opening with `TODO(repolens)`. Python files get no docstrings.
+  - `--function-lens` drafts comment-only stable ids for public feature-boundary functions. The
+    Function Lens index exposes `source_id`, permits lookup by it after a function rename or move,
+    and reports duplicate ids. It remains source-free when the option is not used.
   - `--owners` writes `canonical_owners.draft.yaml` to the proposal directory only. A suggested owner
     is a `.py` or `[owners] javascript_extensions` file, and each entry lists at most 10 consumers.
 - FeatureTrace references accept Next.js route segments (`[id]`, `[[...slug]]`, `(group)`, `@slot`),
@@ -400,6 +406,9 @@ repository. `pyproject.toml` still says 0.3.0.
   vendoring repository runs is not failed by repolens's own code.
 
 ### Fixed
+
+- Function Lens now counts Tree-sitter TypeScript records in the frontend total; earlier output
+  could report zero frontend functions while still indexing `.ts` and `.tsx` declarations.
 - The internal configured-origin marker was the text `//configured`, so a literal base
   `//configured.example.com/api` was read as a configured origin. It is now a NUL-delimited
   sentinel no URL can contain.
@@ -419,6 +428,9 @@ repository. `pyproject.toml` still says 0.3.0.
   3000-term concatenation no longer raises `RecursionError`.
 
 ### Upgrade notes
+
+- Regenerate the Function Lens digest after upgrading. Function records now include `source_id`
+  and duplicate-id state, and TypeScript functions now contribute to the frontend count.
 - `analysis.json` endpoint and page nodes gain `path` and `parameters`, and the graph gains `DEFINES`
   edges and SQL foreign-key `REFERENCES` edges. Consumers that enumerate edge kinds should accept them.
 - `TODO\(repolens\)` is always a `[docs] placeholder_patterns` entry, whatever the repository lists

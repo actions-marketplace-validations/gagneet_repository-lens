@@ -49,7 +49,7 @@ class ExampleAppDocsTests(unittest.TestCase):
 
     def test_a_complete_analysis_writes_every_output_and_exits_0(self):
         self.assertEqual(self.code, 0, self.output)
-        for name in ("openapi.json", "schema.mmd", "schema.md", "architecture.mmd", "architecture.md", "index.md",
+        for name in ("openapi.json", "schema.mmd", "schema.md", "architecture.mmd", "architecture.md", "debugging.md", "index.md",
                      "features/orders.md", "features/orders.context.json", "features/reviews.md"):
             self.assertTrue((self.out / name).is_file(), name)
         self.assertIn("produced by repolens", self.read("index.md"))
@@ -104,6 +104,24 @@ class ExampleAppDocsTests(unittest.TestCase):
         self.assertIn({"name": "orders", "kind": "postgres_table"}, context["stores"])
         self.assertTrue(any("Authorization" in item for item in context["unknowns"]))
         self.assertIn("SQL_INJECTION_RISK", {gap["code"] for gap in context["gaps"]})
+        debug = context["debugging"]
+        self.assertIn("repolens analyze --query orders", debug["impact_query"])
+        [listing] = [trace for trace in debug["traces"] if trace["request"] == "GET /api/orders"]
+        self.assertIn("app/orders/page.tsx:7", listing["caller_locations"])
+        self.assertIn("app/api/orders/route.ts:4", listing["handler_locations"])
+        self.assertIn("orders", listing["stores"])
+        products = json.loads(self.read("features/products.context.json"))["debugging"]["traces"]
+        [outbound] = [trace for trace in products if trace["request"] == "POST /api/reviews"]
+        self.assertEqual(outbound["direction"], "outbound request")
+        self.assertIn("app/products/page.tsx:5", outbound["caller_locations"])
+
+    def test_debugging_guide_is_static_and_gives_bounded_runtime_advice(self):
+        guide = self.read("debugging.md")
+        self.assertIn("has no production runtime path", guide)
+        self.assertIn("repolens analyze --query orders", guide)
+        self.assertIn("sample successful requests", guide)
+        self.assertIn("do not record bodies", guide)
+        self.assertIn("features/orders.md#debugging-plan", guide)
 
     def test_schema_draws_declared_columns_relationships_and_collections(self):
         schema = self.read("schema.mmd")

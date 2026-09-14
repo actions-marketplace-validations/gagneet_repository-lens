@@ -9,6 +9,7 @@ It runs the same read-only analysis as `repolens analyze` and writes:
   openapi.json              OpenAPI 3.1 for the application's own routes, with gaps kept
   schema.mmd, schema.md     a Mermaid ER diagram of the declared tables and collections
   architecture.mmd/.md      pages -> API -> code -> stores, one node per feature group
+  debugging.md              evidence-led trace points and production-safe instrumentation guidance
   features/<group>.md       a mindmap and evidence tables for one route area
   features/<group>.context.json  the same facts as data, for a person or an agent to write prose from
   index.md                  what was generated, whether the analysis was complete, and the limits
@@ -81,6 +82,8 @@ LIMITS = {
                   "applied; a dropped constraint is not, and `public.t` and `t` are separate tables.",
     "architecture.mmd": "Feature groups are route areas named by their first path segment, not business features, "
                         "and the edges are static evidence, not observed traffic.",
+    "debugging.md": "Trace points are candidates from static evidence. Repository Lens installs no runtime "
+                    "instrumentation and cannot prove which path executes in production.",
     "features/": "Each group page lists the evidence the scan found and its diagnostics; an empty section means "
                  "nothing was found, not that nothing exists.",
 }
@@ -718,6 +721,32 @@ def _group_gaps(graph: Graph, index: _Index, group: FeatureGroup) -> list[dict]:
     return sorted(gaps, key=lambda g: (g["severity"] != "warning", g["code"], g["evidence"]))
 
 
+def _debugging_context(group: FeatureGroup, endpoints: list[dict], gaps: list[dict]) -> dict:
+    """Reviewable trace points for a group; this is guidance, never injected instrumentation."""
+    traces = []
+    for endpoint in endpoints:
+        route = f"{endpoint['method']} {endpoint['path']}"
+        handlers = [f"{item['file']}:{item['line']}" for item in endpoint["handlers"]]
+        chain = [*(endpoint["callers"] or ["no static caller found"]), route,
+                 *(handlers or ["no handler found"]), *endpoint["stores"]]
+        first_check = ("route registration and HTTP method" if not endpoint["served"] else
+                       "the client and handler locations, then each store boundary")
+        traces.append({"request": route, "direction": endpoint.get("direction", "feature endpoint"),
+                       "served": endpoint["served"], "static_chain": chain,
+                       "caller_locations": endpoint["callers"], "handler_locations": handlers,
+                       "stores": endpoint["stores"], "resolution": endpoint["resolution"],
+                       "first_check": first_check})
+    return {
+        "mode": "static guidance; no code or production instrumentation is installed",
+        "impact_query": f"repolens analyze --query {group.name}",
+        "traces": traces,
+        "diagnostics": sorted({gap["code"] for gap in gaps}),
+        "safe_runtime_fields_if_instrumented": ["trace or request id", "route template", "HTTP method",
+                                                 "status code", "duration", "error class", "store operation"],
+        "do_not_record": ["request or response bodies", "authorization headers", "cookies", "secrets"],
+    }
+
+
 def build_feature(analysis: Analysis, group: FeatureGroup, index: _Index | None = None) -> tuple[str, dict]:
     """(`features/<group>.md`, the context pack) for one group."""
     graph = analysis.graph
@@ -741,12 +770,29 @@ def build_feature(analysis: Analysis, group: FeatureGroup, index: _Index | None 
     stores = [{"name": graph.nodes[s].label, "kind": graph.nodes[s].kind} for s in group.stores]
     gaps = _group_gaps(graph, index, group)
     calls_out = [graph.nodes[e].label for e in group.calls_out if e in graph.nodes]
+    debug_endpoints = [{**endpoint, "direction": "feature endpoint"} for endpoint in endpoints]
+    for endpoint_id in group.calls_out:
+        if endpoint_id in group.endpoints or endpoint_id not in graph.nodes:
+            continue
+        node = graph.nodes[endpoint_id]
+        handler_edges = index.handler_edges(endpoint_id)
+        handlers = list(dict.fromkeys(e.target for e in handler_edges))
+        callers = [where for where in index.callers(endpoint_id) if _evidence_path(where) in group.files]
+        debug_endpoints.append({
+            "method": str(node.metadata.get("method") or node.label.split(" ", 1)[0]),
+            "path": openapi_path(node)[0], "handlers": [index.symbol(h) for h in handlers],
+            "callers": callers, "stores": [s.label for s in index.stores_from(handlers)] if handlers else [],
+            "resolution": sorted({e.resolution for e in handler_edges}),
+            "served": index.status.get(endpoint_id) == "served", "direction": "outbound request",
+        })
+    debugging = _debugging_context(group, debug_endpoints, gaps)
     context = {
         "group": group.name, "build": describe_build(), "complete": analysis.complete,
         "note": "A feature group is a route area named by its first path segment, not a business feature.",
         "pages": pages, "endpoints": endpoints,
         "files": [{"path": path, "layer": layer} for path, layer in sorted(group.files.items())],
-        "stores": stores, "calls_to_other_groups": calls_out, "gaps": gaps, "unknowns": UNKNOWNS,
+        "stores": stores, "calls_to_other_groups": calls_out, "gaps": gaps,
+        "debugging": debugging, "unknowns": UNKNOWNS,
     }
 
     counter = itertools.count(1)
@@ -802,8 +848,52 @@ def build_feature(analysis: Analysis, group: FeatureGroup, index: _Index | None 
         md += [f"| {g['code']} | {g['severity']} | {markdown_cell(g['evidence'])} | {markdown_cell(g['message'])} |" for g in gaps]
     else:
         md.append("No diagnostics in this group's files or endpoints.")
+    md += ["", "## Debugging plan", "",
+           "These are static trace candidates. Repository Lens adds no logger, span, dependency or build hook to the application.", "",
+           f"Start with `{debugging['impact_query']}`. If you add runtime telemetry, carry one trace or request id across "
+           "the client, handler and store boundaries; record route templates, status, duration and error class, and "
+           "exclude bodies, authorization headers, cookies and secrets.", ""]
+    if debugging["traces"]:
+        md += ["| Request | Direction | Static chain | First check | Resolution |", "|---|---|---|---|---|"]
+        for trace in debugging["traces"]:
+            md.append(f"| {markdown_cell(trace['request'], code=True)} | {markdown_cell(trace['direction'])} | "
+                      f"{markdown_cell(' → '.join(trace['static_chain']))} | "
+                      f"{markdown_cell(trace['first_check'])} | "
+                      f"{markdown_cell(', '.join(trace['resolution']) or 'unresolved')} |")
+    else:
+        md.append("No request path was found for this group.")
     md += ["", "## Not known from the source", "", *[f"- {item}" for item in UNKNOWNS], ""]
     return "\n".join(md), context
+
+
+def build_debugging(analysis: Analysis, contexts: list[tuple[str, str, dict]]) -> str:
+    """A repository-wide debugging entry point linked to each feature's evidence."""
+    md = [f"<!-- produced by {describe_build()} -->", "# Debugging guide", "",
+          "Repository Lens has no production runtime path: it reads source and writes this documentation. "
+          "It does not add a logger, tracing SDK, dependency, middleware or build hook to the application.", ""]
+    if not analysis.complete:
+        md += ["> The analysis was incomplete. Treat missing links as unknown and see index.md for the reasons.", ""]
+    md += ["## Start with static evidence", "",
+           "1. Run `repolens analyze --query <feature>` and open the bounded relationship graph.",
+           "2. Open that feature's page below and follow a request from its caller location to the handler and stores.",
+           "3. Look up an important function by name or `@functionlens:` id with `repolens lens --lookup <value>`.",
+           "4. Reproduce the failure and run the application's type checker, linter and tests alongside the static findings.", "",
+           "| Feature | Requests | Diagnostics | Evidence page | Query |", "|---|---:|---|---|---|"]
+    for name, slug, context in contexts:
+        debugging = context["debugging"]
+        diagnostics = ", ".join(debugging["diagnostics"]) or "none found"
+        md.append(f"| {markdown_cell(name)} | {len(debugging['traces'])} | {markdown_cell(diagnostics)} | "
+                  f"[open](features/{slug}.md#debugging-plan) | `{markdown_inline(debugging['impact_query'])}` |")
+    md += ["", "## If runtime telemetry is still needed", "",
+           "Add it deliberately at the client, route-handler and store boundaries listed on each feature page. "
+           "Carry one trace or request id through the chain and record the route template, HTTP method, status, "
+           "duration, error class and store operation.", "",
+           "Keep production cost bounded: enable detailed diagnostics through configuration, sample successful "
+           "requests, retain errors, batch exports and measure overhead under representative load. Redact at the "
+           "instrumentation boundary; do not record bodies, authorization headers, cookies or secrets.", "",
+           "Repository Lens only proposes the locations. Runtime instrumentation needs framework-specific review "
+           "because middleware, authorization, deployment topology and live traffic are outside static evidence.", ""]
+    return "\n".join(md)
 
 
 # ── index and writing ────────────────────────────────────────────────────────────
@@ -839,7 +929,7 @@ def write_docs(analysis: Analysis, root: Path, out: Path, *, max_groups: int = D
     links = [(group, _slug(group.name, used)) for group in groups.values()]
     features = out / "features"
     targets = [out / name for name in ("openapi.json", "schema.mmd", "schema.md", "architecture.mmd",
-                                       "architecture.md", "index.md")]
+                                       "architecture.md", "debugging.md", "index.md")]
     targets += [features / f"{slug}{suffix}" for _group, slug in links for suffix in (".md", ".context.json")]
     # A symlink (a checkout can commit one under the output directory) would carry a write outside it.
     linked = [path for path in (out, features, *targets) if path.is_symlink()]
@@ -865,10 +955,13 @@ def write_docs(analysis: Analysis, root: Path, out: Path, *, max_groups: int = D
     for stale in [*features.glob("*.md"), *features.glob("*.context.json")]:
         if stale not in targets and _ours(stale):
             stale.unlink()
+    contexts = []
     for group, slug in links:
         md, context = build_feature(analysis, group, index)
         (features / f"{slug}.md").write_text(md, encoding="utf-8")
         (features / f"{slug}.context.json").write_text(json.dumps(context, indent=2) + "\n", encoding="utf-8")
+        contexts.append((group.name, slug, context))
+    (out / "debugging.md").write_text(build_debugging(analysis, contexts), encoding="utf-8")
     operations = sum(len(_operations(item)) for item in openapi["paths"].values())
     stores = sum(1 for n in analysis.graph.nodes.values() if n.kind in _STORE_KINDS)
     page = [f"<!-- produced by {describe_build()} -->", "# Generated documentation", "",
@@ -880,6 +973,7 @@ def write_docs(analysis: Analysis, root: Path, out: Path, *, max_groups: int = D
               f"| [openapi.json](openapi.json) | {_plural(operations, 'operation')}, {_plural(len(openapi['x-repolens-unserved-calls']), 'unserved call')} | {LIMITS['openapi.json']} |",
               f"| [schema.md](schema.md) ([.mmd](schema.mmd)) | {stores} stores | {LIMITS['schema.mmd']} |",
               f"| [architecture.md](architecture.md) ([.mmd](architecture.mmd)) | {len(groups)} feature groups | {LIMITS['architecture.mmd']} |",
+              f"| [debugging.md](debugging.md) | static trace plans for {len(groups)} feature groups | {LIMITS['debugging.md']} |",
               f"| features/ | one page and one context pack per group | {LIMITS['features/']} |", "", "## Feature groups", ""]
     page += [f"- [{markdown_inline(group.name)}](features/{slug}.md) ([context](features/{slug}.context.json)): "
               f"{_plural(len(group.pages), 'page')}, {_plural(len(group.endpoints), 'endpoint')}, "
@@ -888,6 +982,7 @@ def write_docs(analysis: Analysis, root: Path, out: Path, *, max_groups: int = D
     return [f"openapi.json: {_plural(operations, 'operation')}, {_plural(len(openapi['x-repolens-unserved-calls']), 'unserved call')}",
             f"schema.mmd, schema.md: {stores} stores",
             f"architecture.mmd, architecture.md: {len(groups)} feature groups",
+            f"debugging.md: {len(groups)} static trace plans",
             f"features/: {len(links)} pages and context packs",
             "index.md"]
 
