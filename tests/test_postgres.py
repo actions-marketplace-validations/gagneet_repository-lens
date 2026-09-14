@@ -333,7 +333,7 @@ FETCHES = '''
 
 
 class UnboundedFetchTests(unittest.TestCase):
-    def test_a_select_with_no_limit_is_flagged_and_a_bounded_or_aggregate_one_is_not(self):
+    def test_a_select_with_no_limit_is_flagged_and_a_bounded_aggregate_or_grouped_one_is_not(self):
         repo = Repo({"svc/products.py": FETCHES})
         self.addCleanup(repo.close)
         tree = ast.parse(textwrap.dedent(FETCHES))
@@ -341,7 +341,8 @@ class UnboundedFetchTests(unittest.TestCase):
                  if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))]
         found = [f for f in performance.scan(repo.settings) if f.rule == "performance/unbounded-sql-fetch"]
         flagged = {name for f in found for start, end, name in spans if start <= f.line <= end}
-        self.assertEqual(flagged, {"everything", "per_store", "orm_every_row", "text_every_row"})
+        # `per_store` groups by its only other column: one row per store, not the whole table (SCAN-01).
+        self.assertEqual(flagged, {"everything", "orm_every_row", "text_every_row"})
         self.assertEqual({f.confidence for f in found}, {"low"})
 
 

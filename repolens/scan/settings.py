@@ -104,6 +104,12 @@ DEFAULTS: dict[str, Any] = {
         # (`dict.get` is not a round trip), and so is every call in a SYNC function, where
         # no `await` marks the call as I/O (`line.find(":")` is not a query).
         "db_receiver_pattern": r"(?i)(^|_)(db|database|session|sess|conn|connection|cursor|cur)$",
+        # Columns that scope a query to one tenant, organisation or owner (regexes on the
+        # column name, e.g. "^account_id$"). An unbounded fetch whose WHERE compares such a
+        # column with a value is still reported, one severity lower and with a note naming
+        # the column: it returns what one scope holds, not the whole table. Empty: no column
+        # is a scope key.
+        "scope_key_patterns": [],
     },
     "migrations": {
         # Directories of migration files. Empty: every `alembic/versions` and
@@ -166,6 +172,8 @@ class PerformanceSettings:
     db_methods: frozenset[str]
     db_receiver: re.Pattern[str] = field(
         default_factory=lambda: re.compile(DEFAULTS["performance"]["db_receiver_pattern"]))
+    #: `scope_key_patterns`: a WHERE on a matching column scopes an unbounded fetch.
+    scope_keys: tuple[re.Pattern[str], ...] = ()
 
 
 @dataclass
@@ -271,6 +279,7 @@ def from_config(cfg: Config | None = None, *, max_file_bytes: int = 2_000_000) -
             blocking_calls=frozenset(perf["blocking_calls"]),
             db_methods=frozenset(perf["db_methods"]),
             db_receiver=re.compile(perf["db_receiver_pattern"]),
+            scope_keys=_patterns(perf["scope_key_patterns"]),
         ),
         migrations=MigrationSettings(
             roots=tuple(mig["roots"]),

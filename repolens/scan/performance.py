@@ -13,6 +13,12 @@ Four shapes that cost every concurrent request and pass every functional test:
                            `db.query(Model).all()`, and a result held in a name first:
                            `result = await session.execute(stmt)`, `result.scalars().all()`).
                            Low confidence: a lookup by primary key returns one row either way.
+                           One row per group is not every row: an aggregate with no GROUP BY,
+                           or a GROUP BY whose projection is only group keys, aggregates and
+                           constants (SQL text, or `select(...)`/`query(...)` with
+                           `.group_by(...)` and `func.*` aggregates), is not reported. A WHERE
+                           comparing a `[scan.performance] scope_key_patterns` column with a
+                           value lowers the severity one step and says so in the message.
   query-in-loop            a database call inside a loop is N+1 round trips: awaited in an
                            async function, or on a database-looking receiver (`db`,
                            `session`, `cur`) in a sync one, where no `await` marks I/O.
@@ -29,7 +35,7 @@ import ast
 import re
 from collections import defaultdict
 
-from ..core.findings import Finding
+from ..core.findings import SCOPE_KEY_NOTE, Finding
 from .mounts import mount_index
 from .python_ast import (
     FunctionNode,
@@ -100,9 +106,139 @@ def _sql_literal(node: ast.AST) -> str | None:
     return None
 
 
+#: String literals (contents blanked, quotes kept) and comments (blanked), so parentheses,
+#: commas and keywords inside them do not count when clauses are located.
+_SQL_OPAQUE = re.compile(r"'(?:[^']|'')*'|--[^\n]*|/\*.*?\*/", re.S)
+_CLAUSE = re.compile(r"\b(SELECT|FROM|WHERE|GROUP\s+BY|HAVING|WINDOW|ORDER\s+BY|LIMIT|OFFSET|FETCH|FOR|"
+                     r"UNION|INTERSECT|EXCEPT|RETURNING)\b", re.IGNORECASE)
+#: One value per group whatever the group holds (`coalesce(sum(x), 0)` included).
+_AGGREGATE_ITEM = re.compile(
+    r"(?:coalesce\s*\(\s*)?(?:count|sum|min|max|avg|array_agg|string_agg|json_agg|jsonb_agg|json_object_agg|"
+    r"jsonb_object_agg|bool_and|bool_or|every|bit_and|bit_or|stddev\w*|variance|var_pop|var_samp|"
+    r"percentile_cont|percentile_disc|mode)\s*\(", re.IGNORECASE)
+_CONSTANT_ITEM = re.compile(r"(?:'(?:[^']|'')*'|-?\d+(?:\.\d+)?|NULL|TRUE|FALSE)(?:::\w+)?", re.IGNORECASE)
+_ALIASED = re.compile(r"(.+?)\s+(?:AS\s+)?(\"?[A-Za-z_]\w*\"?)", re.IGNORECASE | re.S)
+_NOT_ALIASES = frozenset({"end", "null", "true", "false", "asc", "desc"})
+#: `account_id = $1`, `o.account_id IN (%s)`, `account_id = ANY(:ids)`, `account_id::text = '…'`:
+#: a column compared with a value (a placeholder, an f-string hole or a literal), not a join.
+_VALUE_FILTER = re.compile(
+    r"\b(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)(?:::\w+)?\s*(?:(?<![<>!])=\s*(?:ANY\s*\(\s*)?|\s+IN\s*\(\s*)"
+    r"(?:\$\d+|%s|%\(\w+\)s|:\w+|\?|\{\}|'|-?\d)", re.IGNORECASE)
+
+
+def _top_level_clauses(sql: str) -> list[tuple[str, str]] | None:
+    """(keyword, text) of each clause of the statement's outermost final SELECT, in order,
+    with the text sliced from the original SQL. None for a set operation (`UNION`, ...)
+    or text with no top-level SELECT: those are left to the unbounded rule as they are."""
+    masked = _SQL_OPAQUE.sub(lambda m: (m.group(0)[0] + " " * (len(m.group(0)) - 2) + "'"
+                                        if m.group(0)[0] == "'" else " " * len(m.group(0))), sql)
+    depth, depths = 0, []
+    for char in masked:
+        depth -= char == ")"
+        depths.append(depth)
+        depth += char == "("
+    clauses = [(re.sub(r"\s+", " ", m.group(1)).upper(), m.start(), m.end())
+               for m in _CLAUSE.finditer(masked) if depths[m.start()] == 0]
+    if any(name in ("UNION", "INTERSECT", "EXCEPT") for name, _, _ in clauses):
+        return None
+    start = max((i for i, (name, _, _) in enumerate(clauses) if name == "SELECT"), default=None)
+    if start is None:
+        return None
+    tail = clauses[start:]
+    return [(name, sql[end:tail[i + 1][1] if i + 1 < len(tail) else len(sql)])
+            for i, (name, _, end) in enumerate(tail)]
+
+
+def _split_top_level(text: str) -> list[str]:
+    """`a, f(b, c), 'x,y'` -> ["a", "f(b, c)", "'x,y'"]."""
+    masked = _SQL_OPAQUE.sub(lambda m: "'" + " " * (len(m.group(0)) - 2) + "'"
+                             if m.group(0)[0] == "'" else " " * len(m.group(0)), text)
+    items, depth, begin = [], 0, 0
+    for i, char in enumerate(masked):
+        depth += (char == "(") - (char == ")")
+        if char == "," and depth == 0:
+            items.append(text[begin:i])
+            begin = i + 1
+    items.append(text[begin:])
+    return [item.strip() for item in items]
+
+
+def _normal(expression: str) -> str:
+    """Whitespace-collapsed, lower-case, and `o.status` read as `status`."""
+    spelled = re.sub(r"\s+", " ", expression.strip().strip(";")).lower()
+    qualified = re.fullmatch(r'"?\w+"?\."?(\w+)"?', spelled)
+    return qualified.group(1) if qualified else spelled.strip('"')
+
+
+def _grouped_aggregates(sql: str) -> bool:
+    """A `GROUP BY` whose projection is only group keys, aggregates and constants: one row per
+    group (counts per status, sums per month), not one per table row. A projection with any
+    other column (`SELECT u.id, u.name, count(*) … GROUP BY u.id`) is not."""
+    clauses = _top_level_clauses(sql)
+    if clauses is None:
+        return False
+    found = dict(clauses)
+    if "GROUP BY" not in found or len(found) != len(clauses):
+        return False  # no grouping, or a clause twice at the top level: not read
+    projection = re.sub(r"^\s*(?:ALL\s+|DISTINCT\s+(?!ON\b))", "", found["SELECT"], flags=re.IGNORECASE)
+    items = _split_top_level(projection)
+    keys_text = found["GROUP BY"].strip()
+    if not items or not keys_text or re.match(r"(?:ROLLUP|CUBE|GROUPING\s+SETS)\s*\(", keys_text, re.IGNORECASE):
+        return False
+    expressions: list[tuple[str, str]] = []
+    for item in items:
+        aliased = _ALIASED.fullmatch(item)
+        if aliased and aliased.group(2).strip('"').lower() not in _NOT_ALIASES \
+                and aliased.group(1).count("(") == aliased.group(1).count(")") \
+                and not re.search(r"[-+*/%<>=|&,.]\s*$|::$", aliased.group(1)):
+            expressions.append((aliased.group(1), aliased.group(2).strip('"').lower()))
+        else:
+            expressions.append((item, ""))
+    keys = set()
+    for key in _split_top_level(keys_text):
+        if key.isdigit() and 1 <= int(key) <= len(expressions):
+            keys.add(_normal(expressions[int(key) - 1][0]))  # GROUP BY 1: the first output column
+        else:
+            keys.add(_normal(key))
+    return all(_AGGREGATE_ITEM.match(expression.strip()) or _CONSTANT_ITEM.fullmatch(expression.strip())
+               or _normal(expression) in keys or (alias and alias in keys)
+               for expression, alias in expressions)
+
+
+#: SQLAlchemy `func.<name>(...)` aggregates.
+_ORM_AGGREGATES = frozenset({"count", "sum", "min", "max", "avg", "array_agg", "string_agg", "json_agg",
+                             "jsonb_agg", "bool_and", "bool_or", "every"})
+
+
+def _orm_grouped(calls: list[ast.Call]) -> bool:
+    """`select(Order.status, func.count(Order.id).label("n")).group_by(Order.status)`, or the
+    same through `db.query(...)`: the one selecting call takes only group keys and `func`
+    aggregates. A nested second `select` (a subquery) is not read."""
+    selects = [c for c in calls if last(c.func) in ("select", "query")]
+    keys = {ast.dump(arg) for c in calls if last(c.func) == "group_by" for arg in c.args}
+    if len(selects) != 1 or not keys or not selects[0].args:
+        return False
+
+    def grouped(node: ast.AST) -> bool:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "label":
+            node = node.func.value
+        return ast.dump(node) in keys or (isinstance(node, ast.Call) and last(node.func) in _ORM_AGGREGATES
+                                          and "func" in dotted(node.func).split("."))
+
+    return all(grouped(arg) for arg in selects[0].args)
+
+
+def _where_columns(sql: str) -> set[str]:
+    """Columns the outermost SELECT's WHERE compares with a value."""
+    clauses = _top_level_clauses(sql)
+    where = " ".join(text for name, text in clauses or [] if name == "WHERE")
+    return {m.group(1).lower() for m in _VALUE_FILTER.finditer(where)}
+
+
 def _unbounded_select(sql: str) -> bool:
     return (bool(_SELECT.search(sql)) and not _BOUNDED.search(sql)
-            and not (_ONE_ROW.search(sql) and not _GROUP_BY.search(sql)))
+            and not (_ONE_ROW.search(sql) and not _GROUP_BY.search(sql))
+            and not _grouped_aggregates(sql))
 
 
 def _assigned(fn: ast.AST, name: str) -> list[ast.AST]:
@@ -185,7 +321,8 @@ def _unbounded_chain(fn: ast.AST, chain: list[ast.Call], pattern: re.Pattern[str
     executed = next((c for c in chain if last(c.func) in _EXECUTES and c.args), None)
     if executed is None:
         # `db.query(Item).filter(...).all()`: the chain IS the query.
-        return any(last(c.func) == "query" and c.args and _db_receiver(c, pattern) for c in chain)
+        return (any(last(c.func) == "query" and c.args and _db_receiver(c, pattern) for c in chain)
+                and not _orm_grouped(chain))
     values = _statement_values(fn, executed.args[0])
     if not values:
         return False
@@ -193,7 +330,8 @@ def _unbounded_chain(fn: ast.AST, chain: list[ast.Call], pattern: re.Pattern[str
     if any(t is not None for t in texts):
         return all(t is None or _unbounded_select(t) for t in texts)
     built = {last(sub.func) for v in values for sub in ast.walk(v) if isinstance(sub, ast.Call)}
-    return "select" in built and not built & {"limit", "fetch", "slice"}
+    return ("select" in built and not built & {"limit", "fetch", "slice"}
+            and not all(_orm_grouped([sub for sub in ast.walk(v) if isinstance(sub, ast.Call)]) for v in values))
 
 
 def _is_unbounded_sql_fetch(fn: ast.AST, call: ast.Call,
@@ -222,6 +360,66 @@ def _is_unbounded_sql_fetch(fn: ast.AST, call: ast.Call,
     return bool(values) and all(
         isinstance(v, ast.Call) and _unbounded_chain(fn, [*chain, v, *_receivers(v)], pattern)
         for v in values)
+
+
+def _statement_sources(fn: ast.AST, call: ast.Call) -> list[ast.AST]:
+    """What an unbounded fetch runs, one entry per value it may take: SQL text, or the
+    outermost call of the statement a chain builds."""
+    if last(call.func) == "fetch":
+        return _statement_values(fn, call.args[0])
+    chains = [_receivers(call)]
+    root = _chain_root(call)
+    if isinstance(root, ast.Name) and not any(last(c.func) in _EXECUTES and c.args or last(c.func) == "query"
+                                              for c in chains[0]):
+        assigned = (v.value if isinstance(v, ast.Await) else v for v in _assigned(fn, root.id))
+        chains = [[v, *_receivers(v)] for v in assigned if isinstance(v, ast.Call)]
+    sources: list[ast.AST] = []
+    for chain in chains:
+        executed = next((c for c in chain if last(c.func) in _EXECUTES and c.args), None)
+        if executed is not None:
+            sources.extend(_statement_values(fn, executed.args[0]))
+        elif chain:
+            sources.append(chain[0])
+    return sources
+
+
+def _model_column(node: ast.AST) -> bool:
+    """`Account.id`: another model's column, so comparing with it is a join, not a filter."""
+    return isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id[:1].isupper()
+
+
+def _filtered_columns(source: ast.AST) -> set[str]:
+    """Columns a statement's WHERE compares with a value: SQL text, or SQLAlchemy
+    `.where(Model.col == x)`, `.filter(Model.col.in_(xs))` and `.filter_by(col=x)`."""
+    text = _sql_literal(source)
+    if text is not None:
+        return _where_columns(text)
+    columns: set[str] = set()
+    for sub in ast.walk(source):
+        if not (isinstance(sub, ast.Call) and last(sub.func) in ("where", "filter", "filter_by")):
+            continue
+        columns |= {k.arg for k in sub.keywords if k.arg}
+        for part in (p for arg in sub.args for p in ast.walk(arg)):
+            if (isinstance(part, ast.Compare) and len(part.ops) == 1 and isinstance(part.ops[0], (ast.Eq, ast.In))
+                    and isinstance(part.left, ast.Attribute) and not _model_column(part.comparators[0])):
+                columns.add(part.left.attr)
+            elif (isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute) and part.func.attr == "in_"
+                    and isinstance(part.func.value, ast.Attribute)):
+                columns.add(part.func.value.attr)
+    return columns
+
+
+def _scope_key(fn: ast.AST, call: ast.Call, patterns: tuple[re.Pattern[str], ...]) -> str | None:
+    """The `scope_key_patterns` column every statement the fetch may run filters on, else None."""
+    if not patterns:
+        return None
+    matched = []
+    for source in _statement_sources(fn, call):
+        column = next((c for c in sorted(_filtered_columns(source)) if any(p.search(c) for p in patterns)), None)
+        if column is None:
+            return None
+        matched.append(column)
+    return matched[0] if matched else None
 
 
 def _per_item(loop: ast.AST) -> list[ast.AST]:
@@ -345,12 +543,17 @@ def _file_findings(s: ScanSettings, rel: str, tree: ast.Module,
                            "a total is needed.",
                 ))
             elif isinstance(node, ast.Call) and _is_unbounded_sql_fetch(fn, node, perf.db_receiver):
+                # Already low confidence, so a scope key lowers the severity by one step instead.
+                scope = _scope_key(fn, node, perf.scope_keys)
+                severity = ("low" if route else "info") if scope else ("medium" if route else "low")
+                note = (f" [{SCOPE_KEY_NOTE} `{scope}`: it returns what one scope holds, not the whole table]"
+                        if scope else "")
                 findings.append(Finding(
                     tool=TOOL, rule="performance/unbounded-sql-fetch",
-                    severity="medium" if route else "low", confidence="low",
+                    severity=severity, confidence="low",
                     category="performance", exposure=exposure, file=rel, line=node.lineno,
                     message=f"{where} fetches every row a SELECT matches: no LIMIT in the SQL "
-                            "and none on the statement",
+                            f"and none on the statement{note}",
                     remedy="Bound it (LIMIT n / .limit(n)) and paginate with a keyset "
                            "(WHERE id > $last ORDER BY id), or aggregate in SQL when only a "
                            "total is needed. A table that is small today is not small next year.",

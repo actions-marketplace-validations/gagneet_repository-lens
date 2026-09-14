@@ -49,6 +49,11 @@ UNDEPLOYED_NOTE = "not run by any deployment manifest found"
 #: Anchored on the note's literal text, then anything to the closing bracket at the very
 #: end: a manifest path may itself contain `]` (`deploy/[prod]/Dockerfile`).
 _UNDEPLOYED_SUFFIX = re.compile(r" \[" + re.escape(UNDEPLOYED_NOTE) + r": .*\]\Z")
+#: Appended to an unbounded fetch whose WHERE filters on a `[scan.performance]
+#: scope_key_patterns` column. Configuration, not the code, decides it, so it is kept out of
+#: the fingerprint too: adding or removing a pattern does not turn findings into new ones.
+SCOPE_KEY_NOTE = "filtered on scope key"
+_SCOPE_KEY_SUFFIX = re.compile(r" \[" + re.escape(SCOPE_KEY_NOTE) + r" `[^`]*`[^\]]*\]")
 #: Lower bound of each priority's score band.
 _PRIORITY_FLOOR = (("P0", 9.0), ("P1", 5.0), ("P2", 2.5), ("P3", 0.0))
 #: GitHub code scanning reads `security-severity` (0-10) to label a security result.
@@ -113,7 +118,7 @@ class Finding:
         # Digits are normalised out of the message: counts and line references inside a
         # message change without the finding changing. When the count IS the finding
         # (`counts_matter`) it is compared separately, through `magnitudes`.
-        message = _UNDEPLOYED_SUFFIX.sub("", self.message)
+        message = _SCOPE_KEY_SUFFIX.sub("", _UNDEPLOYED_SUFFIX.sub("", self.message))
         stable = "|".join((self.tool, self.rule, self.file, _DIGITS.sub("#", message)))
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:20]
 
