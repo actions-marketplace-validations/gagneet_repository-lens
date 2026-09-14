@@ -51,6 +51,11 @@ DEFAULTS: dict[str, Any] = {
         "interpreter": "",
         "docformat": "",
         "extra_args": [],
+        # A module that cannot import because a third-party package is not installed for
+        # `interpreter` (an optional extra, e.g. fastapi): "exclude" leaves it out and names
+        # it in the build output; "fail" fails the build. A first-party import error
+        # always fails.
+        "missing_dependency": "exclude",
     },
     "typescript": {
         # Repo-relative files or directories; directories are expanded.
@@ -67,6 +72,7 @@ DEFAULTS: dict[str, Any] = {
 
 @dataclass
 class DocsSettings:
+    """`[docs]` merged over `DEFAULTS`, with paths resolved against the repository root."""
     root: Path
     python_roots: list[str]
     javascript_roots: list[str]
@@ -86,9 +92,11 @@ class DocsSettings:
     typescript: dict[str, Any]
 
     def skipped_file(self, rel_path: str) -> bool:
+        """Whether a repo-relative path matches `skip_file_patterns` and is not measured."""
         return any(p.search(rel_path) for p in self.skip_files)
 
     def is_placeholder(self, doc: str) -> bool:
+        """Whether a docstring is generated boilerplate that counts as missing."""
         return any(p.search(doc) for p in self.placeholders)
 
     def python_interpreter(self) -> str:
@@ -103,6 +111,7 @@ class DocsSettings:
 
 
 def from_config(cfg: Config | None = None) -> DocsSettings:
+    """Docs settings for `cfg`, or for the repolens.toml found from the working directory."""
     cfg = cfg if cfg is not None else load_config()
     d = merge(DEFAULTS, cfg.section("docs"))
     root = cfg.root

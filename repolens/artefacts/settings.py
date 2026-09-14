@@ -41,10 +41,12 @@ DEFAULTS: dict[str, Any] = {
 
 @dataclass(frozen=True)
 class Rule:
+    """One `[artefacts] rules` entry: a path regex and the generator argv that rebuilds it."""
     pattern: re.Pattern[str]
     run: tuple[str, ...]
 
     def argv(self, path: str) -> list[str] | None:
+        """The generator argv for `path` with `{name}` filled from named groups; None if unmatched."""
         match = self.pattern.match(path)
         if not match:
             return None
@@ -61,6 +63,7 @@ def _fill(part: str, groups: dict[str, str]) -> str:
 
 @dataclass
 class ArtefactSettings:
+    """Resolved `[artefacts]` settings, plus the FeatureTrace settings used to map tags."""
     root: Path
     rules: tuple[Rule, ...]
     run_first: tuple[str, ...]
@@ -76,6 +79,7 @@ class ArtefactSettings:
     featuretrace: FTSettings
 
     def rel(self, path: Path) -> str:
+        """`path` relative to the root with forward slashes, or as-is when outside it."""
         try:
             return path.relative_to(self.root).as_posix()
         except ValueError:
@@ -83,6 +87,7 @@ class ArtefactSettings:
 
 
 def from_config(cfg: Config | None = None) -> ArtefactSettings:
+    """Build `ArtefactSettings` from `[artefacts]` merged over `DEFAULTS`; loads config if none given."""
     cfg = cfg if cfg is not None else load_config()
     section = merge(DEFAULTS, cfg.section("artefacts"))
     venv = section["venv_python"]

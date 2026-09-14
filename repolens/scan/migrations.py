@@ -51,7 +51,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..core.findings import Finding
-from .python_ast import keyword_value, last, parse
+from .python_ast import keyword_value, last, not_gitignored
+from .security import TOO_DEEP, could_not_scan
 from .settings import ScanSettings
 
 TOOL = "migrations"
@@ -425,7 +426,7 @@ def _module_strings(tree: ast.Module) -> dict[str, list[_Sql]]:
 
 
 def _read(s: ScanSettings, path: Path) -> _Migration | None:
-    tree = parse(str(path), s.max_file_bytes)
+    tree = s.parse_cache.parse(path, s.max_file_bytes)
     if tree is None:
         return None
     m = _Migration(s.rel(path))
@@ -484,9 +485,9 @@ def migration_files(s: ScanSettings) -> list[Path]:
             and (path := s.root / relative).parent.resolve() in roots
             and not any(part in {"tests", "test"} for part in Path(relative).parts)
         )
-    return sorted(p for root in migration_roots(s) for p in root.glob("*.py")
-                  if p.name != "__init__.py" and not p.is_symlink()
-                  and p.resolve().is_relative_to(s.root.resolve()))
+    return sorted(not_gitignored(s, [p for root in migration_roots(s) for p in root.glob("*.py")
+                                     if p.name != "__init__.py" and not p.is_symlink()
+                                     and p.resolve().is_relative_to(s.root.resolve())]))
 
 
 # ── the rules ────────────────────────────────────────────────────────────────────
@@ -672,8 +673,20 @@ def _unsecured(migrations: list[_Migration], schemas: tuple[str, ...]) -> list[F
 
 def scan(s: ScanSettings) -> list[Finding]:
     """Run the database-migration rules over every migration file and return the findings."""
-    migrations = [m for p in migration_files(s) if (m := _read(s, p)) is not None]
+    migrations: list[_Migration] = []
     findings: list[Finding] = []
+    files = migration_files(s)
+    s.parse_cache.reserve(files)
+    for path in files:
+        try:
+            m = _read(s, path)
+        except RecursionError:
+            # `"..." + x + ...` is rendered recursively; a generated migration deep enough
+            # to overflow is reported, and every other migration is still read.
+            findings.append(could_not_scan(TOOL, s.rel(path), TOO_DEEP))
+            continue
+        if m is not None:
+            migrations.append(m)
     for m in migrations:
         findings.extend(_revision(m, s.migrations.revision_max_length))
         findings.extend(_not_null(m))

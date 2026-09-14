@@ -29,6 +29,7 @@ DEFAULTS: dict = {
 
 @dataclass
 class OwnerSettings:
+    """Resolved `[owners]` settings; paths are absolute under `root`, unset outputs are None."""
     root: Path
     registry: Path
     python_roots: list[str]
@@ -45,14 +46,17 @@ class OwnerSettings:
     command: str
 
     def rel(self, path: Path) -> str:
+        """`path` relative to the root, with forward slashes."""
         return path.relative_to(self.root).as_posix()
 
     @property
     def outputs(self) -> list[Path]:
+        """The configured artefact paths (JSON, then HTML and mindmap when set)."""
         return [p for p in (self.out_json, self.out_html, self.out_mindmap) if p]
 
 
 def from_config(cfg: Config) -> OwnerSettings:
+    """Build `OwnerSettings` from `[owners]`, merged over `DEFAULTS`."""
     d = merge(DEFAULTS, cfg.section("owners"))
     root = cfg.root
     return OwnerSettings(

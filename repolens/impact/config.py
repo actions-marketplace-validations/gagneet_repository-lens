@@ -1,3 +1,4 @@
+"""Graph scanner settings: defaults, then `[impact]` in repolens.toml, then `.impact-tracer.json`."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -15,12 +16,13 @@ DEFAULT_EXCLUDES = {
 
 DEFAULT_EXTENSIONS = {
     ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
-    ".json", ".yaml", ".yml", ".md", ".html", ".sh", ".sql", ".mts", ".cts",
+    ".json", ".yaml", ".yml", ".md", ".html", ".sh", ".sql", ".mts", ".cts", ".prisma",
 }
 
 
 @dataclass(slots=True)
 class Config:
+    """Settings for one graph scan: inputs, limits and application vocabulary. Build with `load`."""
     exclude_dirs: set[str] = field(default_factory=lambda: set(DEFAULT_EXCLUDES))
     exclude_paths: set[str] = field(default_factory=set)
     extensions: set[str] = field(default_factory=lambda: set(DEFAULT_EXTENSIONS))
@@ -28,6 +30,14 @@ class Config:
     canonical_owners_json: str | None = "docs/architecture/canonical_owners.json"
     router_datastore_json: str | None = "docs/architecture/router_datastore_map.json"
     backend_api_prefix: str = ""
+    # Base path for an HTTP client the scanner cannot trace to its declaration
+    # (`const { api } = useAuth()`), e.g. "/api".
+    client_api_base: str = ""
+    # Receiver names that are HTTP clients the scanner cannot trace (`this.http`-style
+    # wrappers passed in as arguments). Bindings from hooks (`useAuth()`) are found without it.
+    client_receivers: list[str] = field(default_factory=list)
+    # Skip untracked files git ignores (backups, build output); tracked files are always read.
+    respect_gitignore: bool = True
     max_ambiguous_targets: int = 12
     max_file_bytes: int = 2_000_000
     max_files: int = 10_000
@@ -42,6 +52,8 @@ class Config:
     mongo_receiver: str = "db"
 
     def validate(self) -> None:
+        """Raise ValueError for out-of-range limits, mistyped values or an artifact path that is
+        absolute or leaves the repository; lower-cases `extensions`."""
         if isinstance(self.max_file_bytes, bool) or not isinstance(self.max_file_bytes, int) or not 1 <= self.max_file_bytes <= 100_000_000:
             raise ValueError("max_file_bytes must be between 1 and 100000000")
         if isinstance(self.max_ambiguous_targets, bool) or not isinstance(self.max_ambiguous_targets, int) or not 1 <= self.max_ambiguous_targets <= 100:
@@ -54,7 +66,7 @@ class Config:
                for ext in self.extensions):
             raise ValueError("extensions must contain suffixes such as .py or .cs")
         self.extensions = {ext.lower() for ext in self.extensions}
-        for name in ("exclude_dirs", "exclude_paths", "pg_schemas", "roles", "toggle_calls"):
+        for name in ("exclude_dirs", "exclude_paths", "pg_schemas", "roles", "toggle_calls", "client_receivers"):
             values = getattr(self, name)
             if not isinstance(values, (set, frozenset, list, tuple)) or any(not isinstance(v, str) for v in values):
                 raise ValueError(f"{name} must be a list of strings")
@@ -66,6 +78,8 @@ class Config:
             raise ValueError("aliases must map strings to lists of strings")
         if not isinstance(self.backend_api_prefix, str) or not isinstance(self.mongo_receiver, str):
             raise ValueError("backend_api_prefix and mongo_receiver must be strings")
+        if not isinstance(self.client_api_base, str) or not isinstance(self.respect_gitignore, bool):
+            raise ValueError("client_api_base must be a string and respect_gitignore a boolean")
         if not self.mongo_receiver:
             raise ValueError("mongo_receiver must not be empty")
         for name in ("canonical_owners_json", "router_datastore_json"):
@@ -126,6 +140,12 @@ class Config:
         if "mongo_receiver" in raw and not isinstance(raw["mongo_receiver"], str):
             raise ValueError("mongo_receiver must be a string")
         self.backend_api_prefix = raw.get("backend_api_prefix", self.backend_api_prefix).rstrip("/")
+        if "client_api_base" in raw and not isinstance(raw["client_api_base"], str):
+            raise ValueError("client_api_base must be a string")
+        self.client_api_base = raw.get("client_api_base", self.client_api_base).rstrip("/")
+        if "respect_gitignore" in raw and not isinstance(raw["respect_gitignore"], bool):
+            raise ValueError("respect_gitignore must be a boolean")
+        self.respect_gitignore = raw.get("respect_gitignore", self.respect_gitignore)
 
         def integer(key: str, current: int) -> int:
             value = raw.get(key, current)
@@ -136,7 +156,7 @@ class Config:
         self.max_ambiguous_targets = integer("max_ambiguous_targets", self.max_ambiguous_targets)
         self.max_file_bytes = integer("max_file_bytes", self.max_file_bytes)
         self.max_files = integer("max_files", self.max_files)
-        for key in ("pg_schemas", "roles", "toggle_calls"):
+        for key in ("pg_schemas", "roles", "toggle_calls", "client_receivers"):
             if key in raw:
                 setattr(self, key, string_list(key))
         if "mongo_receiver" in raw:

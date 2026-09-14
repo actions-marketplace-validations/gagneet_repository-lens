@@ -10,7 +10,7 @@ high confidence, on a tool that crashed, and on a required tool that did not run
 |---|---|
 | severity | how bad is it, IF it is real? |
 | confidence | how likely is it to be real? |
-| exposure | who can reach it: unauthenticated, authenticated, internal, or unreachable (dead code)? |
+| exposure | who can reach it: unauthenticated, authenticated, internal, undeployed (only an app no deployment manifest runs), or unreachable (dead code)? |
 
 Priority P0–P3 is their product. A heuristic detector reports LOW confidence, not a lower
 severity: a missing ownership check is exactly as bad as it ever was, and what is

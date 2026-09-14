@@ -87,6 +87,7 @@ def executed_by_config(cfg: Config, report_is_run: bool = False) -> str:
 
 @dataclass
 class GateSettings:
+    """Resolved `[gates]` settings: the globbed scripts and surfaces, plus exemptions."""
     root: Path
     scripts: list[Path]
     must_fail: list[Path]
@@ -99,6 +100,11 @@ class GateSettings:
     _texts: dict[Path, str] = field(default_factory=dict, repr=False)
 
     def surface_text(self, surface: Path) -> str:
+        """The searchable text of one surface, cached.
+
+        For repolens.toml this is only the commands it executes, never its raw contents;
+        any other surface is its text with whole-line comments stripped.
+        """
         if surface not in self._texts:
             if self.config_path is not None and surface == self.config_path:
                 self._texts[surface] = self.config_commands
@@ -108,6 +114,7 @@ class GateSettings:
 
 
 def from_config(cfg: Config | None = None) -> GateSettings:
+    """Build gate settings from `[gates]` merged over `DEFAULTS`, globbing against the root."""
     cfg = cfg if cfg is not None else load_config()
     section = merge(DEFAULTS, cfg.section("gates"))
     root = cfg.root
@@ -148,12 +155,14 @@ def can_fail(settings: GateSettings, script: Path) -> bool:
 
 @dataclass
 class Findings:
+    """Script names that nothing runs or that cannot fail, and exemptions that no longer apply."""
     unreachable: list[str] = field(default_factory=list)
     non_gating: list[str] = field(default_factory=list)
     stale_exemptions: list[str] = field(default_factory=list)
 
 
 def evaluate(settings: GateSettings) -> Findings:
+    """Check every script for reachability and every `must_fail` script for gating."""
     found = Findings()
     names = {p.name for p in settings.scripts}
     for script in settings.scripts:
@@ -184,6 +193,11 @@ def evaluate(settings: GateSettings) -> Findings:
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          settings: GateSettings | None = None, prog: str | None = None) -> int:
+    """CLI entry point for `gates`: print findings and return an exit code.
+
+    Returns 1 under `--check` or `--strict` for an unreachable or non-gating script, and
+    under `--strict` for a stale exemption; otherwise 0.
+    """
     ap = argparse.ArgumentParser(prog=prog, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true",

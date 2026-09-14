@@ -17,11 +17,16 @@ callers/callees a NAVIGATION aid and blast_radius an UPPER BOUND, never proof. A
 type-resolving analysis would be exact and far slower; this is meant to be cheap
 enough to run in CI.
 
-Frontend extraction uses Tree-sitter when the stack extras are installed, with a
-legacy regex fallback. Neither path performs compiler type or runtime resolution.
+Frontend extraction is chosen by `[lens] javascript_parser`, never by what is installed:
+"regex" (the default; declarations only, no callees) or "tree-sitter" (functions and their
+calls; needs `repolens[stack]`, and refuses to run without it). The committed digest
+records the parser, and `--check` refuses to compare a digest built by the other one: a
+different parser is a different index, not a stale one. Neither parser performs compiler
+type or runtime resolution.
 """
 from __future__ import annotations
 
+import warnings
 import argparse
 import ast
 import hashlib
@@ -36,6 +41,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from ..core.git import run_git
 from ..config import Config, load_config
 from ..core.console import utf8_console
 from ..core.files import iter_files, read_text, read_text_or_none
@@ -61,7 +67,9 @@ def limits(s: LensSettings) -> list[str]:
     out = [
         "Call edges are NAME-based, not type-resolved: every definition sharing a "
         "callee's name is linked. Navigation aid; blast_radius is an upper bound.",
-        "Frontend records use Tree-sitter when available, otherwise regex; call targets remain name-based.",
+        (f"Frontend records were extracted by the {s.javascript_parser} parser ([lens] javascript_parser)"
+         + ("; regex records carry no callees." if s.javascript_parser == "regex"
+            else "; call targets remain name-based.")),
         f"tests[] is a NAME match against {s.tests_dir}/. When tests_ambiguous is true the "
         "list belongs to every function sharing the name, not this one. "
         "untested_upper_bound counts functions no test NAMES - not uncovered code.",
@@ -140,13 +148,12 @@ def _file_churn(s: LensSettings) -> dict[str, dict[str, Any]]:
     """path -> {commits, last_changed}. One `git log` pass, not one per file."""
     churn: dict[str, dict[str, Any]] = defaultdict(lambda: {"commits": 0, "last_changed": None})
     try:
-        raw = subprocess.run(
+        raw = run_git(
             # quotePath off: a non-ASCII path must come back as itself to match `rel`.
             # -z: paths end in NUL, so one holding a newline or edge spaces survives; each
             # commit reads `\x01<date>\0\n<path>\0<path>\0`.
-            ["git", "-c", "core.quotePath=false", "log", "--no-merges", "-z",
-             "--format=%x01%aI", "--name-only"],
-            cwd=s.root, capture_output=True, text=True, timeout=180, check=True,
+            s.root, "-c", "core.quotePath=false", "log", "--no-merges", "-z",
+            "--format=%x01%aI", "--name-only", timeout=180, check=True,
         ).stdout
     except (subprocess.SubprocessError, OSError):
         return {}
@@ -296,7 +303,9 @@ def _mongo_collections(s: LensSettings, node: ast.AST) -> list[str]:
 def _extract_python(s: LensSettings, path: Path, module_tags: list[str],
                     layer: str | None, orm: dict[str, set[str]] | None = None) -> list[dict[str, Any]]:
     try:
-        tree = ast.parse(read_text(path))
+        with warnings.catch_warnings():  # target code's own SyntaxWarnings are not ours to print
+            warnings.simplefilter("ignore")
+            tree = ast.parse(read_text(path))
     except (SyntaxError, OSError, ValueError, RecursionError):
         return []
     if orm is not None:
@@ -354,8 +363,8 @@ def _extract_frontend(s: LensSettings, path: Path, module_tags: list[str],
     rel = s.rel(path)
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    from ..core import javascript
-    if javascript.available():
+    if s.javascript_parser == "tree-sitter":
+        from ..core import javascript
         facts = javascript.parse_source(text, path.suffix.lower())
         language = "typescript" if path.suffix.lower() in {".ts", ".tsx", ".mts", ".cts"} else "javascript"
         for symbol in facts.symbols:
@@ -366,7 +375,9 @@ def _extract_frontend(s: LensSettings, path: Path, module_tags: list[str],
                 "qualname": symbol.qualified, "language": language, "lineno": symbol.line,
                 "is_async": symbol.is_async, "is_private": symbol.name.startswith("_"),
                 "purpose": "", "feature_tags": module_tags, "layer": layer, "routes": [],
-                "callees": sorted({called.rsplit(".", 1)[-1] for owner, called, _ in facts.calls if owner == symbol.qualified}),
+                # JSX renders are recorded beside calls; a rendered component is not a callee.
+                "callees": sorted({called.rsplit(".", 1)[-1] for owner, called, _line, kind in facts.calls
+                                   if owner == symbol.qualified and kind == "CALLS"}),
                 "guards": [], "postgres_tables": [], "mongo_collections": [],
                 "extraction": "tree-sitter",
             })
@@ -428,7 +439,22 @@ def _module_context(path: Path) -> tuple[list[str], str | None]:
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
+def require_parser(s: LensSettings) -> None:
+    """Refuse to build with a configured parser that cannot run. Falling back to regex
+    would emit an index with fewer functions and no callees that passes `--check`
+    against itself on this machine and disagrees with every machine that has the extra."""
+    if s.javascript_parser != "tree-sitter" or not s.frontend_roots:
+        return
+    from ..core import javascript
+    if not javascript.available():
+        raise SystemExit(
+            f"{s.command}: [lens] javascript_parser = \"tree-sitter\", and the Tree-sitter "
+            "grammars are not importable.\nInstall them (python -m pip install 'repolens[stack]'), "
+            "or set [lens] javascript_parser = \"regex\" and regenerate the committed index.")
+
+
 def build(s: LensSettings, with_churn: bool = False) -> dict[str, Any]:
+    require_parser(s)
     owns, violates = _load_canonical_owners(s)
     router_stores = _load_router_stores(s)
     test_refs = _test_references(s)
@@ -496,6 +522,7 @@ def build(s: LensSettings, with_churn: bool = False) -> dict[str, Any]:
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "javascript_parser": s.javascript_parser,
         "counts": {
             "total": len(index),
             "python": sum(1 for r in index.values() if r["language"] == "python"),
@@ -525,6 +552,8 @@ def digest(data: dict[str, Any]) -> dict[str, Any]:
     payload = json.dumps(hashable, sort_keys=True, separators=(",", ":"))
     fns = data["functions"]
     return {
+        # Outside the hash on purpose, so digests committed before it existed stay valid.
+        "javascript_parser": data.get("javascript_parser", "regex"),
         "counts": data["counts"],
         "limits": data["limits"],
         "content_sha256": hashlib.sha256(payload.encode()).hexdigest(),
@@ -563,7 +592,10 @@ def source_stamp(s: LensSettings) -> str:
 
     The settings are hashed as sorted JSON, not `repr(s)`: `repr` of a frozenset follows
     the per-process string hash, so every new process took a different stamp and every
-    lookup rebuilt the index."""
+    lookup rebuilt the index.
+
+    `javascript_parser` is a settings field, so it is part of the stamp: a cache built by
+    the other parser is rebuilt, not answered from."""
     h = hashlib.sha256(json.dumps({f.name: _canonical(getattr(s, f.name)) for f in fields(s)},
                                   sort_keys=True).encode())
     inputs = {
@@ -579,6 +611,25 @@ def source_stamp(s: LensSettings) -> str:
             continue
         h.update(f"{s.rel(path)}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
     return h.hexdigest()
+
+
+def committed_parser(old_digest: dict[str, Any]) -> str:
+    """The parser a committed digest was built with. A digest from before the setting
+    existed was built by regex whenever it could have been compared by `--check` on a
+    machine without the stack extras, so a missing field reads as regex."""
+    return str(old_digest.get("javascript_parser") or "regex")
+
+
+def parser_mismatch(s: LensSettings, old_digest: dict[str, Any]) -> str | None:
+    committed = committed_parser(old_digest)
+    if committed == s.javascript_parser:
+        return None
+    return (f"function lens digest was committed with {committed}, this run would use "
+            f"{s.javascript_parser}; set [lens] javascript_parser.\n"
+            f"  To check the committed digest: [lens] javascript_parser = \"{committed}\"\n"
+            f"  To switch parsers: set it to \"{s.javascript_parser}\", run {s.command}, "
+            "and commit the regenerated digest.\n"
+            "Not compared: a different parser yields a different index, which is not staleness.")
 
 
 def load_index(s: LensSettings) -> dict[str, Any]:
@@ -736,7 +787,8 @@ def main(argv: list[str] | None = None, *, config: Config | None = None,
     ap = argparse.ArgumentParser(prog=prog, description=f"Generate or query the {s.title}.")
     ap.add_argument("--lookup", metavar="NAME", help="show the one-page lens for a function")
     ap.add_argument("--json", action="store_true", help="with --lookup, emit raw JSON")
-    ap.add_argument("--check", action="store_true", help="CI: fail if the artefact is stale")
+    ap.add_argument("--check", action="store_true",
+                    help="CI: exit 1 if the artefact is stale, 2 if it was built by another javascript_parser")
     ap.add_argument("--with-churn", action="store_true",
                     help="include git churn (one extra `git log` pass)")
     ap.add_argument("--limit", type=int, default=12)
@@ -758,15 +810,22 @@ def main(argv: list[str] | None = None, *, config: Config | None = None,
             print(f"\n{len(hits)} match(es).")
         return 0
 
-    stamp = source_stamp(s)  # taken BEFORE the build: an edit during it reads as stale
-    data = build(s, with_churn=args.with_churn)
-    data["source_stamp"] = stamp  # cache only; the digest hashes `functions` alone
-
+    old: dict[str, Any] | None = None
     if args.check:
         if not s.out_digest.exists():
             print(f"function lens digest missing — run:\n  {s.command}")
             return 1
         old = json.loads(s.out_digest.read_text())
+        # Before the build: the refusal needs no index, and must not wait for one.
+        if (mismatch := parser_mismatch(s, old)) is not None:
+            print(mismatch)
+            return 2
+
+    stamp = source_stamp(s)  # taken BEFORE the build: an edit during it reads as stale
+    data = build(s, with_churn=args.with_churn)
+    data["source_stamp"] = stamp  # cache only; the digest hashes `functions` alone
+
+    if old is not None:
         fresh = digest(data)
         if old.get("content_sha256") != fresh["content_sha256"]:
             print("function lens is STALE. Regenerate and commit:")

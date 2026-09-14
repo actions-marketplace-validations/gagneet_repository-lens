@@ -112,15 +112,17 @@ class DiscoveryTests(Fixture):
         self.write("db/versions/0001_init.py", f'revision = "{"x" * 33}"\n')
         from repolens.analysis import analyze
         result = analyze(self.root)
-        self.assertEqual(result.runs[-1].error, "")
-        self.assertIn("migrations/revision-id-too-long", {f.rule for f in result.runs[-1].findings})
+        [run] = [run for run in result.runs if run.tool == "migrations"]
+        self.assertEqual(run.error, "")
+        self.assertIn("migrations/revision-id-too-long", {f.rule for f in run.findings})
 
     @unittest.skipUnless(importlib.util.find_spec("sqlglot") and javascript.available(), "install repolens[stack]")
     def test_default_alembic_directory_is_checked_by_analysis(self):
         from repolens.analysis import analyze
         self.write("alembic/versions/0001_init.py", f'revision = "{"x" * 33}"\n')
         result = analyze(self.root)
-        self.assertIn("migrations/revision-id-too-long", {f.rule for f in result.runs[-1].findings})
+        [run] = [run for run in result.runs if run.tool == "migrations"]
+        self.assertIn("migrations/revision-id-too-long", {f.rule for f in run.findings})
 
     @unittest.skipUnless(importlib.util.find_spec("sqlglot") and javascript.available(), "install repolens[stack]")
     def test_malformed_declared_artifact_marks_analysis_incomplete(self):
@@ -129,11 +131,11 @@ class DiscoveryTests(Fixture):
         self.assertFalse(analyze(self.root).complete)
 
     def test_orm_class_argument_links_the_calling_service_to_its_table(self):
-        self.write("service.py", "def list_lots(session):\n    return session.query(Lot).all()\n")
-        self.write("models.py", 'class Lot(Base):\n    __tablename__ = "lots"\n')
+        self.write("service.py", "def list_orders(session):\n    return session.query(Order).all()\n")
+        self.write("models.py", 'class Order(Base):\n    __tablename__ = "orders"\n')
         graph = scan_repository(self.root)
-        service = next(n.id for n in graph.nodes.values() if n.label == "list_lots")
-        table = next(n.id for n in graph.nodes.values() if n.label == "lots")
+        service = next(n.id for n in graph.nodes.values() if n.label == "list_orders")
+        table = next(n.id for n in graph.nodes.values() if n.label == "orders")
         self.assertTrue(any(e.source == service and e.target == table and e.kind == "TOUCHES_STORE" for e in graph.edges))
 
 

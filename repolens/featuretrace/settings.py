@@ -13,6 +13,7 @@ ICON_FALLBACK = "\U0001f4e6"
 
 @dataclass(frozen=True)
 class Layer:
+    """How one architectural layer is drawn in the maps: colours, icon, node shape and legend text."""
     name: str
     fill: str
     text: str
@@ -85,6 +86,7 @@ DEFAULTS: dict[str, Any] = {
 
 @dataclass
 class FTSettings:
+    """Resolved FeatureTrace settings for one repository, shared by the maps and the audit."""
     root: Path
     scan_dirs: tuple[str, ...]
     skip_parts: frozenset[str]
@@ -108,10 +110,12 @@ class FTSettings:
     concept_index_hint: str
 
     def layer(self, name: str) -> Layer:
+        """The named layer, or the `unknown` layer when it is not configured."""
         return self.layers.get(name) or self.layers[UNKNOWN]
 
     @property
     def map_dir_rel(self) -> str:
+        """The map directory relative to the root, or as given when it lies outside it."""
         try:
             return self.map_dir.relative_to(self.root).as_posix()
         except ValueError:
@@ -144,6 +148,7 @@ def _build_layers(section: dict[str, Any]) -> dict[str, Layer]:
 
 
 def from_config(cfg: Config | None = None) -> FTSettings:
+    """Build settings from `[featuretrace]` in repolens.toml merged over `DEFAULTS`."""
     cfg = cfg if cfg is not None else load_config()
     section = merge(DEFAULTS, cfg.section("featuretrace"))
     audit = section["audit"]

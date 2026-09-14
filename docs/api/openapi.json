@@ -216,7 +216,7 @@
           "Analysis"
         ],
         "summary": "Export Report",
-        "description": "Export a bounded Mermaid/Markdown view or the full normalized SARIF findings.",
+        "description": "Export a bounded Mermaid/Markdown/HTML view or the full normalized SARIF findings.",
         "operationId": "export_report",
         "security": [
           {
@@ -232,7 +232,8 @@
               "enum": [
                 "markdown",
                 "mermaid",
-                "sarif"
+                "sarif",
+                "html"
               ],
               "type": "string",
               "default": "markdown",
@@ -260,6 +261,18 @@
               "minimum": 1,
               "default": 30,
               "title": "Max Nodes"
+            }
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 8,
+              "minimum": 1,
+              "default": 6,
+              "title": "Depth"
             }
           }
         ],
@@ -348,6 +361,26 @@
             },
             "type": "array",
             "title": "Findings"
+          },
+          "incomplete_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Incomplete Reasons",
+            "description": "One line per cause when `complete` is false."
+          },
+          "tool_build": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Tool Build",
+            "description": "The repolens build that produced this result."
+          },
+          "config_sha256": {
+            "type": "string",
+            "title": "Config Sha256",
+            "description": "Fingerprint of the scanner settings and version.",
+            "default": ""
           }
         },
         "type": "object",
@@ -362,7 +395,8 @@
           "tools",
           "findings"
         ],
-        "title": "AnalysisResponse"
+        "title": "AnalysisResponse",
+        "description": "The result of a scan: its graph, tool statuses, findings and stated limits."
       },
       "CapabilitiesResponse": {
         "properties": {
@@ -402,7 +436,8 @@
           "databases",
           "limits"
         ],
-        "title": "CapabilitiesResponse"
+        "title": "CapabilitiesResponse",
+        "description": "The languages, frameworks and databases the analysis supports, and its limits."
       },
       "Diagnostic": {
         "properties": {
@@ -448,7 +483,8 @@
           "evidence",
           "recommendation"
         ],
-        "title": "Diagnostic"
+        "title": "Diagnostic",
+        "description": "A problem or limitation noticed while building the graph, with a recommendation."
       },
       "EdgeRecord": {
         "properties": {
@@ -508,7 +544,8 @@
           "direct",
           "activation"
         ],
-        "title": "EdgeRecord"
+        "title": "EdgeRecord",
+        "description": "A relationship between two nodes, with the evidence it was inferred from."
       },
       "FindingRecord": {
         "properties": {
@@ -577,7 +614,8 @@
           "priority",
           "fingerprint"
         ],
-        "title": "FindingRecord"
+        "title": "FindingRecord",
+        "description": "One prioritised finding at a file and line, with its evidence and suggested remedy."
       },
       "GraphRecord": {
         "properties": {
@@ -625,7 +663,8 @@
           "edges",
           "issues"
         ],
-        "title": "GraphRecord"
+        "title": "GraphRecord",
+        "description": "The full relationship graph of the scanned repository."
       },
       "HTTPValidationError": {
         "properties": {
@@ -657,7 +696,8 @@
           "status",
           "version"
         ],
-        "title": "HealthResponse"
+        "title": "HealthResponse",
+        "description": "Service liveness and version."
       },
       "ImpactRequest": {
         "properties": {
@@ -676,6 +716,14 @@
             "minimum": 1.0,
             "title": "Max Nodes",
             "default": 30
+          },
+          "depth": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Depth",
+            "description": "Relationship hops from the matched nodes. A table to page chain is typically 5-6 hops.",
+            "default": 6
           }
         },
         "additionalProperties": false,
@@ -683,7 +731,8 @@
         "required": [
           "query"
         ],
-        "title": "ImpactRequest"
+        "title": "ImpactRequest",
+        "description": "A search over the latest scan and how far to follow relationships from its matches."
       },
       "ImpactResponse": {
         "properties": {
@@ -750,7 +799,8 @@
           "omitted_nodes",
           "omitted_breakdown"
         ],
-        "title": "ImpactResponse"
+        "title": "ImpactResponse",
+        "description": "The bounded part of the graph connected to the query's matches, and what was left out."
       },
       "MatchRecord": {
         "properties": {
@@ -784,7 +834,8 @@
           "reasons",
           "snippets"
         ],
-        "title": "MatchRecord"
+        "title": "MatchRecord",
+        "description": "A node that matched the query, with its score and why it matched."
       },
       "NodeRecord": {
         "properties": {
@@ -845,7 +896,8 @@
           "kind",
           "label"
         ],
-        "title": "NodeRecord"
+        "title": "NodeRecord",
+        "description": "One code element found in the repository, such as a file, function, route or table."
       },
       "ScanRequest": {
         "properties": {
@@ -868,7 +920,8 @@
         },
         "additionalProperties": false,
         "type": "object",
-        "title": "ScanRequest"
+        "title": "ScanRequest",
+        "description": "Optional file size and file count limits for a scan; no other options are accepted."
       },
       "ToolStatus": {
         "properties": {
@@ -887,6 +940,14 @@
           "finding_count": {
             "type": "integer",
             "title": "Finding Count"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Notes",
+            "description": "Inputs this tool never examined; its results do not cover them."
           }
         },
         "type": "object",
@@ -896,7 +957,8 @@
           "skipped",
           "finding_count"
         ],
-        "title": "ToolStatus"
+        "title": "ToolStatus",
+        "description": "Whether one analysis tool ran, failed or was skipped, and how many findings it made."
       },
       "ValidationError": {
         "properties": {

@@ -18,6 +18,11 @@ scope_values = []
 [lens]
 python_roots = @@PYTHON_ROOTS@@
 frontend_roots = @@JS_ROOTS@@
+# How frontend functions are extracted: "regex" (declarations only, needs nothing) or
+# "tree-sitter" (functions and their calls; needs repolens[stack], and fails without it).
+# Never auto-detected: the committed digest records the parser, and `repolens lens --check`
+# refuses a digest built by the other one rather than calling it stale.
+javascript_parser = "regex"
 tests_dir = "@@TESTS_DIR@@"
 # Calls that establish a trust boundary (auth dependencies, role guards). The lens answers
 # "what gates this function?" from them.
@@ -35,6 +40,12 @@ javascript_roots = @@JS_ROOTS@@
 python_roots = @@PYTHON_ROOTS@@
 # Code that never serves a request (one-off scripts, seeds): findings there rank lower.
 internal_prefixes = []
+# Read deployment manifests (systemd, Dockerfile, compose, Procfile, supervisord, shell
+# scripts) for the Python server they run. Route files only an app no manifest runs
+# reaches are reported as "undeployed" (lower priority, never hidden). package.json
+# scripts and test/CI/dev files mark an app live but never make the deployment known,
+# and anything the reader cannot follow leaves nothing demoted.
+deployment_detection = true
 @@MIGRATIONS@@
 
 # Route path regex -> why it is public BY DESIGN. Each reason names what authorises the

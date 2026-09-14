@@ -1,5 +1,8 @@
 # Deep-dive audit — professional foundation
 
+> Snapshot at the 0.3.0 merge. It is not kept current: the present scope is
+> `analysis.LIMITS`, [`docs/roadmap.md`](../roadmap.md) and the CHANGELOG.
+
 Date: 2026-09-12  
 Branch: `codex/professional-foundation`  
 Baseline: repository `master` at `97097fd`  

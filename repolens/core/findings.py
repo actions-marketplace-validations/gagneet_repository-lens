@@ -8,6 +8,8 @@ report stops being believed:
   severity    how bad it is IF real     critical | high | medium | low | info
   confidence  how likely it is real     high | medium | low
   exposure    who can reach it          unauthenticated | authenticated | internal |
+                                        undeployed (only an app no deployment manifest
+                                        runs reaches it) |
                                         unreachable (dead code: nothing imports it) | ""
 
 `priority` (P0-P3) is derived from all three and is the sort key. A heuristic detector
@@ -39,7 +41,14 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 _SEVERITY_WEIGHT = {"critical": 10.0, "high": 7.0, "medium": 4.0, "low": 2.0, "info": 0.5}
 _CONFIDENCE_WEIGHT = {"high": 1.0, "medium": 0.7, "low": 0.4}
 _EXPOSURE_WEIGHT = {"unauthenticated": 1.5, "authenticated": 1.0, "internal": 0.5,
-                    "unreachable": 0.1, "": 1.0}
+                    "undeployed": 0.3, "unreachable": 0.1, "": 1.0}
+#: Appended to a finding's message when its file is undeployed. It names the manifests
+#: that were read, which change as the repository does, so it is kept out of the
+#: fingerprint: a finding that becomes (or stops being) undeployed keeps its identity.
+UNDEPLOYED_NOTE = "not run by any deployment manifest found"
+#: Anchored on the note's literal text, then anything to the closing bracket at the very
+#: end: a manifest path may itself contain `]` (`deploy/[prod]/Dockerfile`).
+_UNDEPLOYED_SUFFIX = re.compile(r" \[" + re.escape(UNDEPLOYED_NOTE) + r": .*\]\Z")
 #: Lower bound of each priority's score band.
 _PRIORITY_FLOOR = (("P0", 9.0), ("P1", 5.0), ("P2", 2.5), ("P3", 0.0))
 #: GitHub code scanning reads `security-severity` (0-10) to label a security result.
@@ -59,6 +68,7 @@ _MAGNITUDE_FORMAT = 3
 
 @dataclass
 class Finding:
+    """One problem a tool reported, in the shared severity/confidence/exposure model."""
     tool: str
     rule: str
     severity: str
@@ -88,19 +98,23 @@ class Finding:
 
     @property
     def score(self) -> float:
+        """Severity x confidence x exposure weight, rounded to two places; higher sorts first."""
         return round(_SEVERITY_WEIGHT[self.severity] * _CONFIDENCE_WEIGHT[self.confidence]
                      * _EXPOSURE_WEIGHT.get(self.exposure, 1.0), 2)
 
     @property
     def priority(self) -> str:
+        """P0-P3: the highest band whose score floor `score` reaches."""
         return next(name for name, floor in _PRIORITY_FLOOR if self.score >= floor)
 
     @property
     def fingerprint(self) -> str:
+        """A 20-hex-digit baseline identity from tool, rule, file and message; never the line."""
         # Digits are normalised out of the message: counts and line references inside a
         # message change without the finding changing. When the count IS the finding
         # (`counts_matter`) it is compared separately, through `magnitudes`.
-        stable = "|".join((self.tool, self.rule, self.file, _DIGITS.sub("#", self.message)))
+        message = _UNDEPLOYED_SUFFIX.sub("", self.message)
+        stable = "|".join((self.tool, self.rule, self.file, _DIGITS.sub("#", message)))
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:20]
 
     @property
@@ -110,11 +124,13 @@ class Finding:
 
     @property
     def location(self) -> str:
+        """`file:line`, or `file` when the line is unknown, or "" when there is no file."""
         if not self.file:
             return ""
         return f"{self.file}:{self.line}" if self.line else self.file
 
     def to_dict(self) -> dict:
+        """The fields plus the derived priority, score, fingerprint and location."""
         data = asdict(self)
         data.update(priority=self.priority, score=self.score, fingerprint=self.fingerprint,
                     location=self.location)
@@ -122,6 +138,7 @@ class Finding:
 
 
 def sort_key(finding: Finding) -> tuple:
+    """Fix-first order: priority, score (highest first), category, rule, file, line."""
     return (PRIORITIES.index(finding.priority), -finding.score, finding.category,
             finding.rule, finding.file, finding.line)
 
@@ -134,6 +151,9 @@ class ToolRun:
     skipped: str = ""       # non-empty = did not run, and why (never a silent zero)
     error: str = ""         # non-empty = crashed; its findings are incomplete
     seconds: float = 0.0
+    # The tool ran, but these inputs were never examined (skipped, unreadable, failed to
+    # parse). Its findings are real and its silence about those inputs is not.
+    notes: list[str] = field(default_factory=list)
 
 
 # ── baseline ─────────────────────────────────────────────────────────────────────
@@ -186,6 +206,8 @@ def load_magnitudes(path: Path) -> dict[str, list[list[int]]]:
 
 
 def write_baseline(path: Path, findings: Iterable[Finding]) -> None:
+    """Write a format-3 baseline: how many of each fingerprint are known, plus the
+    numbers each `counts_matter` occurrence carried, in sort order."""
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(findings, key=sort_key)  # the order `number_occurrences` uses
     counts = dict(sorted(Counter(f.fingerprint for f in ordered).items()))
@@ -228,6 +250,7 @@ def mark_new(findings: list[Finding], baseline: dict[str, int] | None,
 
 # ── formats ──────────────────────────────────────────────────────────────────────
 def to_json(runs: list[ToolRun], meta: dict) -> str:
+    """The JSON report: `meta`, each tool's status, a `summary` and every finding in sort order."""
     findings = sorted((f for r in runs for f in r.findings), key=sort_key)
     return json.dumps({
         "meta": meta,
@@ -239,6 +262,7 @@ def to_json(runs: list[ToolRun], meta: dict) -> str:
 
 
 def summary(findings: list[Finding]) -> dict:
+    """Finding counts: total, by priority, by category, and how many are new."""
     return {
         "total": len(findings),
         "by_priority": {p: sum(f.priority == p for f in findings) for p in PRIORITIES},
@@ -247,7 +271,7 @@ def summary(findings: list[Finding]) -> dict:
     }
 
 
-def to_sarif(runs: list[ToolRun], tool_version: str) -> str:
+def to_sarif(runs: list[ToolRun], tool_version: str, build: dict | None = None) -> str:
     """SARIF 2.1.0, one run per tool, so GitHub code scanning can file each separately.
 
     A tool that did not run (skipped or crashed) is a run with `executionSuccessful:
@@ -259,6 +283,9 @@ def to_sarif(runs: list[ToolRun], tool_version: str) -> str:
     for run in runs:
         driver = {"name": f"repolens/{run.tool}", "version": tool_version,
                   "informationUri": "https://github.com/"}
+        if build:
+            # Commit, dirty flag, source hash and extras: the version alone names many builds.
+            driver["properties"] = {"repolensBuild": build}
         if run.skipped or run.error:
             sarif_runs.append({"tool": {"driver": driver}, "invocations": [{
                 "executionSuccessful": False,
@@ -300,9 +327,16 @@ def to_sarif(runs: list[ToolRun], tool_version: str) -> str:
                     location["region"] = {"startLine": f.line}
                 result["locations"] = [{"physicalLocation": location}]
             results.append(result)
+        invocation: dict = {"executionSuccessful": True}
+        if run.notes:
+            # Results are kept (they were found), but a run that never opened some of
+            # its inputs did not succeed: a consumer must not read "no alert in a
+            # skipped file" as "the file is clean".
+            invocation = {"executionSuccessful": False, "toolExecutionNotifications": [
+                {"level": "warning", "message": {"text": note}} for note in run.notes]}
         sarif_runs.append({
             "tool": {"driver": {**driver, "rules": list(rules.values())}},
-            "invocations": [{"executionSuccessful": True}],
+            "invocations": [invocation],
             "results": results,
         })
     return json.dumps({
@@ -318,12 +352,16 @@ def _cell(text: str, width: int = 160) -> str:
 
 
 def to_markdown(runs: list[ToolRun], meta: dict, per_rule_cap: int = 15) -> str:
+    """The Markdown report: summary table, tool status, then findings grouped by priority
+    and rule, listing at most `per_rule_cap` per rule."""
     findings = sorted((f for r in runs for f in r.findings), key=sort_key)
     s = summary(findings)
     lines = [f"# {meta.get('title', 'repolens report')}", ""]
     lines.append(f"Tree `{meta.get('commit', '?')}` · {s['total']} findings"
                  + (f" · **{s['new']} new** against the baseline" if meta.get("baseline") else
                     " · no baseline (every finding is unclassified)"))
+    if meta.get("produced_by"):
+        lines += ["", f"Produced by {meta['produced_by']}"]
     lines += ["", "Priority blends severity (how bad if real), confidence (how likely real) "
               "and exposure (who can reach it). Heuristic detectors say LOW confidence rather "
               "than a lower severity — triage them, do not trust them.", ""]
@@ -336,7 +374,8 @@ def to_markdown(runs: list[ToolRun], meta: dict, per_rule_cap: int = 15) -> str:
 
     lines += ["", "## Tools", "", "| tool | findings | status | seconds |", "|---|---|---|---|"]
     for run in runs:
-        status = ("SKIPPED — " + run.skipped) if run.skipped else ("ERROR — " + run.error) if run.error else "ran"
+        status = ("SKIPPED — " + run.skipped) if run.skipped else ("ERROR — " + run.error) if run.error else \
+            (f"PARTIAL — {len(run.notes)} input note(s)" if run.notes else "ran")
         lines.append(f"| {run.tool} | {len(run.findings)} | {_cell(status, 120)} | {run.seconds:.1f} |")
 
     for p in PRIORITIES:

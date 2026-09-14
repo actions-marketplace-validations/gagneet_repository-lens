@@ -14,8 +14,8 @@ Exits 1 when the lists disagree.
 from __future__ import annotations
 
 import argparse
-import subprocess
 
+from ..core.git import run_git
 from ..config import Config
 from ..core.git import tracked_paths
 from .regenerate import Regenerator
@@ -28,10 +28,8 @@ def routed_to_driver(settings: ArtefactSettings, paths: list[str]) -> set[str]:
         return set()
     # -z: NUL-separated in and out, so a non-ASCII path comes back as itself rather than
     # C-quoted, and `path NUL attribute NUL value` needs no ": " splitting.
-    out = subprocess.run(
-        ["git", "-C", str(settings.root), "check-attr", "-z", "--stdin", "merge"],
-        input="\0".join(paths), capture_output=True, text=True, check=True,
-    ).stdout
+    out = run_git(settings.root, "check-attr", "-z", "--stdin", "merge", input="\0".join(paths),
+                  check=True, timeout=60).stdout
     fields = out.split("\0")
     routed = set()
     for i in range(0, len(fields) - 2, 3):
@@ -52,6 +50,7 @@ def disagreements(settings: ArtefactSettings) -> tuple[list[str], list[str]]:
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          settings: ArtefactSettings | None = None, prog: str | None = None) -> int:
+    """Entry point for the artefacts verify command: print disagreements, exit 1 if any."""
     argparse.ArgumentParser(prog=prog, description=__doc__,
                             formatter_class=argparse.RawDescriptionHelpFormatter).parse_args(argv)
     settings = settings or from_config(config)

@@ -12,6 +12,13 @@ there links whichever halves were built.
 pdoc IMPORTS the modules it documents, so it runs under `[docs.python] interpreter` and
 needs their dependencies. A module that cannot import without the application's full
 environment belongs in `[docs.python] exclude`, with the reason written beside it.
+
+Before pdoc runs, every module it would document is imported once under that
+interpreter. A module whose import fails only because a THIRD-PARTY package is not
+installed (an optional extra such as FastAPI for `repolens.api.app`) is left out and
+named in the output and in `index.html`; `[docs.python] missing_dependency = "fail"`
+turns that into a failure instead. Any other import failure, including an ImportError
+inside the documented packages themselves, fails the build before pdoc is started.
 TypeDoc is run through `[docs.typescript] command`, pinned, so the output cannot change
 under an unchanged tree.
 
@@ -22,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -62,7 +71,80 @@ def _tail(text: str, lines: int = 6) -> str:
     return "\n      ".join(kept[-lines:])
 
 
+#: Marks the probe's result line, so output a documented module prints on import is ignored.
+_PROBE_TAG = "REPOLENS-DOCS-PROBE:"
+
+#: Run under the docs interpreter with the pdoc module specs as argv[1] (JSON). It asks
+#: pdoc itself which modules those specs expand to, so `!pattern` exclusions and package
+#: walking follow the installed pdoc exactly, then imports each module the way pdoc will.
+#: A failure is "missing" only when a ModuleNotFoundError names a top-level package that
+#: is not one of the documented packages and cannot be found at all. Anything else,
+#: including a missing first-party module or `cannot import name`, is an "error".
+_PROBE = r"""
+import importlib, importlib.util, json, sys, traceback, warnings
+try:
+    from pdoc import extract
+    walk_specs = extract.walk_specs
+except Exception:
+    print("%(tag)s" + json.dumps({"unsupported": True}))
+    raise SystemExit(0)
+specs = json.loads(sys.argv[1])
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    try:
+        names = walk_specs(specs)
+    except Exception as exc:
+        print("%(tag)s" + json.dumps({"unsupported": True, "reason": repr(exc)}))
+        raise SystemExit(0)
+first_party = {name.split(".")[0] for name in names}
+load = getattr(extract, "load_module", importlib.import_module)
+missing, errors = {}, {}
+for name in names:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            load(name)
+    except BaseException as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        cause = exc.__cause__ if isinstance(exc, RuntimeError) and exc.__cause__ else exc
+        top = (getattr(cause, "name", None) or "").split(".")[0]
+        if (isinstance(cause, ModuleNotFoundError) and top and top not in first_party
+                and importlib.util.find_spec(top) is None):
+            missing[name] = cause.name
+        else:
+            errors[name] = "".join(traceback.format_exception_only(type(cause), cause)).strip()
+print("%(tag)s" + json.dumps({"modules": names, "missing": missing, "errors": errors}))
+""" % {"tag": _PROBE_TAG}
+
+
+@dataclass
+class ImportProbe:
+    """What importing the documented modules showed, before pdoc is asked to render them."""
+    missing: dict[str, str]  # module -> the third-party package it needs and is not installed
+    errors: dict[str, str]  # module -> why it failed to import, for any other reason
+    supported: bool = True  # False when this pdoc cannot expand specs; pdoc then runs unprobed
+
+
+def probe_imports(s: DocsSettings, interpreter: str, specs: list[str],
+                  env: dict[str, str] | None = None) -> ImportProbe:
+    """Import every module pdoc would document for `specs`, under `interpreter`.
+
+    Runs in a subprocess so a module's import side effects stay out of this process, as
+    they do for pdoc. A probe that cannot run or report is `supported=False`, and the
+    build falls back to pdoc's own verdict rather than guessing."""
+    proc = _run([interpreter, "-c", _PROBE, json.dumps(specs)], s, env)
+    for line in reversed((proc.stdout or "").splitlines()):
+        if line.startswith(_PROBE_TAG):
+            data = json.loads(line[len(_PROBE_TAG):])
+            if data.get("unsupported"):
+                break
+            return ImportProbe(dict(data.get("missing") or {}), dict(data.get("errors") or {}))
+    return ImportProbe({}, {}, supported=False)
+
+
 def build_python(s: DocsSettings, out: Path) -> Part:
+    """Render the pdoc half into `out/python`, or say why it was skipped or failed."""
     cfg = s.python
     modules = list(cfg.get("modules") or [])
     if not modules:
@@ -79,24 +161,39 @@ def build_python(s: DocsSettings, out: Path) -> Part:
     probe = _run([interpreter, "-c", "import pdoc"], s, env)
     if probe.returncode != 0:
         return Part("python", "skipped", f"pdoc is not installed for {interpreter} (pip install pdoc){note}")
+    specs = modules + [f"!{name}" for name in cfg.get("exclude") or []]
+    imports = probe_imports(s, interpreter, specs, env)
+    if imports.errors:
+        return Part("python", "failed", "cannot import " + ", ".join(sorted(imports.errors))
+                    + f"{note}:\n      " + "\n      ".join(
+                        f"{name}: {_tail(reason, 1)}" for name, reason in sorted(imports.errors.items())))
+    left_out = ""
+    if imports.missing:
+        listed = ", ".join(f"{name} (needs {dep})" for name, dep in sorted(imports.missing.items()))
+        if str(cfg.get("missing_dependency") or "exclude") == "fail":
+            return Part("python", "failed", f"dependency not installed for {interpreter}: {listed}{note}")
+        left_out = f"; NOT DOCUMENTED, dependency not installed: {listed}"
+        # Anchored: pdoc matches a `!` spec as a regex prefix, and only these modules go.
+        specs += [f"!{re.escape(name)}$" for name in sorted(imports.missing)]
     target = out / "python"
     _clear(target)
     argv = [interpreter, "-m", "pdoc", "-o", str(target)]
     if cfg.get("docformat"):
         argv += ["--docformat", str(cfg["docformat"])]
     argv += [str(a) for a in cfg.get("extra_args") or []]
-    argv += modules + [f"!{name}" for name in cfg.get("exclude") or []]
+    argv += specs
     proc = _run(argv, s, env)
     if proc.returncode != 0:
-        return Part("python", "failed", f"pdoc exited {proc.returncode}{note}:\n      "
+        return Part("python", "failed", f"pdoc exited {proc.returncode}{note}{left_out}:\n      "
                     + _tail(proc.stderr or proc.stdout))
     target.mkdir(parents=True, exist_ok=True)
     (target / MARKER).write_text("repolens docs build\n", encoding="utf-8")
     pages = sum(1 for _ in target.rglob("*.html"))
-    return Part("python", "built", f"{pages} pages for {', '.join(modules)}{note}", target)
+    return Part("python", "built", f"{pages} pages for {', '.join(modules)}{left_out}{note}", target)
 
 
 def build_typescript(s: DocsSettings, out: Path) -> Part:
+    """Render the TypeDoc half into `out/typescript`, or say why it was skipped or failed."""
     cfg = s.typescript
     entry_points = list(cfg.get("entry_points") or [])
     if not entry_points:
@@ -149,6 +246,7 @@ def write_index(out: Path, parts: list[Part], title: str) -> Path:
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          settings: DocsSettings | None = None, prog: str | None = None) -> int:
+    """`repolens docs build`. Exit 1 if a half failed, or under `--strict` was skipped."""
     ap = argparse.ArgumentParser(prog=prog, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--python", action="store_true", help="build only the pdoc half")

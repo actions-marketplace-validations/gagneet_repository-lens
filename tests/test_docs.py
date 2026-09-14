@@ -232,5 +232,111 @@ class BuildTests(unittest.TestCase):
         self.assertIn("configured interpreter venv/bin/python3 not found", part.detail)
 
 
+# A stand-in for pdoc with the two entry points `docs build` uses: `extract.walk_specs` (the
+# probe) and `python -m pdoc` (the render). It records the argv it was run with, so a test
+# can see what was excluded, and runs whether or not the real pdoc is installed.
+FAKE_PDOC = {
+    "src/pdoc/__init__.py": "",
+    "src/pdoc/extract.py": '''
+        import importlib, pkgutil, re
+
+        def load_module(name):
+            try:
+                return importlib.import_module(name)
+            except Exception as exc:
+                raise RuntimeError(f"Error importing {name}") from exc
+
+        def walk_specs(specs):
+            names = []
+            for spec in specs:
+                if spec.startswith("!"):
+                    pattern = re.compile(spec[1:])
+                    names = [n for n in names if not pattern.match(n)]
+                    continue
+                names.append(spec)
+                module = importlib.import_module(spec)
+                names += [m.name for m in pkgutil.iter_modules(getattr(module, "__path__", []), spec + ".")]
+            return names
+    ''',
+    "src/pdoc/__main__.py": '''
+        import json, pathlib, sys
+        args = sys.argv[1:]
+        out = pathlib.Path(args[args.index("-o") + 1])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "index.html").write_text("pages", encoding="utf-8")
+        pathlib.Path(__file__).with_name("argv.json").write_text(json.dumps(args), encoding="utf-8")
+    ''',
+    "src/pkg/__init__.py": '"""P."""\n',
+    "src/pkg/ok.py": '"""Imports."""\nimport json\n',
+}
+OPTIONAL = {"src/pkg/api.py": '"""Needs an extra."""\nimport repolens_test_absent_extra\n'}
+
+
+class OptionalDependencyBuildTests(unittest.TestCase):
+    """One module needing an uninstalled extra must not stop the whole pdoc build."""
+
+    def _build(self, files: dict[str, str], docs: str = "", *argv: str):
+        tree = Tree({**FAKE_PDOC, **files},
+                    docs='[docs.python]\nmodules = ["pkg"]\npath = ["src"]\n' + docs)
+        self.addCleanup(tree.close)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = build.main(["--python", "--out", str(tree.root / "out"), *argv], config=tree.config)
+        recorded = tree.root / "src/pdoc/argv.json"
+        pdoc_argv = __import__("json").loads(recorded.read_text(encoding="utf-8")) if recorded.exists() else None
+        return code, out.getvalue(), pdoc_argv
+
+    def test_a_module_whose_third_party_dependency_is_missing_is_excluded_and_named(self):
+        code, output, pdoc_argv = self._build(OPTIONAL, "", "--strict")
+        self.assertEqual(code, 0)
+        self.assertIn("BUILT", output)
+        self.assertIn("NOT DOCUMENTED, dependency not installed: pkg.api (needs repolens_test_absent_extra)",
+                      output)
+        self.assertEqual(pdoc_argv[-2:], ["pkg", r"!pkg\.api$"])
+
+    def test_a_clean_tree_is_rendered_with_nothing_excluded(self):
+        code, output, pdoc_argv = self._build({})
+        self.assertEqual(code, 0)
+        self.assertNotIn("NOT DOCUMENTED", output)
+        self.assertEqual(pdoc_argv[-1], "pkg")
+
+    def test_the_repository_can_ask_for_a_missing_dependency_to_fail_the_build(self):
+        code, output, pdoc_argv = self._build(OPTIONAL, 'missing_dependency = "fail"\n')
+        self.assertEqual(code, 1)
+        self.assertIn("dependency not installed", output)
+        self.assertIsNone(pdoc_argv)
+
+    def test_a_first_party_import_error_still_fails_and_pdoc_is_not_run(self):
+        code, output, pdoc_argv = self._build(
+            {"src/pkg/broken.py": '"""Broken."""\nfrom pkg.ok import no_such_name\n'})
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED", output)
+        self.assertIn("cannot import pkg.broken", output)
+        self.assertIsNone(pdoc_argv)
+
+    def test_a_missing_first_party_module_is_an_error_not_an_optional_dependency(self):
+        code, output, _ = self._build({"src/pkg/typo.py": '"""Typo."""\nimport pkg.gone\n'})
+        self.assertEqual(code, 1)
+        self.assertIn("cannot import pkg.typo", output)
+
+    def test_an_excluded_module_is_not_probed(self):
+        code, output, pdoc_argv = self._build(OPTIONAL, 'exclude = ["pkg.api"]\n')
+        self.assertEqual(code, 0)
+        self.assertNotIn("NOT DOCUMENTED", output)
+        self.assertEqual(pdoc_argv[-1], "!pkg.api")
+
+
+@unittest.skipUnless(__import__("importlib.util").util.find_spec("pdoc"), "requires pdoc (repolens[docs])")
+class RealPdocBuildTests(unittest.TestCase):
+    def test_pdoc_documents_the_rest_of_a_package_when_one_module_needs_a_missing_extra(self):
+        tree = Tree({"src/pkg/__init__.py": '"""P."""\n', "src/pkg/ok.py": '"""OK."""\n', **OPTIONAL},
+                    docs='[docs.python]\nmodules = ["pkg"]\npath = ["src"]\n')
+        self.addCleanup(tree.close)
+        code = _quiet(build.main, ["--python", "--strict", "--out", str(tree.root / "out")], config=tree.config)
+        self.assertEqual(code, 0)
+        self.assertTrue((tree.root / "out/python/pkg/ok.html").is_file())
+        self.assertFalse((tree.root / "out/python/pkg/api.html").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

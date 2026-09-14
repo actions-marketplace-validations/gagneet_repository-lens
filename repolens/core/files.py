@@ -1,9 +1,10 @@
 """Walking and reading a source tree."""
 from __future__ import annotations
 
+import re
 import sys
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 
@@ -68,6 +69,7 @@ class SkipRule:
         )
 
     def matches(self, parts: tuple[str, ...]) -> bool:
+        """Whether path components `parts` contain a skipped name or a skipped run."""
         if any(part in self.single for part in parts):
             return True
         for run in self.runs:
@@ -99,6 +101,38 @@ def read_text_or_none(path: Path) -> str | None:
     except OSError as exc:
         print(f"repolens: skipped {path}: {exc.strerror or exc}", file=sys.stderr)
         return None
+
+
+#: Directory names that hold test code or fixtures, compared case-insensitively.
+TEST_DIRS = frozenset({"test", "tests", "__tests__", "spec", "specs", "e2e", "cypress", "fixtures", "__fixtures__", "testdata"})
+
+
+def is_test_path(path: str) -> bool:
+    """True for test code and fixtures: a tests/, __tests__, spec/, e2e/, cypress/ or
+    fixtures directory, `test_*.py`, `*_test.py`, `conftest.py`, `*.test.ts` or `*.spec.js`."""
+    posix = PurePosixPath(path)
+    if any(part.lower() in TEST_DIRS for part in posix.parts[:-1]):
+        return True
+    name = posix.name.lower()
+    return bool(re.fullmatch(r"test_.*\.py|.*_test\.py|conftest\.py", name) or re.search(r"\.(?:test|spec)\.[cm]?[jt]sx?$", name))
+
+
+#: Directories whose files are test code, whatever the language.
+_TEST_CODE_DIRS = frozenset({"test", "tests", "__tests__", "e2e", "cypress"})
+
+
+def is_test_code(path: str) -> bool:
+    """Stricter than `is_test_path`, for rules that must never exempt application code: a
+    file under a tests/, test/, `__tests__`/, e2e/ or cypress/ directory, or named as a test
+    (`test_*.py`, `*_test.py`, `conftest.py`, `*.test.ts`, `*.spec.js`, `*.cy.ts`). A spec/,
+    fixtures/ or testdata/ directory alone does not count: applications keep API specs and
+    seed data under those names."""
+    posix = PurePosixPath(path)
+    if any(part.lower() in _TEST_CODE_DIRS for part in posix.parts[:-1]):
+        return True
+    name = posix.name.lower()
+    return bool(re.fullmatch(r"test_.*\.py|.*_test\.py|conftest\.py", name)
+                or re.search(r"\.(?:test|spec|cy)\.[cm]?[jt]sx?$", name))
 
 
 def rel(path: Path, root: Path) -> str:

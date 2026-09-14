@@ -7,6 +7,11 @@ dependencies=[...])` both apply to every route on the router. Reading only the d
 reported router-level authentication as "no authentication", and printed every path
 without its prefix.
 
+The same import resolution answers two more questions about a route file: which
+dependency aliases (`CurrentUser = Annotated[User, Depends(get_current_user)]`) and which
+security scheme instances (`oauth2_scheme = OAuth2PasswordBearer(...)`) its names refer
+to, when they are defined in another module (`dependency_aliases`, `schemes`).
+
 Resolution follows `include_router` calls across files, through imports
 (`from routers.x import router as x_router`, `from routers import x` + `x.router`), and
 up the chain of parents: `app.include_router(api)` where `api = APIRouter(prefix="/api")`.
@@ -33,20 +38,26 @@ from dataclasses import dataclass
 
 from .python_ast import (
     Mount,
+    annotated_aliases,
     declared_routers,
+    dependency_name,
     dependency_names,
     keyword_value,
-    parse,
-    python_files,
+    may_mention,
+    parsed_files,
     router_prefix,
+    run_inputs,
+    security_schemes,
 )
 from .settings import ScanSettings
-from .wiring import module_names
+from .wiring import ModuleMap
 
 _ROUTER_CONSTRUCTORS = frozenset({"APIRouter"})
 
 Key = tuple[str, str]  # (repo-relative file, router variable)
 Target = tuple[str, str | None]  # (module, attribute): what an imported name refers to
+_LAST_LINE = 1 << 30  # a binding looked up for the whole file: the last import wins
+_REEXPORT_DEPTH = 4  # `from .deps import CurrentUser` in an __init__, followed this far
 
 
 @dataclass(frozen=True)
@@ -130,20 +141,27 @@ def _candidates(arg: ast.AST, loop: tuple[str, list[ast.expr]] | None) -> list[a
     return [arg]
 
 
+def mount_index(s: ScanSettings) -> "MountIndex":
+    """The run's MountIndex: built once for security and performance both, and again only
+    if a file or a setting it reads changed (`ParseCache.derived`)."""
+    trees = {s.rel(path): tree for path, tree in parsed_files(s)}
+    return s.parse_cache.derived("mount_index", run_inputs(s, trees), lambda: MountIndex(s, trees))
+
+
 class MountIndex:
     """Every router in the scanned tree, with the Mount it effectively has."""
 
-    def __init__(self, s: ScanSettings):
-        trees: dict[str, ast.Module] = {}
-        by_module: dict[str, str] = {}
-        for path in python_files(s):
-            tree = parse(str(path), s.max_file_bytes)
-            if tree is None:
-                continue
-            rel = s.rel(path)
-            trees[rel] = tree
-            for name in module_names(rel, s.python_roots):
-                by_module.setdefault(name, rel)
+    def __init__(self, s: ScanSettings, trees: dict[str, ast.Module] | None = None):
+        if trees is None:
+            trees = {s.rel(path): tree for path, tree in parsed_files(s)}
+        # A module name more than one file can claim resolves to none of them: mounting
+        # the wrong router's dependencies could make an open route read as protected.
+        self._trees = trees
+        self._modules = ModuleMap(list(trees), s.python_roots)
+        self._scheme_classes = s.security.auth_scheme_classes
+        self._import_memo: dict[str, dict[str, list[tuple[int, Target]]]] = {}
+        self._alias_memo: dict[str, dict[str, ast.Call]] = {}
+        self._scheme_memo: dict[str, set[str]] = {}
 
         constructors = _ROUTER_CONSTRUCTORS | s.app_constructors
         self._own: dict[Key, Mount] = {}
@@ -155,12 +173,10 @@ class MountIndex:
 
         includes: list[_Include] = []
         for rel, tree in trees.items():
-            if not any(isinstance(n, ast.Attribute) and n.attr == "include_router"
-                       for n in ast.walk(tree)):
+            if not may_mention(tree, "include_router") or not any(
+                    isinstance(n, ast.Attribute) and n.attr == "include_router" for n in ast.walk(tree)):
                 continue
-            names = module_names(rel, s.python_roots)
-            own_module = min(names, key=len) if names else ""
-            aliases = _aliases(tree, own_module, rel.endswith("__init__.py"))
+            aliases = self._imports(rel)
             loops = _loop_bindings(tree)
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -168,7 +184,7 @@ class MountIndex:
                         and isinstance(node.func.value, ast.Name)):
                     continue
                 for arg in _candidates(node.args[0], loops.get(id(node))):
-                    child = self._resolve(arg, rel, aliases, by_module, node.lineno)
+                    child = self._resolve(arg, rel, aliases, node.lineno)
                     if child is not None:
                         includes.append(_Include((rel, node.func.value.id), child, router_prefix(node),
                                                  dependency_names(keyword_value(node, "dependencies"))))
@@ -177,20 +193,26 @@ class MountIndex:
             self._parents[inc.child].append(inc)
         self._memo: dict[Key, Mount] = {}
 
+    def _imports(self, rel: str) -> dict[str, list[tuple[int, Target]]]:
+        if rel not in self._import_memo:
+            self._import_memo[rel] = _aliases(self._trees[rel], self._modules.own[rel],
+                                              rel.endswith("__init__.py"))
+        return self._import_memo[rel]
+
     def _resolve(self, arg: ast.AST, rel: str, aliases: dict[str, list[tuple[int, Target]]],
-                 by_module: dict[str, str], line: int) -> Key | None:
+                 line: int) -> Key | None:
         """The router an `include_router(<arg>)` argument names, if it can be found."""
         if isinstance(arg, ast.Name):
             if (rel, arg.id) in self._own:
                 return (rel, arg.id)
             module, attr = _binding(aliases, arg.id, line)
-            file = by_module.get(module)
+            file = self._modules.unique(module, rel)
             if file and attr and (file, attr) in self._own:
                 return (file, attr)
             return None
         if isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name):
             module, attr = _binding(aliases, arg.value.id, line)
-            file = by_module.get(f"{module}.{attr}" if attr else module)
+            file = self._modules.unique(f"{module}.{attr}" if attr else module, rel)
             if file and (file, arg.attr) in self._own:
                 return (file, arg.attr)
         return None
@@ -218,3 +240,87 @@ class MountIndex:
     def for_file(self, rel: str) -> dict[str, Mount]:
         """Router variable -> effective Mount, for the routers declared in `rel`."""
         return {name: self.effective((rel, name)) for name in self._by_file.get(rel, ())}
+
+    # ── names defined in another module ─────────────────────────────────────────────
+    def _aliases_in(self, rel: str) -> dict[str, ast.Call]:
+        if rel not in self._alias_memo:
+            self._alias_memo[rel] = annotated_aliases(self._trees[rel])
+        return self._alias_memo[rel]
+
+    def _schemes_in(self, rel: str) -> set[str]:
+        if rel not in self._scheme_memo:
+            self._scheme_memo[rel] = security_schemes(self._trees[rel], self._scheme_classes)
+        return self._scheme_memo[rel]
+
+    def _defined(self, rel: str, name: str, table, depth: int = 0) -> Key | None:
+        """(file, name) where `name`, as `rel` sees it, is defined in `table(file)`: in
+        `rel` itself, or through a `from m import name`, following a re-export (an
+        `__init__` that imports it from a submodule) a few levels deep."""
+        if name in table(rel):
+            return (rel, name)
+        if depth >= _REEXPORT_DEPTH:
+            return None
+        module, attr = _binding(self._imports(rel), name, _LAST_LINE)
+        file = self._modules.unique(module, rel) if attr else None
+        return self._defined(file, attr, table, depth + 1) if file else None
+
+    def _module_imports(self, rel: str) -> dict[str, str]:
+        """Local name -> file, for names bound to a whole module: `import app.deps as
+        deps`, or `from app import deps` where `app/deps.py` is a scanned file."""
+        out: dict[str, str] = {}
+        for local in self._imports(rel):
+            module, attr = _binding(self._imports(rel), local, _LAST_LINE)
+            file = self._modules.unique(f"{module}.{attr}" if attr else module, rel)
+            if file:
+                out[local] = file
+        return out
+
+    def dependency_aliases(self, rel: str) -> dict[str, ast.Call]:
+        """Annotation name as spelled in `rel` (`CurrentUser`, `deps.CurrentUser`) -> the
+        Depends/Security call of an alias another module defines. The file's own
+        aliases `routes()` reads itself."""
+        out: dict[str, ast.Call] = {}
+        for local in self._imports(rel):
+            if (key := self._defined(rel, local, self._aliases_in)) is not None:
+                out[local] = self._aliases_in(key[0])[key[1]]
+        for local, file in self._module_imports(rel).items():
+            out.update((f"{local}.{name}", call) for name, call in self._aliases_in(file).items())
+        return out
+
+    def _visible_schemes(self, rel: str) -> set[str]:
+        """Scheme names a dependency in `rel` can name: its own, imported ones (a
+        dependency is named by its last attribute, so `deps.oauth2_scheme` is
+        `oauth2_scheme`), and those an alias it uses depends on in the alias's module
+        (`TokenDep = Annotated[str, Depends(reusable_oauth2)]` in deps.py)."""
+        names = set(self._schemes_in(rel))
+        names.update(local for local in self._imports(rel)
+                     if self._defined(rel, local, self._schemes_in) is not None)
+        for file in self._module_imports(rel).values():
+            names |= self._schemes_in(file)
+        aliases = [(rel, name) for name in self._aliases_in(rel)]
+        aliases += [key for local in self._imports(rel)
+                    if (key := self._defined(rel, local, self._aliases_in)) is not None]
+        for file, alias in aliases:
+            target = dependency_name(self._aliases_in(file)[alias])
+            if target and (target in self._schemes_in(file) or
+                           self._defined(file, target, self._schemes_in) is not None):
+                names.add(target)
+        return names
+
+    def schemes(self, rel: str) -> frozenset[str]:
+        """Dependency names that are security schemes for the routes in `rel`, including
+        router-level ones: an `include_router(..., dependencies=[Depends(scheme)])` in
+        another file names the scheme as THAT file sees it."""
+        names = self._visible_schemes(rel)
+        seen: set[str] = {rel}
+        stack: list[Key] = [(rel, name) for name in self._by_file.get(rel, ())]
+        visited: set[Key] = set(stack)
+        while stack:
+            for inc in self._parents.get(stack.pop(), ()):
+                if inc.parent[0] not in seen:
+                    seen.add(inc.parent[0])
+                    names |= self._visible_schemes(inc.parent[0])
+                if inc.parent not in visited:
+                    visited.add(inc.parent)
+                    stack.append(inc.parent)
+        return frozenset(names)

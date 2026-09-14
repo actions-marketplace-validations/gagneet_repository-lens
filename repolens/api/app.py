@@ -1,7 +1,6 @@
 """A single-repository local API; it is not a multi-tenant hosted scanning service."""
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
 from pathlib import Path
 import secrets
@@ -9,31 +8,39 @@ import threading
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import __version__
-from ..analysis import Analysis, LIMITS, analyze
+from ..analysis import MAX_VIEW_DEPTH, VIEW_DEPTH, Analysis, LIMITS, analyze
 from ..core.findings import to_sarif
+from ..provenance import tool_build
 from ..impact.config import Config
 from ..impact.render import render_json, render_mermaid
 
 
 class ScanRequest(BaseModel):
+    """Optional file size and file count limits for a scan; no other options are accepted."""
+
     model_config = ConfigDict(extra="forbid")
     max_file_bytes: int = Field(default=2_000_000, ge=1, le=2_000_000, description="Maximum source bytes per file.")
     max_files: int = Field(default=10_000, ge=1, le=10_000, description="Maximum admitted files; truncation is reported as incomplete.")
 
 
 class ImpactRequest(BaseModel):
+    """A search over the latest scan and how far to follow relationships from its matches."""
+
     model_config = ConfigDict(extra="forbid")
     query: str = Field(min_length=1, max_length=500, examples=["list_items"])
     max_nodes: int = Field(default=30, ge=1, le=100)
+    depth: int = Field(default=VIEW_DEPTH, ge=1, le=MAX_VIEW_DEPTH, description="Relationship hops from the matched nodes. A table to page chain is typically 5-6 hops.")
 
 
 class NodeRecord(BaseModel):
+    """One code element found in the repository, such as a file, function, route or table."""
+
     id: str
     kind: str
     label: str
@@ -44,6 +51,8 @@ class NodeRecord(BaseModel):
 
 
 class EdgeRecord(BaseModel):
+    """A relationship between two nodes, with the evidence it was inferred from."""
+
     source: str
     target: str
     kind: str
@@ -56,6 +65,8 @@ class EdgeRecord(BaseModel):
 
 
 class Diagnostic(BaseModel):
+    """A problem or limitation noticed while building the graph, with a recommendation."""
+
     code: str
     severity: str
     message: str
@@ -66,6 +77,8 @@ class Diagnostic(BaseModel):
 
 
 class GraphRecord(BaseModel):
+    """The full relationship graph of the scanned repository."""
+
     version: int
     root: str
     metadata: dict[str, Any]
@@ -75,13 +88,18 @@ class GraphRecord(BaseModel):
 
 
 class ToolStatus(BaseModel):
+    """Whether one analysis tool ran, failed or was skipped, and how many findings it made."""
+
     tool: str
     error: str
     skipped: str
     finding_count: int
+    notes: list[str] = Field(default_factory=list, description="Inputs this tool never examined; its results do not cover them.")
 
 
 class FindingRecord(BaseModel):
+    """One prioritised finding at a file and line, with its evidence and suggested remedy."""
+
     model_config = ConfigDict(extra="allow")
     tool: str
     rule: str
@@ -98,6 +116,8 @@ class FindingRecord(BaseModel):
 
 
 class AnalysisResponse(BaseModel):
+    """The result of a scan: its graph, tool statuses, findings and stated limits."""
+
     schema_version: str
     tool_version: str
     complete: bool = Field(description="Supported checks completed; does not mean vulnerability-free or fully understood.")
@@ -107,9 +127,14 @@ class AnalysisResponse(BaseModel):
     graph: GraphRecord
     tools: list[ToolStatus]
     findings: list[FindingRecord]
+    incomplete_reasons: list[str] = Field(default_factory=list, description="One line per cause when `complete` is false.")
+    tool_build: dict[str, Any] = Field(default_factory=dict, description="The repolens build that produced this result.")
+    config_sha256: str = Field(default="", description="Fingerprint of the scanner settings and version.")
 
 
 class MatchRecord(BaseModel):
+    """A node that matched the query, with its score and why it matched."""
+
     node_id: str
     score: float
     reasons: list[str]
@@ -117,6 +142,8 @@ class MatchRecord(BaseModel):
 
 
 class ImpactResponse(BaseModel):
+    """The bounded part of the graph connected to the query's matches, and what was left out."""
+
     query: str
     seeds: list[MatchRecord]
     nodes: list[NodeRecord]
@@ -128,11 +155,15 @@ class ImpactResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    """Service liveness and version."""
+
     status: Literal["ok"]
     version: str
 
 
 class CapabilitiesResponse(BaseModel):
+    """The languages, frameworks and databases the analysis supports, and its limits."""
+
     languages: list[str]
     frameworks: list[str]
     databases: list[str]
@@ -140,6 +171,11 @@ class CapabilitiesResponse(BaseModel):
 
 
 def create_app(root: Path, token: str) -> FastAPI:
+    """The loopback-only API for the checkout at `root`, guarded by bearer `token`.
+
+    `token` must be at least 32 characters. The latest analysis is held in process
+    memory; requests can bound a scan but never choose a path, command or plugin."""
+    tool_build()  # stamp the code this server loaded, before any checkout can change
     root = root.resolve()
     if not root.is_dir():
         raise ValueError("repository root must be an existing directory")
@@ -215,19 +251,23 @@ def create_app(root: Path, token: str) -> FastAPI:
               tags=["Analysis"], operation_id="query_impact", responses=errors)
     def query_impact(request: ImpactRequest):
         """Query stored graph evidence without reading or executing target source."""
-        return json.loads(render_json(current().view(request.query, request.max_nodes)))
+        return json.loads(render_json(current().view(request.query, request.max_nodes, request.depth)))
 
     @app.get("/v1/report", response_class=PlainTextResponse, dependencies=auth,
              tags=["Analysis"], operation_id="export_report", responses=errors)
-    def export_report(format: Literal["markdown", "mermaid", "sarif"] = "markdown",
+    def export_report(format: Literal["markdown", "mermaid", "sarif", "html"] = "markdown",
                       query: str = Query(default="", max_length=500),
-                      max_nodes: int = Query(default=30, ge=1, le=100)):
-        """Export a bounded Mermaid/Markdown view or the full normalized SARIF findings."""
+                      max_nodes: int = Query(default=30, ge=1, le=100),
+                      depth: int = Query(default=VIEW_DEPTH, ge=1, le=MAX_VIEW_DEPTH)):
+        """Export a bounded Mermaid/Markdown/HTML view or the full normalized SARIF findings."""
         analysis = current()
+        if format == "html":
+            return HTMLResponse(analysis.html(query, max_nodes, depth),
+                                headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
         if format == "mermaid":
-            return PlainTextResponse(render_mermaid(analysis.view(query, max_nodes)))
+            return PlainTextResponse(render_mermaid(analysis.view(query, max_nodes, depth)))
         if format == "sarif":
-            return PlainTextResponse(to_sarif(analysis.runs, __version__), media_type="application/sarif+json")
-        return PlainTextResponse(analysis.markdown(query, max_nodes), media_type="text/markdown")
+            return PlainTextResponse(to_sarif(analysis.runs, __version__, build=tool_build()), media_type="application/sarif+json")
+        return PlainTextResponse(analysis.markdown(query, max_nodes, depth), media_type="text/markdown")
 
     return app

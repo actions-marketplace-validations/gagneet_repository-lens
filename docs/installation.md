@@ -3,6 +3,12 @@
 Repository Lens is a Python package that analyzes one local checkout. It does not
 clone, install or execute the checkout being analyzed.
 
+The 0.2 version of this page, including "Making it a separate repository" (the split,
+packaging, trusted publishing, the Action, the CI matrix and the hardening checklist) and
+the baseline, merge-hook and removal procedures, is kept verbatim in
+[history/installation-0.2.md](history/installation-0.2.md). Upgrade notes for each
+release are in [CHANGELOG.md](../CHANGELOG.md).
+
 ## Requirements and optional extras
 
 | Extra | Provides | Use it for |
@@ -39,7 +45,7 @@ repolens analyze --out .repolens/analysis
 ```
 
 Use `repolens --root /path/to/checkout analyze` when the command is launched elsewhere.
-The report writes JSON, Markdown, Mermaid and SARIF under the chosen output directory.
+The report writes JSON, Markdown, HTML, Mermaid and SARIF under the chosen output directory.
 
 Start the local API only when you need an interactive client:
 
@@ -103,6 +109,88 @@ report. It does not provide remote-repository access or a hosted service.
   runs `repolens`.
 - SARIF producer files are imported as evidence only. External property files and
   unsuccessful producer runs remain incomplete and cannot be baselined.
+- `repolens docs build` imports each module pdoc documents before running pdoc. A module
+  whose third-party dependency is not installed (for example `repolens.api.app` without
+  the `api` extra) is left out and named as `NOT DOCUMENTED, dependency not installed`,
+  so a `"!repolens.api"` entry in `[docs.python] modules` is no longer needed. Set
+  `[docs.python] missing_dependency = "fail"` to make that a failure. An import error
+  inside the documented packages themselves always fails the build.
+- Upgrading a vendored copy: read the release's upgrade notes in
+  [CHANGELOG.md](../CHANGELOG.md) first. Then replace the whole directory and refresh
+  `VENDORED.json` (below), rather than merging file by file.
+
+### Checking repolens itself
+
+A workflow for this repository should run the gates it asks targets to run, against its
+own package. Run them in two environments: once with only `requirements-ci.txt`, which
+proves the docs build survives a missing optional extra, and once with
+`.[stack,api,test,docs]`:
+
+```yaml
+- run: python -m pip install -e . -r requirements-ci.txt
+- run: python -m unittest discover -s tests -q
+- run: repolens docs coverage --check          # needs a committed .repolens/docstring_baseline.json
+- run: repolens docs build --python --strict   # needs [docs.python] modules = ["repolens"]
+```
+
+The repository has no workflow or `repolens.toml` of its own yet. Until both are
+committed, these commands run only by hand.
+
+## Vendoring a copy
+
+A repository that vendors repolens as a plain copy, instead of installing a pinned
+package, should record what it copied. Put `VENDORED.json` at the top of the vendored
+directory:
+
+```json
+{
+  "schema": 1,
+  "name": "repolens",
+  "upstream": "https://github.com/<owner>/repository-lens",
+  "version": "0.3.0",
+  "commit": "<40-hex upstream commit SHA>",
+  "tree": "<40-hex git tree hash of that commit's root: git rev-parse <commit>^{tree}>",
+  "path": "tools/repolens",
+  "vendored_on": "2026-09-13",
+  "local_changes": []
+}
+```
+
+`commit` says which upstream revision was copied. `tree` lets anyone check the copy
+without trusting the record: git hashes a directory from its file names, modes and
+contents, so an unmodified copy has exactly the upstream root tree hash. The record
+itself is left out of that hash. `local_changes` lists any file deliberately patched
+after copying, with the reason; a non-empty list means `tree` will not match.
+
+Manual procedure, from the consumer's repository root (here `tools/repolens`):
+
+```bash
+UP=/path/to/repository-lens            # a clean checkout at the release to vendor
+git -C "$UP" status --short             # must print nothing
+COMMIT=$(git -C "$UP" rev-parse HEAD)
+TREE=$(git -C "$UP" rev-parse 'HEAD^{tree}')
+
+git rm -r -q --cached tools/repolens 2>/dev/null; rm -rf tools/repolens
+mkdir -p tools/repolens
+git -C "$UP" archive HEAD | tar -x -C tools/repolens   # tracked files only
+git add tools/repolens
+
+# The copy's tree hash, without VENDORED.json, must equal $TREE before the record is written.
+test "$(git write-tree --prefix=tools/repolens/)" = "$TREE" && echo "copy matches $COMMIT"
+# ... write tools/repolens/VENDORED.json with $COMMIT and $TREE, then git add it and commit.
+```
+
+To verify a committed copy later:
+
+```bash
+git ls-tree HEAD:tools/repolens | grep -v $'\tVENDORED.json$' | git mktree
+# prints the tree hash; compare it with "tree" in tools/repolens/VENDORED.json
+```
+
+The check fails if a `.gitattributes` text or eol conversion in the consumer rewrites
+files as they are added, or if an ignore rule there drops a file. In both cases the copy
+really does differ from upstream. A `repolens vendor verify` command that automates this
+is planned in the [roadmap](roadmap.md). It is not implemented.
 
 ## Security posture
 

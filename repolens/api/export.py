@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 def contracts(root: Path | None = None) -> tuple[dict, dict, dict]:
+    """The OpenAPI schema, Postman collection and Postman environment for the API."""
     from .app import create_app
     # Contract generation never starts a server or scans the current directory.
     schema = create_app((root or Path.cwd()).resolve(), "contract-generation-only-" + "0" * 32).openapi()
@@ -21,13 +22,13 @@ def contracts(root: Path | None = None) -> tuple[dict, dict, dict]:
         if not operation.get("security"):
             request["auth"] = {"type": "noauth"}
         if method == "post":
-            example = ({"query": "list_items", "max_nodes": 30} if operation["operationId"] == "query_impact"
+            example = ({"query": "list_items", "max_nodes": 30, "depth": 6} if operation["operationId"] == "query_impact"
                        else {"max_file_bytes": 2000000, "max_files": 10000})
             request["header"] = [{"key": "Content-Type", "value": "application/json"}]
             request["body"] = {"mode": "raw", "raw": json.dumps(example, indent=2),
                                "options": {"raw": {"language": "json"}}}
         if operation["operationId"] == "export_report":
-            request["url"] += "?format=mermaid&max_nodes=30"
+            request["url"] += "?format=mermaid&max_nodes=30&depth=6"
         items.append({"name": operation.get("summary", operation["operationId"]), "request": request,
                       "event": [{"listen": "test", "script": {"type": "text/javascript", "exec": [
                           "pm.test('Request succeeds', function () { pm.response.to.have.status(200); });"
@@ -43,6 +44,7 @@ def contracts(root: Path | None = None) -> tuple[dict, dict, dict]:
 
 
 def main(argv=None, *, config=None, prog=None) -> int:
+    """Write the three contract documents under `--out` (relative to the repository root)."""
     parser = argparse.ArgumentParser(prog=prog, description=__doc__)
     parser.add_argument("--out", type=Path, default=Path("docs/api"))
     args = parser.parse_args(argv)

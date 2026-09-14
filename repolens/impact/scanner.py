@@ -1,27 +1,35 @@
+"""Build one repository's evidence graph from static reads; target code is never imported or run."""
 from __future__ import annotations
 
 import ast
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from functools import lru_cache
 import hashlib
 import json
 import os
+import posixpath
 from importlib import metadata as package_metadata
 from itertools import islice
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .config import Config
 from .model import Edge, Graph, Issue, Node, stable_id
 from .source import read_source
 from .plugins import Extractor, SourceFile, merge_extraction
 from .resolution import ImportIndex
+from .state import (MONGO_NOT_COLLECTIONS, MONGO_READ_METHODS, MONGO_WRITE_METHODS,  # noqa: F401
+                    PendingCall, ScanState, _add_store_edge, _endpoint_id, _file_id, _rel,
+                    _symbol_id, mongo_operation, normalise_route, with_api_prefix)
+from .python_scan import PythonVisitor, _resolve_orm_references, _scan_python  # noqa: F401
+from .render import mark_unverified_stores
 from ..core import javascript
+from ..core.files import is_test_path
 
-SCANNER_REVISION = 2
+SCANNER_REVISION = 8
 
 
 FEATURE_RE = re.compile(r"@featuretrace:([A-Za-z0-9_.-]+)")
@@ -45,47 +53,6 @@ JS_KEYWORDS = {
     "if", "for", "while", "switch", "catch", "function", "return", "typeof",
     "new", "super", "import", "require", "describe", "it", "test", "expect",
 }
-
-
-@dataclass(slots=True)
-class PendingCall:
-    source: str
-    name: str
-    evidence: str
-    language: str
-
-
-@dataclass(slots=True)
-class ScanState:
-    graph: Graph
-    root: Path
-    config: Config
-    definitions: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
-    pending_calls: list[PendingCall] = field(default_factory=list)
-    module_files: dict[str, str] = field(default_factory=dict)
-    files: list[Path] = field(default_factory=list)
-    imports: dict[str, dict[str, tuple[str, str]]] = field(default_factory=dict)
-    python_trees: dict[str, ast.Module] = field(default_factory=dict)
-    import_index: ImportIndex | None = None
-    admitted_paths: frozenset[str] = frozenset()
-    orm_tables: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
-    orm_references: list[tuple[str, str, str]] = field(default_factory=list)
-
-
-def _rel(root: Path, path: Path) -> str:
-    return path.relative_to(root).as_posix()
-
-
-def _file_id(path: str) -> str:
-    return stable_id("file", path)
-
-
-def _symbol_id(path: str, qualified: str) -> str:
-    return stable_id("symbol", f"{path}::{qualified}")
-
-
-def _endpoint_id(method: str, route: str) -> str:
-    return stable_id("endpoint", f"{method.upper()} {normalise_route(route)}")
 
 
 def _language_for_path(path: Path) -> str:
@@ -122,21 +89,26 @@ def _artifact_rel(state: ScanState, value: object) -> str | None:
     return pure.as_posix().removeprefix("./")
 
 
-def normalise_route(route: str) -> str:
-    route = route.strip()
-    route = re.sub(r"\$\{[^}]+\}", "{dynamic}", route)
-    # Parameter spelling differs between client templates and backend routes.
-    route = re.sub(r"\{[^{}]+\}", "{dynamic}", route)
-    route = re.sub(r"//+", "/", route)
-    if route != "/":
-        route = route.rstrip("/")
-    return route or "/"
+def _gitignored(root: Path) -> tuple[frozenset[str], str]:
+    """Untracked paths git ignores under `root`, and why that list is unavailable; see
+    `core.git.untracked_ignored`. A gitignored backup is not source, and reading it made
+    scans incomplete. Repository config that could run a command is overridden."""
+    from ..core.git import untracked_ignored
+    return untracked_ignored(root)
 
 
-def iter_source_files(root: Path, config: Config) -> Iterable[Path]:
+def iter_source_files(root: Path, config: Config, ignored: frozenset[str] | None = None) -> Iterable[Path]:
+    """Yield regular files with a configured extension under `root`, in sorted walk order.
+
+    Symlinks, excluded directories and paths, and (with `respect_gitignore`) untracked
+    gitignored paths are pruned before they are descended into."""
+    if ignored is None:
+        ignored = _gitignored(root)[0] if config.respect_gitignore else frozenset()
+
     def excluded(path: Path) -> bool:
         rel = path.relative_to(root).as_posix()
-        return any(rel == item or rel.startswith(item + "/") for item in config.exclude_paths)
+        # An ignored directory is pruned before its files are reached, so membership suffices.
+        return rel in ignored or any(rel == item or rel.startswith(item + "/") for item in config.exclude_paths)
 
     # Prune before descending: rglob followed by filtering still walks node_modules.
     for base, directories, files in os.walk(root, followlinks=False):
@@ -185,252 +157,936 @@ def repository_content_sha(root: Path, config: Config) -> str:
     return digest.hexdigest()
 
 
-class PythonVisitor(ast.NodeVisitor):
-    def __init__(self, state: ScanState, path: str, file_node: str, text: str, router_prefix: str = ""):
-        self.state = state
-        self.path = path
-        self.file_node = file_node
-        self.text = text
-        self.scope: list[str] = []
-        self.symbol_stack: list[str] = []
-        self.router_prefix = router_prefix
-        self.sql_values: list[dict[str, ast.AST]] = [{}]
-
-    def _current_source(self) -> str:
-        return self.symbol_stack[-1] if self.symbol_stack else self.file_node
-
-    def _add_definition(self, node: ast.AST, name: str, kind: str) -> str:
-        qualified = ".".join([*self.scope, name])
-        node_id = _symbol_id(self.path, qualified)
-        doc = ast.get_docstring(node) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else None
-        metadata = {"qualified_name": qualified, "symbol_kind": kind}
-        if doc:
-            metadata["doc"] = doc[:600]
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            body_dump = ast.dump(
-                ast.Module(body=node.body, type_ignores=[]),
-                annotate_fields=True,
-                include_attributes=False,
-            )
-            if len(body_dump) >= 110:
-                metadata["body_fingerprint"] = hashlib.sha256(body_dump.encode("utf-8")).hexdigest()
-        self.state.graph.add_node(Node(
-            id=node_id,
-            kind="symbol",
-            label=qualified,
-            path=self.path,
-            line=getattr(node, "lineno", None),
-            language="python",
-            metadata=metadata,
-        ))
-        self.state.graph.add_edge(Edge(
-            self.file_node, node_id, "CONTAINS", "exact", "python_ast", origin="ast"
-        ))
-        self.state.definitions[name].append(node_id)
-        return node_id
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        symbol = self._add_definition(node, node.name, "class")
-        table = schema = ""
-        for statement in node.body:
-            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
-                continue
-            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-            names = {target.id for target in targets if isinstance(target, ast.Name)}
-            if "__tablename__" in names and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str):
-                table = statement.value.value
-            if "__table_args__" in names and statement.value is not None:
-                for value in ast.walk(statement.value):
-                    if isinstance(value, ast.Dict):
-                        for key, item in zip(value.keys, value.values):
-                            if isinstance(key, ast.Constant) and key.value == "schema" and isinstance(item, ast.Constant) and isinstance(item.value, str):
-                                schema = item.value
-        if table:
-            table_name = f"{schema}.{table}" if schema else table
-            self.state.orm_tables[node.name].append(table_name)
-            _add_store_edge(self.state.graph, symbol, "postgres_table", table_name,
-                            "exact", f"{self.path}:{node.lineno}")
-        self.scope.append(node.name)
-        self.symbol_stack.append(symbol)
-        self.sql_values.append({})
-        self.generic_visit(node)
-        self.sql_values.pop()
-        self.symbol_stack.pop()
-        self.scope.pop()
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._visit_function(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._visit_function(node)
-
-    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        symbol = self._add_definition(node, node.name, "function")
-        self.scope.append(node.name)
-        self.symbol_stack.append(symbol)
-        self.sql_values.append({})
-        self.generic_visit(node)
-        self.sql_values.pop()
-        self.symbol_stack.pop()
-        self.scope.pop()
-
-    def visit_Call(self, node: ast.Call) -> None:
-        name = None
-        if isinstance(node.func, ast.Name):
-            name = node.func.id
-        elif isinstance(node.func, ast.Attribute):
-            name = ast.unparse(node.func)
-        if name:
-            self.state.pending_calls.append(PendingCall(
-                self._current_source(), name,
-                f"{self.path}:{getattr(node, 'lineno', '?')}", "python",
-            ))
-        if name and name.rsplit(".", 1)[-1] in {"text", "execute", "executemany", "fetch", "fetchrow", "fetchval", "exec_driver_sql", "query"}:
-            value = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg in {"query", "sql", "statement"}), None)
-            if isinstance(value, ast.Name):
-                value = next((scope[value.id] for scope in reversed(self.sql_values) if value.id in scope), None)
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                if re.search(r"\b(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", value.value, re.I):
-                    from .postgres import add_sql
-                    add_sql(self.state.graph, self._current_source(), value.value, f"{self.path}:{node.lineno}")
-            elif isinstance(value, (ast.JoinedStr, ast.BinOp)):
-                from .postgres import add_sql
-                add_sql(self.state.graph, self._current_source(), "", f"{self.path}:{node.lineno}", dynamic=True)
-        for reference in ast.walk(node):
-            if isinstance(reference, ast.Name):
-                self.state.orm_references.append((
-                    self._current_source(), reference.id,
-                    f"{self.path}:{getattr(reference, 'lineno', node.lineno)}",
-                ))
-        self.generic_visit(node)
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                self.sql_values[-1][target.id] = node.value
-        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-            if re.match(r"\s*(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", node.value.value, re.I):
-                from .postgres import add_sql
-                add_sql(self.state.graph, self._current_source(), node.value.value, f"{self.path}:{node.lineno}")
-        self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if isinstance(node.target, ast.Name):
-            self.sql_values[-1][node.target.id] = node.value
-        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-            if re.match(r"\s*(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", node.value.value, re.I):
-                from .postgres import add_sql
-                add_sql(self.state.graph, self._current_source(), node.value.value, f"{self.path}:{node.lineno}")
-        self.generic_visit(node)
-
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        if isinstance(node.value, ast.Name) and node.value.id == self.state.config.mongo_receiver:
-            _add_store_edge(
-                self.state.graph, self._current_source(), "mongo_collection",
-                node.attr, "high", f"{self.path}:{getattr(node, 'lineno', '?')}",
-            )
-        self.generic_visit(node)
+#: Bundler inputs a JS module may import that are not code: never a missing local module.
+_ASSET_SUFFIXES = frozenset({
+    ".css", ".scss", ".sass", ".less", ".styl", ".pcss", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".avif", ".ico", ".bmp", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp4", ".webm", ".mp3", ".wav",
+    ".pdf", ".txt", ".md", ".mdx", ".graphql", ".gql", ".wasm", ".html", ".yaml", ".yml", ".json", ".glsl",
+})
+#: A too-large file of another type is data (a JSON backup), not a hole in the code analysis,
+#: unless the scanner interprets it (`_interpreted_data_file`).
+_DATA_SUFFIXES = frozenset({".json", ".yaml", ".yml", ".md", ".mdx", ".txt", ".csv", ".tsv", ".html", ".xml", ".lock", ".log",
+                            ".map", ".svg"})
+#: Receivers whose members are the platform, never a function in this repository.
+_JS_GLOBALS = frozenset({
+    "JSON", "console", "Math", "Object", "Array", "Promise", "window", "document", "process", "Number",
+    "String", "Date", "Reflect", "globalThis", "Intl", "Symbol", "Map", "Set", "WeakMap", "WeakSet", "URL",
+    "URLSearchParams", "Buffer", "localStorage", "sessionStorage", "navigator", "location", "history",
+    "crypto", "performance", "Response", "Request", "Headers", "Error", "RegExp", "BigInt", "Proxy",
+    "module", "exports", "require", "self", "customElements", "Atomics", "ArrayBuffer", "DataView",
+})
+_HTTP_HANDLER_NAMES = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 
 
-def _add_store_edge(
-    graph: Graph, source: str, kind: str, name: str, resolution: str, evidence: str
-) -> None:
-    store_id = stable_id(kind, name)
-    graph.add_node(Node(store_id, kind, name, metadata={"store": name}))
-    graph.add_edge(Edge(source, store_id, "TOUCHES_STORE", resolution, evidence, origin="syntax"))
+def _interpreted_data_file(name: str) -> bool:
+    """`package.json` (Prisma schema selection, project roots, liveness) and `tsconfig`/
+    `jsconfig` path aliases change results, so skipping one is a hole, not skipped data."""
+    return name == "package.json" or bool(re.fullmatch(r"(?:ts|js)config(?:\.[\w.-]+)?\.json", name))
+#: Files that mark a directory as a JS project root, so its `app/`/`pages/` is a router.
+_NEXT_PROJECT_MARKERS = ("package.json", "next.config.js", "next.config.mjs", "next.config.ts", "next.config.cjs")
+_URL_SCHEME = re.compile(r"^(?:[a-z][a-z0-9+.-]*:)?//", re.I)
 
 
-def _scan_python(state: ScanState, path: Path, text: str, file_node: str) -> None:
-    rel = _rel(state.root, path)
-    try:
-        tree = ast.parse(text, filename=rel)
-    except SyntaxError as exc:
-        state.graph.issues.append(Issue(
-            "PYTHON_PARSE_ERROR", "warning", f"Could not parse {rel}: {exc.msg}",
-            [file_node], f"{rel}:{exc.lineno or 1}", "Fix syntax or exclude generated/vendor code.",
+def _store_detail(detail: str, operation: str) -> str:
+    return f"{detail} ({operation})" if operation else detail
+
+
+def _report_sql_interpolation(graph, source: str, evidence: str, holes: list[tuple[str, str, bool]]) -> None:
+    """SQL text built by splicing values in. A value traced to a CLI argument or request
+    input is an injection; any other is named, so a reviewer knows what to check."""
+    untrusted = [(text, origin) for text, origin, _ in holes if origin]
+    if untrusted:
+        origins = " and ".join(sorted({origin for _, origin in untrusted}))
+        graph.issues.append(Issue(
+            "SQL_INJECTION_RISK", "warning",
+            f"SQL text splices in {', '.join(f'`{text}`' for text, _ in untrusted)}, which comes from {origins}.",
+            [source], evidence,
+            "Pass the value as a bound parameter ($1 with a values array, or a tagged template) instead of building the SQL string.",
         ))
         return
-    state.python_trees[rel] = tree
-    for target, local, symbol, line in state.import_index.python_bindings(rel, tree):
-        state.imports.setdefault(rel, {})[local] = (target, symbol)
-        target_id = _file_id(target)
-        state.graph.add_node(Node(target_id, "file", target, path=target))
-        state.graph.add_edge(Edge(file_node, target_id, "IMPORTS", "exact", f"{rel}:{line}", origin="python_ast"))
-    router_prefix = ""
-    for node in tree.body:
-        value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
-        if not isinstance(value, ast.Call):
-            continue
-        func_name = value.func.id if isinstance(value.func, ast.Name) else getattr(value.func, "attr", "")
-        if func_name != "APIRouter":
-            continue
-        for keyword in value.keywords:
-            if keyword.arg == "prefix" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
-                router_prefix = keyword.value.value.rstrip("/")
-    PythonVisitor(state, rel, file_node, text, router_prefix).visit(tree)
+    shown = ", ".join(f"`{text}`" + (" inside a quoted literal" if quoted else "") for text, _, quoted in holes[:4])
+    more = f" and {len(holes) - 4} more" if len(holes) > 4 else ""
+    graph.issues.append(Issue("DYNAMIC_SQL", "info", f"SQL text splices in {shown}{more}.", [source], evidence,
+                              "Bind values as parameters; choose any varying identifier from a fixed allow-list."))
+
+
+def _into_excluded_directory(state: ScanState, rel: str, module: str) -> bool:
+    """`./.next/types/routes.d.ts` from next-env.d.ts: output the scan skips by design."""
+    if not module.startswith("."):
+        return False
+    target = posixpath.normpath(posixpath.join(posixpath.dirname(rel), module))
+    parts = PurePosixPath(target).parts
+    if not parts or parts[0] == "..":
+        return False
+    return (any(part in state.config.exclude_dirs for part in parts[:-1])
+            or any(target == prefix or target.startswith(prefix + "/") for prefix in state.config.exclude_paths))
 
 
 def _scan_javascript_syntax(state: ScanState, path: Path, text: str, file_node: str) -> None:
     rel = _rel(state.root, path)
     facts = javascript.parse_source(text, path.suffix.lower())
     language = "typescript" if path.suffix.lower() in {".ts", ".tsx", ".mts", ".cts"} else "javascript"
+    graph = state.graph
+
+    def owner_id(owner: str) -> str:
+        node_id = _symbol_id(rel, owner) if owner else file_node
+        return node_id if node_id in graph.nodes else file_node
+
     for line in facts.errors[:20]:
-        state.graph.issues.append(Issue("JAVASCRIPT_PARSE_ERROR", "warning", "Parser recovered from invalid or unsupported JavaScript/TypeScript syntax.",
-                                        [file_node], f"{rel}:{line}", "Correct the syntax or report a grammar limitation."))
+        graph.issues.append(Issue("JAVASCRIPT_PARSE_ERROR", "warning", "Parser recovered from invalid or unsupported JavaScript/TypeScript syntax.",
+                                  [file_node], f"{rel}:{line}", "Correct the syntax or report a grammar limitation."))
     for symbol in facts.symbols:
         node_id = _symbol_id(rel, symbol.qualified)
-        state.graph.add_node(Node(node_id, "symbol", symbol.qualified, path=rel, line=symbol.line, language=language,
-                                  metadata={"qualified_name": symbol.qualified, "symbol_kind": symbol.kind,
-                                            "exported": symbol.exported, "default_export": symbol.default_export,
-                                            "end_line": symbol.end_line}))
-        state.graph.add_edge(Edge(file_node, node_id, "CONTAINS", "exact", f"{rel}:{symbol.line}", origin="tree-sitter"))
+        metadata = {"qualified_name": symbol.qualified, "symbol_kind": symbol.kind,
+                    "exported": symbol.exported, "default_export": symbol.default_export,
+                    "end_line": symbol.end_line}
+        if symbol.export_names:
+            metadata["export_names"] = list(symbol.export_names)
+        if symbol.value_holders:
+            # Same-file uses by value (`[{ loader: load }]`), read by _JavaScriptLiveness.
+            metadata["value_holders"] = list(symbol.value_holders)
+        graph.add_node(Node(node_id, "symbol", symbol.qualified, path=rel, line=symbol.line, language=language,
+                            metadata=metadata))
+        graph.add_edge(Edge(file_node, node_id, "CONTAINS", "exact", f"{rel}:{symbol.line}", origin="tree-sitter"))
         state.definitions[symbol.name].append(node_id)
-        parts = rel.split("/")
-        app_indexes = [index for index, part in enumerate(parts[:-1]) if part == "app"]
-        if (app_indexes and path.stem == "route" and symbol.exported
-                and symbol.name in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}):
-            route_parts = parts[max(app_indexes) + 1:-1]
-            route = "/" + "/".join(part for part in route_parts if not part.startswith(("(", "@")))
-            route = re.sub(r"\[\[?[^/]+?\]\]?", "{dynamic}", route)
-            endpoint = _endpoint_id(symbol.name, route)
-            state.graph.add_node(Node(endpoint, "endpoint", f"{symbol.name} {route}", path=rel, line=symbol.line,
-                                      language=language, metadata={"method": symbol.name, "route": route, "framework": "nextjs"}))
-            state.graph.add_edge(Edge(endpoint, node_id, "HANDLES_API", "exact", f"{rel}:{symbol.line}", origin="nextjs_app_router"))
+    state.js_exports[rel] = dict(facts.exports)
+    edges_before = len(graph.edges)
+    _add_next_routes(state, rel, path, facts, file_node, language)
+    _add_route_registrations(state, rel, facts, file_node, language, routed=len(graph.edges) > edges_before)
     for module, local, exported, line in facts.imports:
         target, expected_local = state.import_index.javascript(rel, module)
         if target:
             target_id = _file_id(target)
-            state.graph.add_node(Node(target_id, "file", target, path=target))
-            state.graph.add_edge(Edge(file_node, target_id, "IMPORTS", "exact", f"{rel}:{line}", origin="tree-sitter"))
+            graph.add_node(Node(target_id, "file", target, path=target))
+            graph.add_edge(Edge(file_node, target_id, "IMPORTS", "exact", f"{rel}:{line}", origin="tree-sitter"))
             if local:
                 state.imports.setdefault(rel, {})[local] = (target, exported)
         elif expected_local:
-            state.graph.issues.append(Issue("UNRESOLVED_LOCAL_IMPORT", "warning", f"Local import could not be resolved: {module}",
-                                            [file_node], f"{rel}:{line}", "Check paths, tsconfig aliases and excluded files."))
-    for owner, called, line in facts.calls:
+            if PurePosixPath(module.split("?", 1)[0]).suffix.lower() in _ASSET_SUFFIXES:
+                continue  # a stylesheet, image or font: bundler input, not a missing module
+            bare = module.split("?", 1)[0]
+            if (module.startswith(".") and PurePosixPath(bare).suffix.lower() in _UNSCANNED_COMPONENT_SUFFIXES
+                    and (path.parent / bare).is_file()):
+                continue  # `import App from "./App.vue"`: a component file this scanner does not read
+            if _into_excluded_directory(state, rel, module):
+                continue
+            graph.issues.append(Issue("UNRESOLVED_LOCAL_IMPORT", "warning", f"Local import could not be resolved: {module}",
+                                      [file_node], f"{rel}:{line}", "Check paths, tsconfig aliases and excluded files."))
+        elif local:
+            # A package binding. Recording it keeps `format()` from `date-fns` from being
+            # name-matched to an unrelated `format` defined in this repository.
+            state.imports.setdefault(rel, {})[local] = (f"external:{module}", exported)
+    for module, public, imported, _line in facts.reexports:
+        target, _ = state.import_index.javascript(rel, module)
+        if target:
+            state.js_reexports.setdefault(rel, []).append((target, public, imported))
+    for owner, called, line, relationship in facts.calls:
         if re.fullmatch(r"[\w$]+(?:\.[\w$]+)*", called) and called not in {"require", "import"}:
-            state.pending_calls.append(PendingCall(_symbol_id(rel, owner) if owner else file_node,
-                                                   called, f"{rel}:{line}", language))
-    for owner, method, url, dynamic, line in facts.requests:
-        source = _symbol_id(rel, owner) if owner else file_node
+            state.pending_calls.append(PendingCall(owner_id(owner), called, f"{rel}:{line}", language, relationship))
+    for name, base in facts.clients.items():
+        state.http_clients[(rel, name)] = base
+    # Hook and injection results are decided per call site (Request.hook_bound), not by a
+    # file-wide name: a same-named parameter in another function is not that client.
+    state.js_untraced_clients.update((rel, name) for name in facts.free_receivers)
+    state.js_requests.extend((rel, file_node, request) for request in facts.requests)
+    for line in facts.uncertain_requests:
+        graph.issues.append(Issue("DYNAMIC_HTTP_REQUEST", "info", "HTTP URL or method requires runtime values.",
+                                  [file_node], f"{rel}:{line}", "Declare the API mapping or review the request wrapper."))
+    from .postgres import add_sql, looks_like_sql
+    sql_shaped = set()
+    for owner, sql, line, dynamic, parameterized in facts.queries:
+        # A splice in a table position (`FROM ${t}` spelled `FROM $1`) is not grammar the gate
+        # accepts, so the spelling with an identifier in each hole is checked too.
+        if looks_like_sql(sql) or looks_like_sql(re.sub(r"\$\d+", "x", sql)):
+            sql_shaped.add((owner, line))
+        add_sql(graph, owner_id(owner), sql, f"{rel}:{line}", dynamic=dynamic, gated=True, parameterized=parameterized)
+    for owner, line, holes in facts.sql_interpolations:
+        # Prose handed to a `.query()` method (`dialog.query(`Delete ${name}?`)`) is not SQL,
+        # so what it splices in is neither an injection nor dynamic SQL.
+        if (owner, line) in sql_shaped:
+            _report_sql_interpolation(graph, owner_id(owner), f"{rel}:{line}", holes)
+    declared = set()
+    # `db.collection('x')` is Firestore and others too: the receiver must be a MongoDB handle.
+    lines = text.splitlines() if any(store.detail == "MongoDB driver collection() literal" for store in facts.stores) else []
+    not_mongo = {id(store) for store in facts.stores if store.detail == "MongoDB driver collection() literal"
+                 and not _mongo_collection_call(state, rel, text, store.line, store.name, lines)}
+    for store in facts.stores:
+        declared.add(id(store))
+        if id(store) in not_mongo:
+            continue
+        _add_store_edge(graph, owner_id(store.owner), store.kind, store.name, store.resolution, f"{rel}:{store.line}",
+                        detail=_store_detail(store.detail, store.operation), origin="tree-sitter")
+    for name, model in facts.models.items():
+        if id(model) in not_mongo:
+            continue
+        state.js_models[(rel, name)] = model
+        if id(model) not in declared:
+            _add_store_edge(graph, file_node, model.kind, model.name, model.resolution, f"{rel}:{model.line}",
+                            detail=_store_detail(model.detail, model.operation), origin="tree-sitter")
+    for owner, binding, operation, line, via in facts.model_refs:
+        state.js_model_refs.append((rel, owner_id(owner), binding, operation, line, via))
+    for owner, receiver, accessor, method, line in facts.member_stores:
+        state.js_member_stores.append((rel, owner_id(owner), receiver, accessor, method, line))
+
+
+def _next_router_base(state: ScanState, parts: list[str], directory: str, *, lenient: bool) -> int | None:
+    """Index of the Next.js router directory in `parts`.
+
+    The first `app`/`pages` directory sitting at a project root (the repository root, a
+    directory holding package.json or next.config.*, either optionally followed by
+    `src/`) is the router. A route SEGMENT named `app` (`app/(dash)/app/settings`) is
+    not, and neither is `components/pages/`. `lenient` keeps the first `app` directory
+    for checkouts without a package manifest, which App Router file names already
+    disambiguate; `pages/` has no such file naming, so it requires a project root."""
+    indexes = [index for index, part in enumerate(parts[:-1]) if part == directory]
+    for index in indexes:
+        prefix = parts[:index]
+        if prefix and prefix[-1] == "src":
+            prefix = prefix[:-1]
+        project = "/".join(prefix)
+        if not prefix or any(f"{project}/{marker}" in state.admitted_paths for marker in _NEXT_PROJECT_MARKERS):
+            return index
+    return indexes[0] if indexes and lenient else None
+
+
+def _next_route_variants(segments: list[str]) -> tuple[list[str], bool]:
+    """URL paths a Next.js route directory serves, and whether it ends in a catch-all.
+
+    Route groups `(x)` and parallel-route slots `@x` add no URL segment; intercepting
+    markers `(.)x` are dropped from the segment. `[[...slug]]` also serves its parent."""
+    parts: list[str] = []
+    optional = False
+    for segment in segments:
+        if segment.startswith("@") or (segment.startswith("(") and segment.endswith(")")):
+            continue
+        segment = re.sub(r"^(?:\((?:\.{1,3}|\.\.\)\(\.\.)\))+", "", segment)
+        if not segment:
+            continue
+        if segment.startswith("[[..."):
+            optional = True
+            parts.append("{dynamic}")
+        elif segment.startswith("["):
+            parts.append("{dynamic}")
+        else:
+            parts.append(segment)
+    route = "/" + "/".join(parts)
+    variants = [route]
+    if optional:
+        variants.append("/" + "/".join(parts[:-1]))
+    catch_all = bool(segments) and segments[-1].startswith(("[...", "[[..."))
+    return variants, catch_all
+
+
+def _add_next_routes(state: ScanState, rel: str, path: Path, facts, file_node: str, language: str) -> None:
+    graph = state.graph
+    parts = rel.split("/")
+
+    def handler_target(local: str) -> str:
+        symbol = _symbol_id(rel, local)
+        return symbol if symbol in graph.nodes else file_node
+
+    def add_endpoint(method: str, route: str, target: str, origin: str, catch_all: bool) -> None:
+        endpoint = _endpoint_id(method, route)
+        graph.add_node(Node(endpoint, "endpoint", f"{method} {normalise_route(route)}", path=rel,
+                            line=graph.nodes[target].line, language=language,
+                            metadata={"method": method, "route": normalise_route(route), "framework": "nextjs",
+                                      "catch_all": catch_all}))
+        graph.add_edge(Edge(endpoint, target, "HANDLES_API", "exact", f"{rel}:{graph.nodes[target].line or 1}",
+                            origin=origin))
+
+    def add_page(route: str, origin: str) -> None:
+        page_id = stable_id("page", route)
+        graph.add_node(Node(page_id, "page", route, path=rel, metadata={"route": route, "framework": "nextjs"}))
+        graph.add_edge(Edge(page_id, file_node, "IMPLEMENTED_BY", "exact", origin, origin="framework_path"))
+        # The default export IS the page component. Reaching it only through the file's
+        # CONTAINS edge made every page one expensive hop further from its data.
+        component = _symbol_id(rel, facts.exports.get("default", ""))
+        if component in graph.nodes:
+            graph.add_edge(Edge(page_id, component, "IMPLEMENTED_BY", "exact", origin, origin="framework_path"))
+
+    if path.stem in {"route", "page"}:
+        base = _next_router_base(state, parts, "app", lenient=True)
+        if base is None:
+            return
+        variants, catch_all = _next_route_variants(parts[base + 1:-1])
+        if path.stem == "page":
+            for route in variants:
+                add_page(route, "next_app_router_path")
+            return
+        for public, local in sorted(facts.exports.items()):
+            if public in _HTTP_HANDLER_NAMES:
+                for route in variants:
+                    add_endpoint(public, route, handler_target(local), "nextjs_app_router", catch_all)
+        return
+    base = _next_router_base(state, parts, "pages", lenient=False)
+    if base is None or "default" not in facts.exports:
+        return
+    segments = [*parts[base + 1:-1], path.stem]
+    if any(segment.startswith("_") for segment in segments):
+        return  # _app, _document, _error, _middleware: framework shells, not routes
+    if segments[-1] == "index":
+        segments = segments[:-1]
+    variants, catch_all = _next_route_variants(segments)
+    if segments and segments[0] == "api":
+        # A Pages Router API route is one default-export handler for every method.
+        for route in variants:
+            add_endpoint("ANY", route, handler_target(facts.exports["default"]), "nextjs_pages_router", catch_all)
+    else:
+        for route in variants:
+            add_page(route, "next_pages_router_path")
+
+
+#: The `style` of a `ScanState.js_requests` entry that records a server route this scanner does not model.
+_UNMODELLED_ROUTE = "unmodelled_route"
+#: Imports that make a `routes/` module's `loader`/`action` a server route.
+_SERVER_ROUTE_MODULE = re.compile(r"@remix-run/|@react-router/|react-router$|\./\+types/")
+
+
+def _add_route_registrations(state: ScanState, rel: str, facts, file_node: str, language: str, *, routed: bool) -> None:
+    """Endpoints for the server routes a JS/TS file registers in a shape that is modelled, and
+    a record of every other route it registers, which `_detect_endpoint_gaps` reads.
+
+    Only `app.<verb>("/literal", handler)` on a server this file creates and starts
+    listening is modelled (probable). A router, plugin or sub-app is mounted under a prefix
+    decided elsewhere, and NestJS controllers, SvelteKit `+server`, Remix resource routes and
+    Nuxt server handlers are not modelled, so a call with no handler may be served by them.
+    Test code (`core.files.is_test_path`) registers mock servers, not the application's
+    routes, so it records neither."""
+    graph = state.graph
+    if is_test_path(rel):
+        return
+
+    def unmodelled(description: str, line: int, method: str = "ANY") -> None:
+        state.js_requests.append((rel, file_node, javascript.Request("", method, "", False, line, description,
+                                                                      style=_UNMODELLED_ROUTE)))
+
+    for method, route, line, shape, receiver in facts.route_registrations:
+        if shape != "server":
+            verb = "all" if method == "ANY" else method.lower()
+            what = "a NestJS controller route" if shape == "controller" else f"`{receiver}.{verb}()` on a router"
+            unmodelled(what, line, method)
+            continue
+        route = normalise_route(re.sub(r":([A-Za-z_]\w*)", r"{\1}", route))
+        endpoint = _endpoint_id(method, route)
+        graph.add_node(Node(endpoint, "endpoint", f"{method} {route}", path=rel, line=line, language=language,
+                            metadata={"method": method, "route": route, "framework": "javascript-server"}))
+        graph.add_edge(Edge(endpoint, file_node, "HANDLES_API", "probable", f"{rel}:{line}", origin="tree-sitter",
+                            detail=f"`{receiver}.{method.lower()}()` on a server this file starts; middleware unverified"))
+    if routed:
+        return
+    # File-based handlers of other frameworks: SvelteKit `+server`, Expo `*+api`, Astro
+    # `pages/**` and Remix/React Router `routes/**` exporting verbs, `loader` or `action`, and
+    # Nuxt/Nitro `server/api/**` and `server/routes/**` default exports.
+    directories = rel.split("/")[:-1]
+    stem = PurePosixPath(rel).name.split(".")[0]
+    verbs = sorted(set(facts.exports) & _HTTP_HANDLER_NAMES)
+    if verbs and (stem.startswith("+") or stem.endswith("+api") or stem == "route" or {"pages", "routes"} & set(directories)):
+        unmodelled(f"file-based `{'`/`'.join(verbs)}` handlers", 1)
+    elif ({"loader", "action"} & set(facts.exports) and "routes" in directories
+          and any(_SERVER_ROUTE_MODULE.match(module) for module, _local, _exported, _line in facts.imports)):
+        # A client-side data router (a Vite SPA) exports `loader` too; only Remix and React
+        # Router framework modules (or their generated `./+types/` route types) run it on a server.
+        unmodelled("a route module's `loader`/`action`", 1)
+    elif "default" in facts.exports and "server" in directories and {"api", "routes"} & set(
+            directories[directories.index("server") + 1:]):
+        unmodelled("a server route file", 1)
+
+
+def _js_export_origin(state: ScanState, path: str, public: str, depth: int = 0) -> tuple[str, str] | None:
+    """(file, local binding) that `public` exported from `path` denotes, through barrels."""
+    if depth > 6:
+        return None
+    exports = state.js_exports.get(path, {})
+    if public in exports:
+        return path, exports[public]
+    for target, name, imported in state.js_reexports.get(path, []):
+        if name == public and imported != "*":
+            return _js_export_origin(state, target, imported, depth + 1) or (target, imported)
+        if name == "*" and public != "default" and (found := _js_export_origin(state, target, public, depth + 1)):
+            return found
+    return None
+
+
+def _client_base(state: ScanState, rel: str, receiver: str) -> str | None:
+    """Literal base URL of an HTTP client binding; None when the receiver is not a client."""
+    if (rel, receiver) in state.http_clients:
+        return state.http_clients[(rel, receiver)]
+    binding = state.imports.get(rel, {}).get(receiver)
+    if not binding or binding[0].startswith("external:") or binding[1] == "":
+        return None
+    if binding[1] == "*":
+        # `const api = require("./client")` of a module that assigns `module.exports = axios.create(...)`.
+        return state.http_clients.get((binding[0], "default"))
+    origin = _js_export_origin(state, *binding)
+    return state.http_clients.get(origin) if origin else None
+
+
+def _resolve_js_requests(state: ScanState) -> None:
+    graph = state.graph
+    # A client handed over at run time (`const { api } = useAuth()`, or a name listed in
+    # [impact] client_receivers) cannot be traced to its declaration. Its base URL is
+    # [impact] client_api_base when set; otherwise, when the repository declares exactly one
+    # client base URL, that one is assumed; otherwise it is unknown. A literal absolute base
+    # (`https://api.example.com`) is another service's client, never this repository's API.
+    bases = sorted({base for base in state.http_clients.values()
+                    if base and (base.startswith("//configured") or not _URL_SCHEME.match(base))})
+    if state.config.client_api_base:
+        untraced_base, untraced_source = state.config.client_api_base, "[impact] client_api_base"
+        if _URL_SCHEME.match(untraced_base) and not untraced_base.startswith("//configured"):
+            # Configured explicitly, so an absolute value still names this repository's API.
+            untraced_base = "//configured/" + untraced_base.split("//", 1)[1].partition("/")[2]
+    elif len(bases) == 1:
+        untraced_base = bases[0]
+        untraced_source = f"the repository's only client base URL ({untraced_base.replace('//configured', '<configured origin>')})"
+    else:
+        untraced_base, untraced_source = "", ""
+    for rel, file_node, request in state.js_requests:
+        if request.style == _UNMODELLED_ROUTE:
+            continue  # a server route registration, read by _detect_endpoint_gaps
+        source = _symbol_id(rel, request.owner) if request.owner else file_node
+        source = source if source in graph.nodes else file_node
+        url, resolution = request.url, "exact"
+        details = [f"HTTP request syntax ({request.style}); runtime dispatch unverified"]
+        configured = request.configured_origin
+        if request.receiver:
+            base = _client_base(state, rel, request.receiver)
+            if base is None:
+                if request.receiver in {"axios", "ky"}:
+                    base = ""
+                elif (request.hook_bound or (rel, request.receiver) in state.js_untraced_clients
+                      or request.receiver in state.config.client_receivers):
+                    if not (request.url.startswith("/") or request.configured_origin):
+                        continue  # `params.get("q")` on a hook result is not a request
+                    base, resolution = untraced_base, "probable"
+                    details.append(f"client `{request.receiver}` was not traced to a declaration; "
+                                   + (f"base URL from {untraced_source}" if untraced_base else "its base URL is unknown"))
+                else:
+                    continue  # `router.get("/x", handler)` and other non-client receivers
+            if base and not _URL_SCHEME.match(url):
+                if base.startswith("//configured"):
+                    # The marker javascript._factory_base writes for a base behind a configured origin.
+                    base, configured = base[len("//configured"):], True
+                # A literal absolute base stays absolute, so the request is an external reference.
+                url = base.rstrip("/") + "/" + url.lstrip("/")
+                details.append(f"base URL from client `{request.receiver}`")
+        if configured:
+            resolution = "probable"
+            details.append("URL starts with a configured origin; assumed to be this repository's API")
+            url = url if url.startswith("/") else "/" + url
         if not url.startswith("/") or url.startswith("//"):
             # A fully qualified URL belongs to a different service unless configured
             # explicitly. It must not alias a same-path handler in this repository.
-            state.graph.issues.append(Issue("EXTERNAL_API_REFERENCE", "info", "HTTP target is external or relative to runtime configuration.",
-                                            [source], f"{rel}:{line}", "Review service origin and base-path configuration."))
+            graph.issues.append(Issue("EXTERNAL_API_REFERENCE", "info", "HTTP target is external or relative to runtime configuration.",
+                                      [source], f"{rel}:{request.line}", "Review service origin and base-path configuration."))
             continue
-        route = normalise_route(url.split("?", 1)[0].split("#", 1)[0])
-        endpoint = _endpoint_id(method, route)
-        state.graph.add_node(Node(endpoint, "endpoint", f"{method} {route}", path=rel, line=line,
-                                  metadata={"method": method, "route": route, "dynamic": dynamic}))
-        state.graph.add_edge(Edge(source, endpoint, "CALLS_API", "probable" if dynamic or method == "UNKNOWN" else "exact",
-                                  f"{rel}:{line}", origin="tree-sitter", detail="HTTP request syntax; runtime dispatch unverified"))
-    for line in facts.uncertain_requests:
-        state.graph.issues.append(Issue("DYNAMIC_HTTP_REQUEST", "info", "HTTP URL or method requires runtime values.",
-                                        [file_node], f"{rel}:{line}", "Declare the API mapping or review the request wrapper."))
-    from .postgres import add_sql
-    for owner, sql, line, dynamic in facts.queries:
-        add_sql(state.graph, _symbol_id(rel, owner) if owner else file_node, sql, f"{rel}:{line}", dynamic=dynamic)
+        if request.dynamic or request.method == "UNKNOWN":
+            resolution = "probable"
+        path = url.split("?", 1)[0].split("#", 1)[0]
+        # `/export.${fmt}`, `/v2${path}`, `/items${query}`: a runtime value joined to the last
+        # segment may be a file extension, further segments or a query string. The call is
+        # kept as an open-ended prefix and matched against the handlers that extend it.
+        open_tail = bool(re.search(r"[^/]\{dynamic\}$", path))
+        if open_tail:
+            path, resolution = path[:-len("{dynamic}")], "probable"
+            details.append("the URL ends in a runtime value joined to its last segment; matched by route prefix")
+        route = normalise_route(path)
+        endpoint = _endpoint_id(request.method, route + "*" if open_tail else route)
+        # No path or line: an endpoint node belongs to its handler, and the call site is
+        # already the edge's evidence. The first caller must not become its location.
+        graph.add_node(Node(endpoint, "endpoint", f"{request.method} {route}{'*' if open_tail else ''}",
+                            metadata={"method": request.method, "route": route, "dynamic": request.dynamic,
+                                      **({"open_tail": True} if open_tail else {})}))
+        if configured:
+            graph.nodes[endpoint].metadata["open_head"] = True
+        graph.add_edge(Edge(source, endpoint, "CALLS_API", resolution, f"{rel}:{request.line}",
+                            origin="tree-sitter", detail="; ".join(details)))
+
+
+_PRISMA_PROVIDER = re.compile(r'datasource\s+\w+\s*\{[^}]*?\bprovider\s*=\s*"([\w-]+)"', re.S)
+_PRISMA_MODEL = re.compile(r"^[ \t]*(model|view)\s+(\w+)\s*\{(.*?)^[ \t]*\}", re.S | re.M)
+
+
+def _scan_prisma_schemas(state: ScanState) -> dict[tuple[str, str], tuple[str, str]]:
+    """(package root, client accessor `user`) -> (store kind, table). Declarations get edges.
+
+    The schema files are the ones the column check uses (`columns.prisma_schema_sets`:
+    the configured or conventional schema of each package, never a test fixture), so a
+    stray copy cannot remap an accessor. Comments are ignored, and `public` is the
+    default schema, not part of the table name. An accessor that the used files map to
+    different tables is dropped rather than guessed."""
+    from .columns import POSTGRES_PRISMA_PROVIDERS, PackageRoots, prisma_schema_sets, strip_prisma_comments
+    models: dict[tuple[str, str], tuple[str, str]] = {}
+    if not state.prisma_schemas:
+        return models
+    sets = prisma_schema_sets(state, PackageRoots(state))
+    texts = {rel: strip_prisma_comments(text) for rel, text in state.prisma_schemas}
+    ambiguous: set[tuple[str, str]] = set()
+    unsupported: set[str] = set()
+    for root, (files, _) in sets.items():
+        if not files:
+            continue
+        # Each package declares its own datasource: a monorepo may hold a PostgreSQL
+        # service beside a MongoDB one, and neither decides the other's models.
+        providers = {m.group(1) for rel in files for m in _PRISMA_PROVIDER.finditer(texts[rel])}
+        kind = ("postgres_table" if providers and providers <= POSTGRES_PRISMA_PROVIDERS
+                else "mongo_collection" if providers == {"mongodb"} else None)
+        if kind is None:
+            state.graph.issues.append(Issue(
+                "PRISMA_PROVIDER_UNSUPPORTED", "info",
+                f"Prisma datasource provider {', '.join(sorted(providers)) or 'not declared'}; only PostgreSQL and MongoDB models are mapped.",
+                [_file_id(files[0])], files[0],
+                "Declare the datasource provider in a schema file inside the scanned tree.",
+            ))
+            unsupported.add(root)
+            continue
+        for rel in files:
+            text = texts[rel]
+            for match in _PRISMA_MODEL.finditer(text):
+                block, name, body = match.groups()
+                mapped = re.search(r'@@map\(\s*(?:name\s*:\s*)?"([^"]+)"', body)
+                schema = re.search(r'@@schema\(\s*"([^"]+)"', body)
+                table = mapped.group(1) if mapped else name
+                if schema and schema.group(1) != "public" and kind == "postgres_table":
+                    table = f"{schema.group(1)}.{table}"
+                key = (root, name[0].lower() + name[1:])
+                if models.setdefault(key, (kind, table)) != (kind, table):
+                    ambiguous.add(key)
+                _add_store_edge(state.graph, _file_id(rel), kind, table, "exact",
+                                f"{rel}:{text.count(chr(10), 0, match.start()) + 1}",
+                                detail=f"Prisma {block} {name} (declares)", origin="prisma_schema")
+    for key in ambiguous:
+        models.pop(key, None)
+    for root in unsupported:
+        # A package with its own (MySQL, SQLite…) schema maps nothing, and its accessors must
+        # not fall back to a table other packages declare: `_prisma_accessor` sees the package.
+        models[(root, "")] = ("", "")
+    return models
+
+
+def _prisma_accessor(prisma: dict[tuple[str, str], tuple[str, str]], root: str, accessor: str) -> tuple[str, str] | None:
+    """The model a client accessor names from a file in package `root`: that package's own
+    schema when it has one, else the one table every package's schema agrees on."""
+    if (root, accessor) in prisma:
+        return prisma[(root, accessor)] if accessor else None
+    if any(package == root for package, _ in prisma):
+        return None
+    found = {model for (_, name), model in prisma.items() if name == accessor}
+    return found.pop() if len(found) == 1 else None
+
+
+_MONGO_PACKAGES = frozenset({"mongodb", "mongoose"})
+_MONGO_IMPORT = re.compile(r"""(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(\s*)["'](?:mongodb|mongoose)(?:/[^"']*)?["']""")
+# mongosh/legacy shell scripts use a global `db`; these calls exist only there.
+_MONGO_SHELL = re.compile(r"\b(?:db\s*\.\s*(?:getSiblingDB|createCollection|createUser|getCollection|getName|dropDatabase)"
+                          r"|printjson|ISODate|NumberLong|NumberDecimal)\s*\(")
+
+
+# What a MongoDB database (or, for `.collection()`, a Mongoose connection) is assigned from.
+_MONGO_DB_INIT = re.compile(r"\.\s*(?:db|getSiblingDB)\s*\(|\bconnection\s*\.\s*db\b")
+_MONGO_CONNECTION_INIT = re.compile(r"\bmongoose\s*\.\s*connection\b(?!\s*\.)|\.\s*(?:createConnection|useDb)\s*\(")
+_MONGO_MODIFIERS = r"(?:(?:private|public|protected|readonly|static|declare|override)\s+)*"
+_MONGO_NOT_PARAMETER_LISTS = frozenset({"if", "while", "for", "switch", "catch", "return", "typeof", "await", "with"})
+# A JS string or template literal (kept) or a comment (`c`, blanked before reading bindings).
+_JS_COMMENT_OR_STRING = re.compile(r"""'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`|(?P<c>//[^\n]*|/\*.*?\*/)""", re.S)
+# A type annotation, bounded: an unbounded lazy `[^=;\n]+?` rescanned the rest of the line
+# at every occurrence of the name (`{ db: 1, db: 2, … }` on one line).
+_MONGO_TYPE = r"[^=;\n]{1,120}?"
+# What follows a parameter list: an optional return type, then `=>` or a body.
+_MONGO_AFTER_PARAMETERS = re.compile(r"\s*(?::\s*[^{;=\n]{1,120}?)?\s*(?:=>|\{)")
+
+
+def _mongo_type(text: str, annotation: str, *, collection: bool) -> bool:
+    """Is a type annotation `Db` (or `Connection` for `.collection()`) imported from the driver?"""
+    names = ("Db", "Connection") if collection else ("Db",)
+    match = re.fullmatch(r"\s*(?:(mongodb|mongoose)\s*\.\s*)?([\w$]+)\s*", annotation or "")
+    if not match or match.group(2) not in names:
+        return False
+    return bool(match.group(1)) or bool(re.search(
+        rf"""\bimport\s+(?:type\s+)?\{{[^}}]*\b{match.group(2)}\b[^}}]*\}}\s*from\s*["'](?:mongodb|mongoose)["']"""
+        rf"""|\{{[^}}]*\b{match.group(2)}\b[^}}]*\}}\s*=\s*require\s*\(\s*["'](?:mongodb|mongoose)["']""", text))
+
+
+def _mongo_bindings(text: str, name: str, *, member: bool, collection: bool) -> set[str]:
+    """How `name` is bound in `text`: "handle" (from `<client>.db(…)`, typed `Db`), "value"
+    (anything else it is initialised or imported as), "parameter" (an untyped or other-typed
+    parameter). `member`: the receiver is `this.name`, so only fields and `this.name =` count."""
+    kinds: set[str] = set()
+    n = re.escape(name)
+    inits = (_MONGO_DB_INIT, _MONGO_CONNECTION_INIT) if collection else (_MONGO_DB_INIT,)
+    # `// db = null when disconnected` is not a binding.
+    text = _JS_COMMENT_OR_STRING.sub(lambda m: m.group(0) if m.group("c") is None else re.sub(r"[^\n]", " ", m.group(0)), text)
+
+    def initialised(init: str) -> str | None:
+        if re.fullmatch(r"\s*(?:null|undefined|void\s+0)\s*[;,)}]*\s*", init):
+            return None  # `db = null` in `close()` clears a handle; it does not rebind it
+        return "handle" if any(p.search(init) for p in inits) else "value"
+
+    if member:
+        assignments = [rf"\bthis\s*\.\s*{n}\s*=(?![=>])(?P<init>[^;\n]*)",
+                       rf"^[ \t]*{_MONGO_MODIFIERS}{n}\s*[?!]?\s*(?::\s*(?P<type>{_MONGO_TYPE}))?\s*(?:=(?![=>])(?P<init>[^;\n]*)|;|$)"]
+        parameters = [rf"[(,]\s*(?:@\w+\([^()]*\)\s*)*(?:private|public|protected|readonly)\s+(?:readonly\s+)?{n}\s*\??"
+                      rf"\s*(?::\s*(?P<type>[\w$.]+))?"]
+    else:
+        assignments = [rf"(?:^|[^\w$.])(?:(?:const|let|var)\s+)?{n}\s*(?::\s*(?P<type>{_MONGO_TYPE}))?\s*(?:=(?![=>])(?P<init>[^;\n]*))",
+                       rf"\b(?:const|let|var)\s+{n}\s*(?::\s*(?P<type>{_MONGO_TYPE}))?\s*(?:;|$)"]
+        parameters = [rf"(?<![\w$.]){n}\s*=>"]
+        if re.search(rf"\b(?:function|class)\s+{n}\b|\bimport\b[^;\n]*?(?<![\w$.]){n}\b[^;\n]*?\bfrom\b"
+                     rf"|\bimport\s+{n}\s*=|\{{[^{{}}]{{0,400}}?(?<![\w$.]){n}\b[^{{}}]{{0,400}}\}}\s*=", text, re.M):
+            kinds.add("value")
+        # `(a, db: Db) => …`, `function f(db) {`: each innermost parenthesised list is read
+        # once. A pattern spanning list and name backtracked over every occurrence of the
+        # name, which made an argument object with many `db:` keys quadratic.
+        name_in_list = re.compile(rf"(?<![\w$.]){n}\s*\??\s*(?::\s*(?P<type>[\w$.]+))?")
+        for group in re.finditer(r"\(([^()]*)\)", text):
+            if name not in group.group(1) or not _MONGO_AFTER_PARAMETERS.match(text, group.end()):
+                continue
+            head = re.search(r"([\w$]*)\s*$", text[max(0, group.start() - 64):group.start()])
+            if head and head.group(1) in _MONGO_NOT_PARAMETER_LISTS:
+                continue
+            for match in name_in_list.finditer(group.group(1)):
+                kinds.add("handle" if match.group("type") and _mongo_type(text, match.group("type"), collection=collection)
+                          else "parameter")
+    for pattern in assignments:
+        for match in re.finditer(pattern, text, re.M):
+            if match.groupdict().get("type") and _mongo_type(text, match.group("type"), collection=collection):
+                kinds.add("handle")
+            elif match.groupdict().get("init") is not None and (kind := initialised(match.group("init"))):
+                kinds.add(kind)
+    for pattern in parameters:
+        for match in re.finditer(pattern, text, re.M):
+            if match.groupdict().get("head") in _MONGO_NOT_PARAMETER_LISTS:
+                continue
+            kinds.add("handle" if match.groupdict().get("type") and _mongo_type(text, match.group("type"), collection=collection)
+                      else "parameter")
+    return kinds
+
+
+def _mongo_handle(state: ScanState, rel: str, receiver: str, texts: dict[str, str], *,
+                  collection: bool = False, depth: int = 0) -> bool:
+    """`_mongo_handle_uncached`, once per (file, receiver): every call site on one receiver
+    has the same answer, and each answer reads the whole file."""
+    key = (rel, receiver, collection, depth)
+    if key not in state.mongo_handles:
+        state.mongo_handles[key] = _mongo_handle_uncached(state, rel, receiver, texts, collection=collection, depth=depth)
+    return state.mongo_handles[key]
+
+
+def _mongo_handle_uncached(state: ScanState, rel: str, receiver: str, texts: dict[str, str], *,
+                           collection: bool = False, depth: int = 0) -> bool:
+    """Is `receiver` (`db`, `this.db`) a MongoDB database handle in `rel`?
+
+    `db.users.find(u => …)` is as often an in-memory array, a Sequelize model registry
+    (`db.User.findOne`), a Prisma client (`this.db.user.aggregate`) or Firestore
+    (`admin.firestore().collection('x')`). A file importing the driver does not decide it:
+    when the receiver is bound in the file, that binding does. It is a handle only when
+    assigned from `<client>.db(…)` or `mongoose.connection.db`, typed as the driver's `Db`,
+    or imported from a module that exports such a handle. An unbound (global) receiver
+    counts in a file that imports `mongodb`/`mongoose`, or in a mongo shell script.
+    `collection`: the call is `<receiver>.collection('x')`, which a Mongoose connection
+    also has (`mongoose.connection`, `createConnection(…)`, `useDb(…)`, typed `Connection`)."""
+    if rel not in texts:
+        try:
+            texts[rel] = read_source(state.root, state.root / rel, state.config.max_file_bytes).text or ""
+        except OSError:
+            texts[rel] = ""
+    text = texts[rel]
+    parts = [part.strip() for part in receiver.split(".")]
+    imports = state.imports.get(rel, {})
+
+    def driver_package(module: str) -> bool:
+        return module.startswith("external:") and module[len("external:"):].split("/", 1)[0] in _MONGO_PACKAGES
+
+    driver = any(driver_package(module) for module, _ in imports.values()) or bool(_MONGO_IMPORT.search(text))
+    if parts[0] != "this" and parts[0] in imports and driver_package(imports[parts[0]][0]) and len(parts) > 1:
+        return True  # `mongoose.connection.db`, `mongoose.connection.collection('x')`
+    if len(parts) == 1 or (len(parts) == 2 and parts[0] == "this"):
+        name, member = parts[-1], parts[0] == "this"
+        if not member and name in imports:
+            module, exported = imports[name]
+            if driver_package(module) or module.startswith("external:"):
+                return False  # a package binding: not a database handle
+            return (depth < 2 and exported not in ("", "*", "default")
+                    and _mongo_handle(state, module, exported, texts, collection=collection, depth=depth + 1))
+        kinds = _mongo_bindings(text, name, member=member, collection=collection)
+    else:
+        # `ctx.db`, `req.app.locals.db`: only an assignment to the whole path is a binding.
+        written = r"\s*\.\s*".join(re.escape(part) for part in parts)
+        inits = (_MONGO_DB_INIT, _MONGO_CONNECTION_INIT) if collection else (_MONGO_DB_INIT,)
+        kinds = {"handle" if any(p.search(m.group("init")) for p in inits) else "value"
+                 for m in re.finditer(rf"(?:^|[^\w$.]){written}\s*=(?![=>])(?P<init>[^;\n]*)", text, re.M)}
+    if "value" in kinds:
+        return False
+    if "handle" in kinds:
+        return True
+    if kinds:
+        return False  # a parameter: whatever the caller passes
+    return driver or (receiver == "db" and bool(_MONGO_SHELL.search(text))
+                      and not re.search(r"\bimport\b|\brequire\s*\(", text))
+
+
+def _mongo_collection_call(state: ScanState, rel: str, text: str, line: int, name: str,
+                           lines: list[str] | None = None) -> bool:
+    """Is the `.collection('name')` call on `line` made on a MongoDB handle? The syntax fact
+    does not keep its receiver, so it is read back from the source lines ending there.
+    `lines`: `text.splitlines()`, split once by a caller checking many calls."""
+    lines = text.splitlines() if lines is None else lines
+    window = "\n".join(lines[max(0, line - 4):line])
+    offset = len("\n".join(lines[max(0, line - 4):line - 1]))
+    calls = [m for m in re.finditer(rf"\.\s*collection\s*\(\s*(['\"`]){re.escape(name)}\1", window) if m.start() >= offset]
+    if not calls:
+        return False
+    for call in calls:
+        before = window[:call.start()]
+        if re.search(r"\.\s*db\s*\((?:[^()]|\([^()]*\))*\)\s*$", before):
+            return True  # `client.db('shop').collection('orders')`, `client.db(cfg.name()).collection(…)`
+        receiver = re.search(r"((?:this\s*\.\s*)?[\w$]+(?:\s*\.\s*[\w$]+)*)\s*$", before)
+        if receiver and _mongo_handle(state, rel, re.sub(r"\s+", "", receiver.group(1)), {rel: text}, collection=True):
+            return True  # one call on a handle is enough: `db.collection('x'); other.collection('x')`
+    return False
+
+
+def _resolve_js_stores(state: ScanState) -> None:
+    graph = state.graph
+    prisma = _scan_prisma_schemas(state)
+    for rel, source, binding, operation, line, via in state.js_model_refs:
+        model = state.js_models.get((rel, binding))
+        if model is None:
+            bound = state.imports.get(rel, {}).get(binding)
+            if bound and not bound[0].startswith("external:") and bound[1] not in ("", "*"):
+                origin = _js_export_origin(state, *bound)
+                model = state.js_models.get(origin) if origin else None
+        if model is None:
+            continue
+        _add_store_edge(graph, source, model.kind, model.name, "high" if model.resolution == "exact" else "probable",
+                        f"{rel}:{line}", detail=_store_detail(f"{model.detail}; {via}()", operation), origin="tree-sitter")
+    drizzle: dict[str, list] = defaultdict(list)
+    for (_, name), model in state.js_models.items():
+        if model.detail.startswith("Drizzle"):
+            drizzle[name].append(model)
+    from .columns import PackageRoots
+    roots = PackageRoots(state)
+    texts: dict[str, str] = {}
+    for rel, source, receiver, accessor, method, line in state.js_member_stores:
+        tail = receiver.rsplit(".", 1)[-1]
+        evidence = f"{rel}:{line}"
+        model = _prisma_accessor(prisma, roots.of(rel), accessor) if prisma else None
+        if model is not None and (method in javascript.PRISMA_READS or method in javascript.PRISMA_WRITES):
+            kind, table = model
+            operation = "reads" if method in javascript.PRISMA_READS else "writes"
+            _add_store_edge(graph, source, kind, table, "high", evidence, origin="tree-sitter",
+                            detail=f"Prisma client {receiver}.{accessor}.{method}() ({operation})")
+        elif tail == "query" and len(drizzle.get(accessor, ())) == 1 and method in javascript.PRISMA_READS:
+            model = drizzle[accessor][0]
+            _add_store_edge(graph, source, model.kind, model.name, "probable", evidence, origin="tree-sitter",
+                            detail=f"Drizzle relational query {receiver}.{accessor}.{method}() (reads)")
+        elif (tail == state.config.mongo_receiver and (operation := mongo_operation(method))
+              and accessor not in MONGO_NOT_COLLECTIONS and _mongo_handle(state, rel, receiver, texts)):
+            _add_store_edge(graph, source, "mongo_collection", accessor, "probable", evidence, origin="tree-sitter",
+                            detail=f"MongoDB driver call {receiver}.{accessor}.{method}() ({operation})")
+
+
+def _route_segments(route: str) -> list[str]:
+    return [segment for segment in route.split("/") if segment]
+
+
+#: File stems a bundler, framework or runtime loads without an import from another module:
+#: Next.js route, special and metadata files (`sitemap`, `opengraph-image`, `global-error`,
+#: parallel-route `default`), Remix `root` and `entry.client`/`entry.server`, SvelteKit
+#: `+page`/`+layout`/`+server`/`+error` (also `+page.server`) and `hooks.server`/`hooks.client`.
+_ENTRY_STEMS = frozenset({"main", "index", "app", "_app", "_document", "server", "client", "entry", "middleware",
+                          "instrumentation", "layout", "page", "route", "template", "loading", "error", "not-found",
+                          "global-error", "default", "sitemap", "robots", "manifest", "opengraph-image",
+                          "twitter-image", "icon", "apple-icon", "root", "+page", "+layout", "+server", "+error",
+                          "hooks"})
+#: Directories whose every module a framework loads by file name: Remix `app/routes/**`.
+_ENTRY_DIRECTORIES = ("app/routes/",)
+#: Component files the JS/TS extractor never reads. Their imports are invisible, so a
+#: repository holding any of them gets no dead-code judgements at all.
+_UNSCANNED_COMPONENT_SUFFIXES = frozenset({".vue", ".svelte", ".astro", ".mdx"})
+
+
+_JS_SOURCE_SUFFIXES = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts")
+
+
+class _JavaScriptLiveness:
+    """Which JS/TS code the app can load: modules reached by import from entry files
+    (routed pages and handlers, layouts, `main`/`index`...), and exported functions a
+    live module imports or something calls. With no entry file, nothing is judged dead."""
+
+    def __init__(self, state: ScanState):
+        graph = state.graph
+        imports: dict[str, set[str]] = defaultdict(set)
+        entries = set()
+        callers: list[tuple[str, str]] = []
+        for edge in graph.edges:
+            source, target = graph.nodes.get(edge.source), graph.nodes.get(edge.target)
+            if source is None or target is None:
+                continue
+            if edge.kind == "IMPORTS" and source.path and target.path:
+                imports[source.path].add(target.path)
+            elif edge.kind in {"IMPLEMENTED_BY", "HANDLES_API"} and target.path:
+                entries.add(target.path)
+            if edge.kind in {"CALLS", "RENDERS", "IMPLEMENTED_BY", "HANDLES_API"} and edge.source != edge.target:
+                callers.append((source.path or "", edge.target))
+        for rel, reexports in state.js_reexports.items():
+            imports[rel].update(target for target, _, _ in reexports)
+        entries |= {n.path for n in graph.nodes.values() if n.kind == "file" and n.path
+                    and n.path.endswith(_JS_SOURCE_SUFFIXES)
+                    and (PurePosixPath(n.path).name.split(".")[0].lower() in _ENTRY_STEMS
+                         or any(directory in "/" + n.path for directory in ("/" + d for d in _ENTRY_DIRECTORIES)))}
+        # A .vue/.svelte/.astro/.mdx file can import any module, and those imports are not read.
+        self.known = bool(entries) and not self._has_unscanned_components(state)
+        self.exports = state.js_exports
+        self.entries = frozenset(entries)
+        self.live, stack = set(entries), list(entries)
+        while stack:
+            for target in imports[stack.pop()] - self.live:
+                self.live.add(target)
+                stack.append(target)
+        # Only a caller the app can load keeps a function alive; a dead module's call does not.
+        self.incoming = {target for path, target in callers if not path or path in self.live}
+        # Names live modules take from each module; "*" (namespace, default, `export *`) is anything.
+        self.used: dict[str, set[str]] = defaultdict(set)
+        for importer in self.live:
+            for target, exported in state.imports.get(importer, {}).values():
+                self.used[target].add("*" if exported in {"*", "", "default"} else exported)
+            for target, _public, imported in state.js_reexports.get(importer, []):
+                self.used[target].add(imported)
+        self.graph = graph
+
+    def dead_reason(self, node: Node) -> str:
+        """Why `node` cannot run, or "" when it may."""
+        path = node.path or ""
+        if not self.known or not path.endswith(_JS_SOURCE_SUFFIXES):
+            return ""
+        if path not in self.live:
+            return f"{path} is not imported from any page, route or entry file"
+        qualified = str(node.metadata.get("qualified_name") or "") if node.kind == "symbol" else ""
+        if not qualified or path in self.entries:
+            return ""  # an entry file's exports are loaded by the framework or runtime, not imported
+        top = self.graph.nodes.get(_symbol_id(path, qualified.split(".")[0]), node)
+        used = self.used.get(path, set())
+        # An unexported function may be a callback or event handler; that is not judged.
+        if top.id in self.incoming or not top.metadata.get("exported") or "*" in used:
+            return ""
+        names = {top.label.split(".")[0], *top.metadata.get("export_names", [])}
+        if names & used:
+            return ""
+        # Used by value in its own file (`export const routes = [{ loader: load }]`): alive when
+        # the use sits in a function body or module statement (""), or in a variable that is
+        # not exported or whose export a live module imports.
+        exports = self.exports.get(path, {})
+        for holder in top.metadata.get("value_holders", []):
+            public = {name for name, local in exports.items() if local == holder}
+            if not holder or not public or public & used:
+                return ""
+        return f"`{top.label}` in {path} is exported but never imported or called"
+
+    @staticmethod
+    def _has_unscanned_components(state: ScanState) -> bool:
+        import dataclasses
+        config = dataclasses.replace(state.config, extensions=set(_UNSCANNED_COMPONENT_SUFFIXES))
+        # Gitignored component files count too: being conservative only withholds a judgement.
+        return next(iter_source_files(state.root, config, frozenset()), None) is not None
+
+
+def _serves(called: list[str], handler: Node, *, open_tail: bool, loose: bool, skip: int = 0) -> bool:
+    """Whether `handler`'s route can serve a call with these path segments.
+
+    A dynamic handler segment serves any literal; the reverse is a different route
+    (`/items/{id}` is not `/items/export`) unless `loose`, where a whole runtime segment in
+    the call may be any literal the handler declares. An `open_tail` call ends in a runtime
+    value joined to its last segment, so the handler may extend that segment with an
+    extension (`export.` serves `export.xlsx`) or add segments after it. `skip` drops that
+    many leading handler segments: the path a configured origin may carry."""
+    served = _route_segments(str(handler.metadata.get("route", "")))[skip:]
+
+    def same(call: str, declared: str) -> bool:
+        return call == declared or declared == "{dynamic}" or (loose and call == "{dynamic}")
+
+    if handler.metadata.get("catch_all") and served and served[-1] == "{dynamic}":
+        prefix = served[:-1]
+        if len(called) > len(prefix) or (open_tail and len(called) == len(prefix)):
+            return all(same(c, h) for c, h in zip(called, prefix, strict=False))
+        return False
+    if not open_tail:
+        return len(called) == len(served) and all(same(c, h) for c, h in zip(called, served, strict=True))
+    if not called or len(served) < len(called):
+        return False
+    *head, last = called
+    tail = served[len(called) - 1]
+    extends = tail.startswith(last) and (last.endswith(".") or tail[len(last):].startswith("."))
+    return all(same(c, h) for c, h in zip(head, served, strict=False)) and (same(last, tail) or extends)
+
+
+def _methods_serving(node: Node, handlers: list[Node]) -> list[str]:
+    """Other methods served on the route shape `node` calls: a PATCH sent to a GET-only route."""
+    route = node.metadata.get("route")
+    if not isinstance(route, str) or node.metadata.get("open_tail"):
+        return []
+    called = _route_segments(route)
+    methods = set()
+    for handler in handlers:
+        served = _route_segments(str(handler.metadata.get("route", "")))
+        # As in _match_endpoints: a dynamic handler segment serves any value, a literal one only itself.
+        if len(called) == len(served) and all(c == h or h.startswith("{") for c, h in zip(called, served, strict=True)):
+            methods.add(str(handler.metadata.get("method") or ""))
+    return sorted(methods - {"", "UNKNOWN", str(node.metadata.get("method"))})
+
+
+def _match_endpoints(state: ScanState) -> None:
+    """Link client calls to handlers whose route shape serves them without being the
+    same normalized endpoint: a literal `/items/42` served by `/items/{id}`, a call whose
+    method is hidden in its options, a Pages Router `ANY` handler, a catch-all route.
+
+    Every such edge is `probable`: the shapes agree, the runtime dispatch is unverified."""
+    graph = state.graph
+    handled: dict[str, Node] = {}
+    for edge in graph.edges:
+        if edge.kind in {"HANDLES_API", "IMPLEMENTED_BY"} and graph.nodes[edge.source].kind == "endpoint":
+            handled[edge.source] = graph.nodes[edge.source]
+    callers: dict[str, list[Edge]] = defaultdict(list)
+    for edge in graph.edges:
+        if edge.kind == "CALLS_API":
+            callers[edge.target].append(edge)
+    for endpoint_id, edges in sorted(callers.items()):
+        if endpoint_id in handled:
+            continue
+        node = graph.nodes[endpoint_id]
+        method, route = node.metadata.get("method", ""), node.metadata.get("route")
+        if not isinstance(route, str):
+            continue
+        called = _route_segments(route)
+        open_tail = bool(node.metadata.get("open_tail"))
+        candidates = [handler for handler in handled.values()
+                      if handler.metadata.get("method") == "ANY" or handler.metadata.get("method") == method
+                      or (method == "UNKNOWN" and handler.metadata.get("method"))
+                      # Frameworks (Next.js, Express, FastAPI/Starlette) answer HEAD with the GET handler.
+                      or (method == "HEAD" and handler.metadata.get("method") == "GET")]
+        matches = [handler for handler in candidates if _serves(called, handler, open_tail=open_tail, loose=False)]
+        reason, loose = "matched by route shape to", False
+        if not matches and "{dynamic}" in called:
+            # `/items/${id}/${action}` sent to `/items/{id}/approve`: a runtime segment can hold
+            # any literal a handler declares. Tried only when no handler has the call's shape.
+            matches = [handler for handler in candidates if _serves(called, handler, open_tail=open_tail, loose=True)]
+            reason, loose = "matched, through a runtime segment, to", True
+        if not matches and node.metadata.get("open_head"):
+            # `${process.env.API_URL}/items`: the origin may carry a path (`https://host/api`),
+            # so a handler whose route ENDS with the call's segments may serve it.
+            matches = [handler for handler in candidates
+                       if any(_serves(called, handler, open_tail=open_tail, loose=False, skip=skip)
+                              for skip in range(1, len(_route_segments(str(handler.metadata.get("route", ""))))))]
+            reason, loose = "matched, after the path a configured origin may carry, to", True
+        if not matches:
+            continue
+        node.metadata["matched_handlers"] = sorted(handler.id for handler in matches)
+        cap = state.config.max_ambiguous_targets
+        widened = loose or open_tail
+        resolution = "ambiguous" if widened and len(matches) > 1 else "probable"
+        for handler in sorted(matches, key=lambda item: item.id)[:cap] if widened else matches:
+            for edge in edges:
+                graph.add_edge(Edge(edge.source, handler.id, "CALLS_API", resolution, edge.evidence, origin=edge.origin,
+                                    detail=f"{node.label} {reason} {handler.label}; runtime dispatch unverified"))
 
 
 def _scan_javascript(state: ScanState, path: Path, text: str, file_node: str) -> None:
@@ -522,15 +1178,176 @@ def _compile_vocabulary(pg_schemas: tuple[str, ...], mongo_receiver: str, roles:
 
     return (
         re.compile(rf"\b({words(pg_schemas)})\.([a-z_][a-z0-9_]*)\b") if pg_schemas else None,
-        re.compile(rf"\b{re.escape(mongo_receiver)}\.([a-zA-Z_][a-zA-Z0-9_]*)\b") if mongo_receiver else None,
+        re.compile(rf"\b{re.escape(mongo_receiver)}\.([a-zA-Z_][a-zA-Z0-9_]*)\.({'|'.join(sorted(MONGO_READ_METHODS | MONGO_WRITE_METHODS))})\s*\(")
+        if mongo_receiver else None,
         re.compile(rf"\b({words(roles)})\b") if roles else None,
         re.compile(rf"(?:{'|'.join(toggle_calls)})[(\s'\"]+([a-z][a-z0-9_.-]+)") if toggle_calls else None,
     )
 
 
+#: Callables whose string arguments name code, not data: `patch("routers.billing.db")`,
+#: `patch.object(...)`, `monkeypatch.setattr("app.billing.x", ...)`, `import_module(...)`.
+_CODE_TARGET_CALLS = frozenset({"patch", "object", "multiple", "setattr", "delattr", "import_module",
+                                "__import__", "reload", "find_spec", "resolve_name"})
+_DOTTED_PATH_RE = re.compile(r"\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\s*")
+#: Where SQL puts a table name. ON counts only after INDEX/TRIGGER/POLICY/GRANT/REVOKE.
+_TABLE_KEYWORD_BEFORE_RE = re.compile(
+    r"(?<![\w.$])(FROM|JOIN|INTO|UPDATE|TABLE|REFERENCES|TRUNCATE|COPY|VIEW|ON)"
+    r"(?:\s+ONLY|\s+IF\s+(?:NOT\s+)?EXISTS)?\s+$", re.I)
+_ON_OBJECT_RE = re.compile(r"\b(?:INDEX|TRIGGER|POLICY|GRANT|REVOKE|RULE)\b", re.I)
+_UPDATE_SET_RE = re.compile(r"(?:\s+(?:AS\s+)?[A-Za-z_]\w*)?\s+SET\b", re.I)
+_TABLE_LIST_GAP_RE = re.compile(r"(?:\s+(?:AS\s+)?[A-Za-z_]\w*)?\s*,\s*", re.I)
+#: A clause keyword written the way SQL is written, in capitals. Case-sensitive on purpose.
+_SQL_UPPER_KEYWORD_RE = re.compile(
+    r"(?<![\w.$])(?:SELECT|INSERT|UPDATE|DELETE|MERGE|FROM|JOIN|WHERE|INTO|VALUES|SET|RETURNING|"
+    r"GROUP\s+BY|ORDER\s+BY|LIMIT|OFFSET|HAVING|UNION|CREATE|ALTER|DROP|TRUNCATE|TABLE|"
+    r"ON\s+CONFLICT|COPY|VIEW)(?![\w.$])")
+#: String literals in C-like source (JS/TS and similar). Comments are alternatives too, and
+#: the leftmost match wins, so the apostrophe in `// don't read from x` never opens a
+#: string. Quoted strings end at the line; a template literal may span lines.
+_C_LIKE_LITERAL_RE = re.compile(
+    r"//[^\n]*|/\*.*?\*/|`((?:\\.|[^`\\])*)`|'((?:\\.|[^'\\\n])*)'|\"((?:\\.|[^\"\\\n])*)\"", re.S)
+
+
+def _sql_shaped(value: str) -> bool:
+    """Does a string read as SQL beyond the one keyword in front of a table? It does when
+    it opens like a statement (`looks_like_sql`: `select id from x`, `update x set`) or
+    carries a capitalised clause keyword (`" update x set total = 0 WHERE "`). Prose
+    ("Importing rows from billing.staging", "Copy billing.summary") does neither."""
+    from .postgres import looks_like_sql
+    return bool(_SQL_UPPER_KEYWORD_RE.search(value)) or looks_like_sql(value)
+
+
+def _python_strings(state: ScanState, rel: str, *, sql_only: bool = False) -> list[tuple[str, int]]:
+    """String constants in a parsed Python module, docstrings excluded: prose that says
+    "reads rows FROM staging INTO the cache" is documentation, not a query.
+
+    With `sql_only`, strings that name code or keys are left out too: patch, setattr and
+    import targets, dict keys, subscripts, and any string that is only a dotted path
+    (`"billing.summary"` as a route key is not a query)."""
+    tree = state.python_trees.get(rel)
+    if tree is None:
+        return []
+    skip = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                skip.add(id(first.value))
+        if not sql_only:
+            continue
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ""
+            if name in _CODE_TARGET_CALLS:
+                skip.update(id(arg) for arg in (*node.args, *(kw.value for kw in node.keywords)))
+        elif isinstance(node, ast.Dict):
+            skip.update(id(key) for key in node.keys if key is not None)
+        elif isinstance(node, ast.Subscript):
+            skip.add(id(node.slice))
+    return [(node.value, node.lineno) for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip
+            and not (sql_only and _DOTTED_PATH_RE.fullmatch(node.value))]
+
+
+def _in_sql_table_position(text: str, start: int, end: int, previous_end: int | None,
+                           sql_shaped: Callable[[], bool] | None = None) -> bool:
+    """Is `text[start:end]` where SQL names a table? Straight after FROM, JOIN, INTO,
+    UPDATE … SET, TABLE, REFERENCES, TRUNCATE, COPY or VIEW (ONLY / IF [NOT] EXISTS
+    allowed between), after ON in an INDEX/TRIGGER/POLICY/GRANT statement, or next in a
+    comma list after a name that was (`previous_end`).
+
+    `routers.billing.db` (part of a longer dotted path), `billing.fn(` (a call) and
+    `from billing.jobs import x` (Python) never are. A schema name alone is not SQL
+    context: the configured schema is often also a module name. `looks_like_sql` alone
+    does not decide it, because it only reads a statement's opening, and a query is
+    often built from fragments (`" FROM billing.invoices WHERE "`).
+
+    `sql_shaped` is None when `text` is known SQL (a .sql file). Otherwise a keyword that
+    is not in capitals counts only when `sql_shaped()` says the whole string reads as
+    SQL: "Importing rows from billing.staging" and "Open the view billing.dashboard"
+    are sentences."""
+    if start and text[start - 1] == ".":
+        return False
+    after = text[end:end + 80]
+    if re.match(r"\s+import\b", after):
+        return False
+    # After FROM/JOIN/UPDATE/TRUNCATE a parenthesis makes it a function; after INTO, ON,
+    # TABLE, REFERENCES, COPY or VIEW it opens a column list.
+    call = bool(re.match(r"\s*\(", after))
+    before = text[max(0, start - 120):start]
+    if keyword := _TABLE_KEYWORD_BEFORE_RE.search(before):
+        if sql_shaped is not None and not keyword.group(1).isupper() and not sql_shaped():
+            return False
+        word = keyword.group(1).upper()
+        if call and word in {"FROM", "JOIN", "UPDATE", "TRUNCATE"}:
+            return False
+        if word == "ON":
+            return bool(_ON_OBJECT_RE.search(before))
+        if word == "UPDATE":
+            return bool(_UPDATE_SET_RE.match(after))
+        return True
+    return not call and previous_end is not None and bool(_TABLE_LIST_GAP_RE.fullmatch(text, previous_end, start))
+
+
+def _schema_references(state: ScanState, rel: str, suffix: str, text: str, pattern: re.Pattern) -> list[tuple[str, str]]:
+    """`<schema>.<table>` for a configured schema, only where SQL can be (a .sql file or a
+    string literal) and only in a table position (`_in_sql_table_position`). `app.state`
+    in code, `app.config` in a guide and `patch("routers.billing.db")` are not tables."""
+    if suffix in {".md", ".mdx", ".html", ".json", ".yaml", ".yml", ".txt", ".sh"}:
+        return []
+    found: list[tuple[str, str]] = []
+
+    def collect(value: str, where: Callable[[int], str], known_sql: bool) -> None:
+        shaped: list[bool] = []
+
+        def sql_shaped() -> bool:  # computed once per string, and only when asked
+            if not shaped:
+                shaped.append(_sql_shaped(value))
+            return shaped[0]
+
+        previous = None
+        for m in pattern.finditer(value):
+            in_table = _in_sql_table_position(value, m.start(), m.end(), previous,
+                                              None if known_sql else sql_shaped)
+            previous = m.end() if in_table else None
+            if in_table:
+                found.append((f"{m.group(1)}.{m.group(2)}", where(m.start())))
+
+    if suffix == ".py":
+        for value, line in _python_strings(state, rel, sql_only=True):
+            collect(value, lambda pos, value=value, line=line: f"{rel}:{line + value.count(chr(10), 0, pos)}", False)
+    elif suffix == ".sql":
+        collect(text, lambda pos: f"{rel}:{text.count(chr(10), 0, pos) + 1}", True)
+    elif pattern.search(text):
+        # Only inside string literals; comments are skipped by the literal pattern itself.
+        for literal in _C_LIKE_LITERAL_RE.finditer(text):
+            group = next((g for g in (1, 2, 3) if literal.group(g) is not None), None)
+            if group is None:
+                continue
+            offset = literal.start(group)
+            collect(literal.group(group),
+                    lambda pos, offset=offset: f"{rel}:{text.count(chr(10), 0, offset + pos) + 1}", False)
+    return found
+
+
+def _add_regex_store_edge(graph: Graph, source: str, kind: str, name: str, evidence: str,
+                          detail: str | None = None) -> None:
+    """A store seen only by a pattern: always `probable`, and said to be unverified. A store
+    first created here is flagged `unverified`; `render.mark_unverified_stores` settles the
+    flag after the scan, since a later file can confirm it with a parsed statement."""
+    new = stable_id(kind, name) not in graph.nodes
+    note = "unverified (regex match only)"
+    _add_store_edge(graph, source, kind, name, "probable", evidence, origin="regex",
+                    detail=f"{detail}; {note}" if detail else note,
+                    metadata={"unverified": True} if new else None)
+
+
 def _scan_generic(state: ScanState, path: Path, text: str, file_node: str) -> None:
     rel = _rel(state.root, path)
-    for match in IMPORT_RE.finditer(text) if path.suffix.lower() in javascript.EXTENSIONS and not javascript.available() else ():
+    suffix = path.suffix.lower()
+    regex_javascript = suffix in javascript.EXTENSIONS and not javascript.available()
+    for match in IMPORT_RE.finditer(text) if regex_javascript else ():
         target = _resolve_import(state.root, path, match.group(1))
         if target:
             target_rel = _rel(state.root, target)
@@ -547,23 +1364,34 @@ def _scan_generic(state: ScanState, path: Path, text: str, file_node: str) -> No
         state.graph.add_edge(Edge(file_node, tag_id, "DECLARES_CONCEPT", "declared", "featuretrace_marker", origin="declared"))
 
     pg_table_re, mongo_re, role_re, toggle_re = _vocabulary(state.config)
-    for match in pg_table_re.finditer(text) if pg_table_re else ():
-        _add_store_edge(state.graph, file_node, "postgres_table", f"{match.group(1)}.{match.group(2)}", "probable", f"{rel}:{text.count(chr(10), 0, match.start()) + 1}")
-    if path.suffix == ".py" and not _sql_parser_available():
-        if not pg_table_re:
-            # No schema list: fall back to SQL-shaped text. Keywords must be upper case,
-            # so a Python `from x import y` never reads as a table.
-            for match in _GENERIC_SQL_TABLE_RE.finditer(text):
+    for table, evidence in _schema_references(state, rel, suffix, text, pg_table_re) if pg_table_re else ():
+        _add_regex_store_edge(state.graph, file_node, "postgres_table", table, evidence,
+                              "Configured PostgreSQL schema name after a SQL table keyword")
+    if suffix == ".py" and not _sql_parser_available() and not pg_table_re:
+        # No SQL parser and no schema list: fall back to SQL-shaped string literals.
+        # Keywords must be upper case, so a Python `from x import y` never reads as a table.
+        for value, line in _python_strings(state, rel):
+            if not re.match(r"\s*(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b", value):
+                continue
+            for match in _GENERIC_SQL_TABLE_RE.finditer(value):
                 keyword, first, second, paren = match.groups()
                 # A parenthesis opens INSERT's column list, and is a function call anywhere else.
                 if first in _SQL_NOT_TABLES or (paren and keyword != "INTO"):
                     continue
                 table = f"{first}.{second}" if second else first
-                _add_store_edge(state.graph, file_node, "postgres_table", table, "probable",
-                                f"{rel}:{text.count(chr(10), 0, match.start()) + 1}")
-    if path.suffix != ".py" and mongo_re:
-        for match in mongo_re.finditer(text):
-            _add_store_edge(state.graph, file_node, "mongo_collection", match.group(1), "probable", f"{rel}:{text.count(chr(10), 0, match.start()) + 1}")
+                _add_regex_store_edge(state.graph, file_node, "postgres_table", table,
+                                      f"{rel}:{line + value.count(chr(10), 0, match.start())}")
+    if regex_javascript and mongo_re:
+        # Tree-sitter extraction handles collections when it is installed; this fallback
+        # still requires a driver method, so `db.connect()` is never a collection, and the
+        # same MongoDB handle evidence (`_mongo_handle`) as the syntax path, read lexically.
+        mongo_file = _mongo_handle(state, rel, state.config.mongo_receiver, {rel: text})
+        for match in mongo_re.finditer(text) if mongo_file else ():
+            if match.group(1) in MONGO_NOT_COLLECTIONS:
+                continue
+            _add_regex_store_edge(state.graph, file_node, "mongo_collection", match.group(1),
+                                  f"{rel}:{text.count(chr(10), 0, match.start()) + 1}",
+                                  f"MongoDB driver call ({mongo_operation(match.group(2))})")
 
     for role in sorted(set(role_re.findall(text))) if role_re else ():
         role_id = stable_id("policy", f"role:{role}")
@@ -574,13 +1402,13 @@ def _scan_generic(state: ScanState, path: Path, text: str, file_node: str) -> No
         state.graph.add_node(Node(toggle_id, "policy", toggle, metadata={"policy_kind": "feature_toggle"}))
         state.graph.add_edge(Edge(file_node, toggle_id, "GUARDED_BY", "probable", "toggle_reference", origin="regex"))
 
-    if rel.endswith("/page.tsx") or rel.endswith("/page.jsx"):
+    if regex_javascript and (rel.endswith("/page.tsx") or rel.endswith("/page.jsx")):
+        # Syntax extraction registers App and Pages Router routes; this is the fallback.
         parts = rel.split("/")
         try:
             app_index = max(index for index, part in enumerate(parts[:-1]) if part == "app")
             route_parts = [p for p in parts[app_index + 1:-1] if not (p.startswith("(") and p.endswith(")"))]
             route = "/" + "/".join(route_parts)
-            route = route if route != "" else "/"
             page_id = stable_id("page", route)
             state.graph.add_node(Node(page_id, "page", route, path=rel, metadata={"route": route}))
             state.graph.add_edge(Edge(page_id, file_node, "IMPLEMENTED_BY", "exact", "next_app_router_path", origin="framework_path"))
@@ -760,7 +1588,7 @@ def _load_router_datastore_map(state: ScanState) -> None:
         for route in router.get("routes", []):
             method = str(route.get("method", "GET")).upper()
             raw_path = str(route.get("path", "/"))
-            endpoint_path = normalise_route(f"{state.config.backend_api_prefix}{raw_path}")
+            endpoint_path = normalise_route(with_api_prefix(state, raw_path))
             endpoint_id = _endpoint_id(method, endpoint_path)
             state.graph.add_node(Node(
                 endpoint_id, "endpoint", f"{method} {endpoint_path}", path=router_path,
@@ -803,56 +1631,107 @@ def _load_router_datastore_map(state: ScanState) -> None:
 
 
 def _resolve_calls(state: ScanState) -> None:
-    symbols_by_path: dict[str, list[Node]] = defaultdict(list)
-    for node in state.graph.nodes.values():
+    graph = state.graph
+    labels: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    defaults: dict[str, list[str]] = defaultdict(list)
+    for node in graph.nodes.values():
         if node.kind == "symbol" and node.path:
-            symbols_by_path[node.path].append(node)
-    grouped: dict[tuple[str, str], list[PendingCall]] = defaultdict(list)
+            labels[node.path][node.label].append(node.id)
+            if node.metadata.get("default_export"):
+                defaults[node.path].append(node.id)
+
+    def lookup(path: str, name: str, depth: int = 0) -> list[str]:
+        """Symbols a dotted `name` denotes in module `path`: a qualified symbol, a public
+        export alias, a barrel `export ... from`, or a Python package re-export."""
+        if depth > 6 or path.startswith("external:") or not name:
+            return []
+        if name == "default" and defaults.get(path):
+            return defaults[path]
+        if found := labels[path].get(name):
+            return found
+        head, _, rest = name.partition(".")
+        suffix = f".{rest}" if rest else ""
+        local = state.js_exports.get(path, {}).get(head)
+        if local and local != head and (found := lookup(path, local + suffix, depth + 1)):
+            return found
+        for target, public, imported in state.js_reexports.get(path, []):
+            if public == head:
+                inner = imported + suffix if imported != "*" else rest
+                found = lookup(target, inner, depth + 1)
+            elif public == "*" and head != "default":
+                found = lookup(target, name, depth + 1)
+            else:
+                continue
+            if found:
+                return found
+        binding = state.imports.get(path, {}).get(head)
+        if binding and path.endswith(".py"):
+            target, exported = binding
+            inner = rest if exported == "*" else exported + suffix
+            if found := lookup(target, inner, depth + 1):
+                return found
+        # `ItemService.build` with no such method in the file (inherited, or assigned at
+        # runtime): the class itself is the closest static target.
+        return labels[path].get(head, []) if rest and depth == 0 else []
+
+    grouped: dict[tuple[str, str, str], list[PendingCall]] = defaultdict(list)
     for call in state.pending_calls:
-        grouped[(call.source, call.name)].append(call)
-    for (source, name), calls in grouped.items():
-        source_node = state.graph.nodes.get(source)
+        grouped[(call.source, call.name, call.relationship)].append(call)
+    for (source, name, relationship), calls in grouped.items():
+        source_node = graph.nodes.get(source)
         if source_node is None:
             continue
+        language = calls[0].language
         parts = name.split(".")
         bindings = state.imports.get(source_node.path or "", {})
-        binding = bindings.get(parts[0])
-        binding = binding or bindings.get(".".join(parts[:-1]))
-        resolution = "probable"
+        binding, remainder = None, []
+        for size in range(len(parts), 0, -1):
+            if (key := ".".join(parts[:size])) in bindings:
+                binding, remainder = bindings[key], parts[size:]
+                break
+        targets: list[str] = []
+        resolution, origin = "probable", "name_resolution"
+        detail = "Name-only candidate; imports and object types unverified"
         if binding:
             path, exported = binding
-            expected = parts[-1] if exported == "*" else exported
-            targets = [node.id for node in symbols_by_path[path]
-                       if node.label == expected or (expected == "default" and node.metadata.get("default_export"))]
-            resolution = "high"  # import-bound syntax, not type or runtime resolution
-        else:
+            if path.startswith("external:"):
+                continue  # a package or the standard library: nothing in this repository
+            inner = (".".join(remainder) or "default") if exported == "*" else ".".join([exported, *remainder])
+            targets = sorted(set(lookup(path, inner)))
+            if targets:
+                # Import-bound syntax, not type or runtime resolution.
+                resolution, origin, detail = "high", "import_binding", "Import-bound syntax; runtime dispatch unverified"
+        if not targets and len(parts) == 2 and parts[0] in {"self", "cls", "this"} and source_node.kind == "symbol":
+            scope = source_node.label.split(".")[:-1]
+            while scope and not targets:
+                targets = labels[source_node.path or ""].get(".".join([*scope, parts[1]]), [])
+                scope = scope[:-1]
+            if targets:
+                detail = "Method of the enclosing class; subclass overrides and runtime binding unverified"
+        if not targets:
+            if language != "python" and len(parts) > 1 and parts[0] in _JS_GLOBALS:
+                continue
             targets = sorted(set(state.definitions.get(parts[-1], [])))
             # Avoid cross-language name joins (e.g. a Python save and a TS save).
-            targets = [target for target in targets if
-                       (state.graph.nodes[target].language == "python") == (calls[0].language == "python")]
+            targets = [target for target in targets
+                       if (graph.nodes[target].language == "python") == (language == "python")]
+            if parts[0] in {"self", "cls", "this"}:
+                targets = [target for target in targets if "." in graph.nodes[target].label]
             # A local lexical definition outranks a repository-wide name candidate.
-            local = [target for target in targets if state.graph.nodes[target].path == source_node.path]
+            local = [target for target in targets if graph.nodes[target].path == source_node.path]
             if local and len(parts) == 1:
                 targets = local
-        if not targets:
-            continue
-        if len(targets) > state.config.max_ambiguous_targets:
+        targets = [target for target in targets if target != source]
+        if not targets or len(targets) > state.config.max_ambiguous_targets:
             continue
         # A unique name in the index says nothing about an object's runtime type.
         # It is a candidate even when only one definition happens to be present.
         resolution = resolution if len(targets) == 1 else "ambiguous"
         evidence = calls[0].evidence
         for target in targets:
-            if target == source:
-                continue
-            state.graph.add_edge(Edge(
-                source, target, "CALLS", resolution,
-                evidence,
-                origin="import_binding" if binding else "name_resolution",
-                detail="Import-bound syntax; runtime dispatch unverified" if binding else "Name-only candidate; imports and object types unverified",
-            ))
+            graph.add_edge(Edge(source, target, relationship, resolution, evidence, origin=origin, detail=detail))
         if len(targets) > 1:
-            state.graph.issues.append(Issue(
+            graph.issues.append(Issue(
                 "AMBIGUOUS_CALL", "info",
                 f"Call to {name} has {len(targets)} possible definitions.",
                 [source, *targets[:6]], evidence,
@@ -861,44 +1740,105 @@ def _resolve_calls(state: ScanState) -> None:
             ))
 
 
-def _resolve_orm_references(state: ScanState) -> None:
-    """Link ORM class arguments after every admitted module has been visited."""
-    seen: set[tuple[str, str, str]] = set()
-    for source, class_name, evidence in state.orm_references:
-        for table in state.orm_tables.get(class_name, ()):
-            key = (source, table, evidence)
-            if key in seen:
-                continue
-            seen.add(key)
-            table_id = stable_id("postgres_table", table)
-            state.graph.add_node(Node(
-                table_id, "postgres_table", table,
-                metadata={"store": table, "dialect": "postgres", "orm_class": class_name},
-            ))
-            state.graph.add_edge(Edge(
-                source, table_id, "TOUCHES_STORE", "probable", evidence,
-                origin="python_ast", detail=f"ORM class reference {class_name}; runtime query shape unverified",
-            ))
+#: Python web frameworks whose routes are not modelled (FastAPI's are): a module that imports one
+#: and constructs an application or route table (`_PYTHON_APP_CONSTRUCTORS`).
+_UNMODELLED_PYTHON_FRAMEWORKS = frozenset({"flask", "quart", "sanic", "bottle", "falcon", "litestar", "django",
+                                           "pyramid", "aiohttp.web", "tornado.web", "cherrypy", "responder"})
+
+
+#: Calls (by last name) and assignments that build a Flask/Quart/Sanic/Bottle/Falcon/Litestar/
+#: aiohttp/Tornado/Pyramid/CherryPy/Responder application or router, or a Django `urlpatterns`.
+_PYTHON_APP_CONSTRUCTORS = frozenset({"Flask", "Quart", "Sanic", "Bottle", "Blueprint", "App", "API", "Litestar",
+                                      "Application", "Configurator", "Router", "RouteTableDef", "route", "quickstart"})
+
+
+def _constructs_python_app(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            function = node.func
+            name = function.attr if isinstance(function, ast.Attribute) else function.id if isinstance(function, ast.Name) else ""
+            if name in _PYTHON_APP_CONSTRUCTORS:
+                return True
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == "urlpatterns" for target in targets):
+                return True
+    return False
+
+
+def _unmodelled_python_routes(state: ScanState) -> list[str]:
+    """Modules that import an unmodelled Python web framework and build an app or route table.
+    An import alone (a compatibility test, `django.conf.settings` in a script) serves nothing,
+    and test code is left out."""
+    found = set()
+    for rel, tree in state.python_trees.items():
+        if is_test_path(rel):
+            continue
+        for statement in tree.body:
+            names = ([alias.name for alias in statement.names] if isinstance(statement, ast.Import)
+                     else [statement.module or ""] + [f"{statement.module}.{alias.name}" for alias in statement.names]
+                     if isinstance(statement, ast.ImportFrom) and not statement.level else [])
+            # `aiohttp` and `tornado` are also HTTP clients; only their `.web` modules serve routes.
+            framework = next((name.split(".")[0] for name in names
+                              if name in _UNMODELLED_PYTHON_FRAMEWORKS or name.split(".")[0] in _UNMODELLED_PYTHON_FRAMEWORKS),
+                             None)
+            if framework:
+                if _constructs_python_app(tree):
+                    found.add(f"a {framework} application module ({rel})")
+                break
+    return sorted(found)
 
 
 def _detect_endpoint_gaps(state: ScanState) -> None:
     incoming_kinds: dict[str, set[str]] = defaultdict(set)
     outgoing_kinds: dict[str, set[str]] = defaultdict(set)
+    api_callers: dict[str, set[str]] = defaultdict(set)
+    call_sites: dict[str, set[str]] = defaultdict(set)
     for edge in state.graph.edges:
         outgoing_kinds[edge.source].add(edge.kind)
         incoming_kinds[edge.target].add(edge.kind)
+        if edge.kind == "CALLS_API":
+            api_callers[edge.target].add(edge.source)
+            call_sites[edge.target].add(edge.evidence)
+    handlers = [n for n in state.graph.nodes.values()
+                if n.kind == "endpoint" and {"HANDLES_API", "IMPLEMENTED_BY"} & outgoing_kinds[n.id]]
+    liveness = _JavaScriptLiveness(state)
+    # Routes registered in a shape the scanner does not model (an Express router under an
+    # unknown mount, a NestJS controller, a Flask app) may serve any call that matched nothing.
+    # A gap is then only a lead: reported as info, naming where those routes are.
+    unmodelled = sorted({f"{request.receiver} ({rel}:{request.line})" if request.line > 1 else f"{request.receiver} ({rel})"
+                         for rel, _file, request in state.js_requests if request.style == _UNMODELLED_ROUTE})
+    unmodelled += _unmodelled_python_routes(state)
     for node in state.graph.nodes.values():
         if node.kind != "endpoint":
             continue
         called = "CALLS_API" in incoming_kinds[node.id]
         handled = bool({"HANDLES_API", "IMPLEMENTED_BY"} & outgoing_kinds[node.id])
-        if called and not handled:
-            state.graph.issues.append(Issue(
-                "API_CALL_WITHOUT_HANDLER", "warning",
-                f"No matching backend handler was found for {node.label}.", [node.id],
-                node.path or node.label,
-                "Check API prefixes, dynamic path normalization, proxy routes, or a missing backend handler.",
-            ))
+        if called and not handled and not node.metadata.get("matched_handlers"):
+            if node.metadata.get("method") == "OPTIONS":
+                continue  # a CORS preflight or capability query: frameworks answer it without a handler
+            code, severity = "API_CALL_WITHOUT_HANDLER", "warning"
+            message = f"No matching backend handler was found for {node.label}."
+            recommendation = "Check API prefixes, dynamic path normalization, proxy routes, or a missing backend handler."
+            sites = sorted(call_sites[node.id])
+            if others := _methods_serving(node, handlers):
+                # The path exists and the method does not: a 405 at run time, and the one kind
+                # of handler gap that is almost always a real bug.
+                code, recommendation = "API_METHOD_MISMATCH", "Use a method the route serves, or add a handler for this method."
+                message = (f"{node.label} has no handler, but the route is handled for {', '.join(others)}, so the call "
+                           f"gets 405 Method Not Allowed. Called from {', '.join(sites[:3])}.")
+            reasons = [liveness.dead_reason(state.graph.nodes[caller]) for caller in sorted(api_callers[node.id])]
+            if reasons and all(reasons):
+                # Code nothing loads cannot send the request; say so rather than rank it with live calls.
+                severity = "info"
+                message += f" The call is likely dead code: {'; '.join(sorted(set(reasons))[:3])}."
+            if unmodelled:
+                severity = "info"
+                more = f" and {len(unmodelled) - 3} more" if len(unmodelled) > 3 else ""
+                message += (f" The repository also registers routes this scanner does not model, which may serve it: "
+                            f"{'; '.join(unmodelled[:3])}{more}.")
+            state.graph.issues.append(Issue(code, severity, message, [node.id], node.path or node.label, recommendation,
+                                            subject=sites[0] if sites else ""))
         elif handled and not called:
             state.graph.issues.append(Issue(
                 "API_HANDLER_WITHOUT_STATIC_CALLER", "info",
@@ -922,7 +1862,7 @@ def _detect_structural_duplicates(state: ScanState) -> None:
         if len(nodes) < 2 or len(paths) < 2:
             continue
         ordered = sorted(nodes, key=lambda item: (item.path or "", item.line or 0, item.label))
-        for left, right in zip(ordered, ordered[1:]):
+        for left, right in zip(ordered, ordered[1:], strict=False):
             state.graph.add_edge(Edge(
                 left.id, right.id, "STRUCTURALLY_SIMILAR", "ambiguous",
                 f"python_ast_body:{fingerprint[:16]}", origin="heuristic",
@@ -937,6 +1877,11 @@ def _detect_structural_duplicates(state: ScanState) -> None:
 
 def scan_repository(root: Path, config: Config | None = None, *,
                     extractors: Iterable[Extractor] = ()) -> Graph:
+    """Scan `root` into a `Graph`: extract each file, then run the cross-file resolution passes.
+
+    `config` is copied, never mutated (extractors add their extensions to the copy). A
+    file that fails becomes an issue and the scan continues. `metadata["content_sha256"]`
+    equals `repository_content_sha` for the same tree and config."""
     root = root.resolve()
     config = config or Config.load(root)
     config.validate()
@@ -951,15 +1896,24 @@ def scan_repository(root: Path, config: Config | None = None, *,
     })
     graph = Graph(root=str(root))
     state = ScanState(graph=graph, root=root, config=config)
-    state.files = list(islice(iter_source_files(root, config), config.max_files + 1))
+    ignored, gitignore_problem = _gitignored(root) if config.respect_gitignore else (frozenset(), "")
+    if gitignore_problem:
+        graph.issues.append(Issue("GITIGNORE_UNAVAILABLE", "info",
+                                  f"Git-ignored files could not be listed ({gitignore_problem}); untracked ignored files were read.",
+                                  [], "", "Check that git is installed and trusts this directory, or exclude generated paths."))
+    state.files = list(islice(iter_source_files(root, config, ignored), config.max_files + 1))
     if len(state.files) > config.max_files:
         state.files.pop()
         graph.issues.append(Issue("SCAN_FILE_LIMIT", "warning", "Scan stopped at the configured file-count limit.",
                                   [], "", "Narrow the scope or increase max_files; this scan is incomplete."))
     state.admitted_paths = frozenset(_rel(root, path) for path in state.files)
     state.import_index = ImportIndex(root, state.files, config.max_file_bytes)
-    for path, problem in state.import_index.problems:
-        graph.issues.append(Issue("IMPORT_CONFIG_ERROR", "warning", problem, [], path, "Correct or flatten the local tsconfig."))
+    for path, problem, fatal in state.import_index.problems:
+        if fatal:
+            graph.issues.append(Issue("IMPORT_CONFIG_ERROR", "warning", problem, [], path, "Correct or flatten the local tsconfig."))
+        else:
+            graph.issues.append(Issue("IMPORT_CONFIG_PARTIAL", "info", problem, [], path,
+                                      "Aliases declared in this config still resolve; inherited options are unknown."))
 
     digest = hashlib.sha256()
     digest.update(b"truncated" if any(i.code == "SCAN_FILE_LIMIT" for i in graph.issues) else b"complete")
@@ -979,8 +1933,15 @@ def scan_repository(root: Path, config: Config | None = None, *,
         ))
         if text is None:
             skipped_count += 1
+            # Only a data format no extractor was asked to read; an oversized source file,
+            # including one a plugin or `extensions` names, is a hole in the analysis.
+            suffix = path.suffix.lower()
+            data_file = (source.status == "too_large" and suffix in _DATA_SUFFIXES
+                         and not _interpreted_data_file(path.name)
+                         and not any(suffix in plugin.extensions for plugin in extractors))
             graph.issues.append(Issue(
-                "FILE_SKIPPED", "warning", f"File was not analyzed: {source.status}.",
+                "DATA_FILE_SKIPPED" if data_file else "FILE_SKIPPED", "info" if data_file else "warning",
+                f"{'Data file' if data_file else 'File'} was not analyzed: {source.status}.",
                 [file_node], rel,
                 "Review the file encoding, access and configured max_file_bytes limit.",
                 subject=source.status,
@@ -1005,8 +1966,10 @@ def scan_repository(root: Path, config: Config | None = None, *,
                     graph.issues.append(Issue("JAVASCRIPT_PARSER_UNAVAILABLE", "warning", "Using legacy regex extraction; JS/TS syntax coverage is incomplete.",
                                               [file_node], rel, "Install repolens[stack]."))
             elif path.suffix.lower() == ".sql":
-                from .postgres import add_sql
-                add_sql(graph, file_node, text, rel)
+                from .postgres import add_sql_file
+                add_sql_file(graph, file_node, text, rel)
+            elif path.suffix.lower() == ".prisma":
+                state.prisma_schemas.append((rel, text))
             _scan_generic(state, path, text, file_node)
         except RecursionError:
             state.graph.issues.append(Issue(
@@ -1040,19 +2003,53 @@ def scan_repository(root: Path, config: Config | None = None, *,
                     subject=plugin.name,
                 ))
 
-    _resolve_orm_references(state)
+    def run_pass(name: str, step: Callable[..., object], *args: object) -> None:
+        # The per-file guard above does not cover the cross-file passes. One pass that
+        # crashes (a pathological tree, an unforeseen shape) must not discard the graph;
+        # what it would have added is missing, so the code is an incomplete one. The
+        # exception text is left out: it can carry paths from the scanned checkout.
+        try:
+            step(*args)
+        except Exception as exc:  # noqa: BLE001 - one pass may never end the run
+            graph.issues.append(Issue(
+                "ANALYSIS_PASS_FAILED", "warning",
+                f"Analysis pass {name} failed ({type(exc).__name__}); the relationships it adds are missing.",
+                [], "", "Report this; the scan continued without that pass, so this result is incomplete.",
+                subject=name,
+            ))
+
+    from .columns import check_columns
     from .fastapi import add_routes
-    add_routes(state)
-    _resolve_calls(state)
-    for loader in (_load_canonical_owners, _load_router_datastore_map):
+    run_pass("resolve_js_requests", _resolve_js_requests, state)
+    run_pass("resolve_js_stores", _resolve_js_stores, state)
+    run_pass("check_columns", check_columns, state)
+    run_pass("resolve_orm_references", _resolve_orm_references, state)
+    run_pass("add_routes", add_routes, state)
+    run_pass("resolve_calls", _resolve_calls, state)
+
+    def load_artifact(loader: Callable[[ScanState], None]) -> None:
         try:
             loader(state)
         except (ValueError, TypeError, AttributeError, KeyError, OSError) as exc:
             graph.issues.append(Issue("ARTIFACT_SCAN_FAILED", "warning",
                                       f"A declared relationship artifact is malformed ({type(exc).__name__}).",
                                       [], "", "Validate artifact structure; declared relationships may be incomplete."))
-    _detect_endpoint_gaps(state)
-    _detect_structural_duplicates(state)
+
+    run_pass("load_canonical_owners", load_artifact, _load_canonical_owners)
+    run_pass("load_router_datastore_map", load_artifact, _load_router_datastore_map)
+    if state.api_prefix_already_resolved:
+        state.graph.issues.append(Issue(
+            "API_PREFIX_ALREADY_RESOLVED", "info",
+            f"backend_api_prefix {state.config.backend_api_prefix!r} was already part of "
+            f"{state.api_prefix_already_resolved} resolved route(s) and was not added to them again.",
+            [], "[impact] backend_api_prefix",
+            "Remove backend_api_prefix when the application declares the prefix itself; keep it only for a "
+            "prefix added outside the code (a proxy or root_path).",
+        ))
+    run_pass("match_endpoints", _match_endpoints, state)
+    run_pass("detect_endpoint_gaps", _detect_endpoint_gaps, state)
+    run_pass("detect_structural_duplicates", _detect_structural_duplicates, state)
+    run_pass("mark_unverified_stores", mark_unverified_stores, graph)
     graph.metadata.update({
         "content_sha256": digest.hexdigest(),
         "config_sha256": config_fingerprint(config),

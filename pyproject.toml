@@ -9,7 +9,7 @@ description = "Read-only static repository analysis with evidence graphs, impact
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "StrataOS contributors" }]
+authors = [{ name = "Repository Lens contributors" }]
 dependencies = []
 
 [project.optional-dependencies]

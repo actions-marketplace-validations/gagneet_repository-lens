@@ -46,6 +46,7 @@ import subprocess
 import sys
 from pathlib import PurePosixPath
 
+from ..core.git import run_git
 from ..config import Config
 from ..core.files import SkipRule
 from ..core.git import tracked_paths
@@ -60,6 +61,8 @@ HEAD_BYTES = 4000
 
 
 class Regenerator:
+    """Decides which configured generators a change invalidates, and runs them."""
+
     def __init__(self, settings: ArtefactSettings):
         self.settings = settings
         self._ft_skip = SkipRule(settings.featuretrace.skip_parts)
@@ -111,12 +114,15 @@ class Regenerator:
 
     # ── how to run it ───────────────────────────────────────────────────────────
     def is_slow(self, command: list[str]) -> bool:
+        """Whether any argument of `command` names a generator listed as `slow`."""
         return any(any(slow in part for part in command) for slow in self.settings.slow)
 
     def needs_venv(self, command: list[str]) -> bool:
+        """Whether any argument of `command` names a generator listed in `needs_venv`."""
         return any(any(name in part for part in command) for name in self.settings.needs_venv)
 
     def has_venv(self) -> bool:
+        """Whether `venv_python` is configured and exists on disk."""
         venv = self.settings.venv_python
         return venv is not None and venv.exists()
 
@@ -198,12 +204,15 @@ class Regenerator:
         return tags
 
     def featuretrace_map_for(self, tag: str) -> str:
+        """Repo-relative path of the FeatureTrace flow map for `tag`."""
         return f"{self.settings.featuretrace.map_dir_rel}/{tag}_flow.md"
 
     def _head_at(self, ref: str, path: str) -> str:
         """The top of `path` as it was at `ref`, or "" if it did not exist there."""
-        out = subprocess.run(["git", "show", f"{ref}:{path}"], cwd=self.settings.root,
-                             capture_output=True, text=True, encoding="utf-8", errors="replace")
+        try:
+            out = run_git(self.settings.root, "show", f"{ref}:{path}", errors="replace", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return ""
         return out.stdout[:HEAD_BYTES] if out.returncode == 0 else ""
 
     def affected_paths(self, changed: list[str], since: str | None = None) -> list[str]:
@@ -253,12 +262,13 @@ class Regenerator:
         return paths
 
     def changed_since(self, ref: str) -> list[str]:
+        """Artefact paths invalidated by the files changed between `ref` and HEAD.
+
+        Empty, with a message on stderr, when git cannot diff against `ref`.
+        """
         # -z: git C-quotes a non-ASCII path in line mode ("docs/caf\303\251.md"), which
         # then matches no rule and no file, so its artefact was silently never refreshed.
-        out = subprocess.run(
-            ["git", "diff", "--name-only", "-z", ref, "HEAD"], cwd=self.settings.root,
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
+        out = run_git(self.settings.root, "diff", "--name-only", "-z", ref, "HEAD", errors="replace", timeout=600)
         if out.returncode != 0:
             # A hook must never break the operation it runs after. Report and do nothing
             # rather than guess: the CI gate still catches a stale artefact.
@@ -273,6 +283,11 @@ class Regenerator:
 
     # ── the run ─────────────────────────────────────────────────────────────────
     def run(self, argv: list[str] | None, prog: str | None = None) -> int:
+        """Parse the CLI, run the needed generators and report the outcome.
+
+        Always returns 0: it runs from git hooks, so generators that need a missing venv,
+        slow ones, orphaned tags and failures are printed rather than failing the caller.
+        """
         ap = argparse.ArgumentParser(prog=prog, description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
         group = ap.add_mutually_exclusive_group(required=True)
@@ -363,6 +378,7 @@ class Regenerator:
 
 def main(argv: list[str] | None = None, *, config: Config | None = None,
          settings: ArtefactSettings | None = None, prog: str | None = None) -> int:
+    """Entry point for `repolens artefacts regenerate`."""
     return Regenerator(settings or from_config(config)).run(argv, prog)
 
 

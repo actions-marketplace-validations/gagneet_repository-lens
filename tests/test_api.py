@@ -108,3 +108,24 @@ class ApiTests(unittest.TestCase):
                                            json=payload, headers=self.auth)
             self.assertEqual(response.status_code, 200, item["name"] + response.text)
         self.assertEqual(next(v["value"] for v in environment["values"] if v["key"] == "api_token"), "")
+
+    def test_impact_and_report_depth_is_bounded(self):
+        self.assertEqual(self.client.post("/v1/analysis", json={}, headers=self.auth).status_code, 200)
+        for depth in (0, 9):
+            response = self.client.post("/v1/impact", json={"query": "list_items", "depth": depth}, headers=self.auth)
+            self.assertEqual(response.status_code, 422)
+            response = self.client.get("/v1/report", params={"format": "mermaid", "depth": depth}, headers=self.auth)
+            self.assertEqual(response.status_code, 422)
+        deep = self.client.post("/v1/impact", json={"query": "list_items", "depth": 8, "max_nodes": 5}, headers=self.auth)
+        self.assertEqual(deep.status_code, 200, deep.text)
+        self.assertLessEqual(len(deep.json()["nodes"]), 5)
+        schema = self.client.get("/openapi.json").json()
+        self.assertEqual(schema["components"]["schemas"]["ImpactRequest"]["properties"]["depth"]["maximum"], 8)
+
+    def test_generated_contracts_match_the_committed_documents(self):
+        # docs/api is generated; a model change without `repolens api export` drifts.
+        from repolens.api.export import contracts
+        docs = Path(__file__).resolve().parents[1] / "docs" / "api"
+        schema, collection, _ = contracts()
+        self.assertEqual(json.loads((docs / "openapi.json").read_text())["components"], schema["components"])
+        self.assertEqual(json.loads((docs / "repository-lens.postman_collection.json").read_text())["item"], collection["item"])

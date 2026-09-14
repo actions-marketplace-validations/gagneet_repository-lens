@@ -1,12 +1,17 @@
 """Shared, read-only Python AST helpers: parse once, find routes and their dependencies."""
 from __future__ import annotations
 
+import warnings
 import ast
+import hashlib
 import re
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Callable, Iterable, Iterator, TypeVar
+
+_T = TypeVar("_T")
 
 from ..core.files import iter_files
 from .settings import ScanSettings
@@ -39,27 +44,155 @@ def last(node: ast.AST) -> str:
     return ""
 
 
-@lru_cache(maxsize=256)
-def _parse_text(path: str, text: str) -> ast.Module | None:
+def _parse_source(path: str, text: str) -> ast.Module | None:
     try:
-        return ast.parse(text, filename=path)
+        with warnings.catch_warnings():  # target code's own SyntaxWarnings are not ours to print
+            warnings.simplefilter("ignore")
+            tree = ast.parse(text, filename=path)
     except (SyntaxError, ValueError, RecursionError):
         return None
+    # Kept for `may_mention`, set before the tree is shared. Only ASCII source: a non-ASCII
+    # identifier is NFKC-normalised by the parser, so its node name need not appear as text.
+    tree._repolens_source = text if text.isascii() else None  # type: ignore[attr-defined]
+    return tree
+
+
+def may_mention(tree: ast.AST, *words: str) -> bool:
+    """False only when the module's source text contains none of `words`, so no name or
+    attribute node in it can be one of them. A prefilter for a whole-tree `ast.walk`
+    looking for a specific name; True whenever the source is unknown."""
+    source = getattr(tree, "_repolens_source", None)
+    return source is None or any(word in source for word in words)
+
+
+_parse_text = lru_cache(maxsize=256)(_parse_source)
+
+
+def _read(path: str, max_bytes: int) -> str | None:
+    from ..impact.source import read_source
+    source = Path(path)
+    return read_source(source.parent, source, max_bytes).text
 
 
 def parse(path: str, max_bytes: int = 2_000_000) -> ast.Module | None:
-    # Content-keyed: a long-lived API process must not reuse yesterday's AST for a
-    # path changed in-place. The bounded cache also prevents retaining 8192 full ASTs.
-    from ..impact.source import read_source
-    source = Path(path)
-    read = read_source(source.parent, source, max_bytes)
-    return _parse_text(path, read.text) if read.text is not None else None
+    """A parse outside any run: a small content-keyed LRU, so a long-lived API process
+    never reuses yesterday's AST for a path changed in place, and never holds thousands
+    of them. The checks use their run's `ParseCache` (`ScanSettings.parse_cache`)."""
+    text = _read(path, max_bytes)
+    return _parse_text(path, text) if text is not None else None
+
+
+class ParseCache:
+    """The parsed modules of ONE run of the checks, shared by every check in it.
+
+    Each check reads every Python file several times: `route_exposure` and `MountIndex`
+    parse the tree before the check's own loop does, and security and performance each do
+    all three. A process-wide LRU either holds thousands of ASTs after the run ends (it
+    was 8192) or misses on nearly every parse of a large tree (at 256 the checks ran
+    30-40% slower on a 2,274-file repository). So the cache belongs to the run: it hangs
+    off the `ScanSettings` the run was configured with, which `dataclasses.replace` shares
+    and which is garbage when the run is.
+
+    Entries are keyed on the path and the SHA-256 of the bounded read, so a file edited
+    during a run is re-parsed rather than answered from its old tree. One entry per path:
+    capacity grows to the number of distinct files the run declares (`reserve`), and past
+    it the least recently used entry goes, so memory is bounded by the run's own inventory
+    (which `MountIndex` held in full at once anyway). A file that does not parse, or is too
+    deep for the parser (RecursionError), is cached as None like any other result; a
+    RecursionError while a CHECK walks a tree is still caught per file by that check.
+    Trees are shared, so a check must never mutate one.
+    """
+
+    def __init__(self, capacity: int = 256) -> None:
+        self.capacity = capacity
+        self._entries: OrderedDict[tuple[str, int], tuple[bytes, ast.Module | None]] = OrderedDict()
+        self._declared: set[str] = set()
+        self._derived: dict[str, tuple[Any, Any]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def derived(self, name: str, key: Any, compute: Callable[[], _T]) -> _T:
+        """The last `compute()` stored under `name`, while `key` still equals the key it was
+        computed for; otherwise computed again. One value per name, so this holds only the
+        latest index of each kind (route exposure, mount index) for the run.
+
+        The key must name every input: `run_inputs(s, trees)`. Trees compare by identity,
+        so a file edited since (a new tree) recomputes, and the key keeps them alive."""
+        held = self._derived.get(name)
+        if held is not None and held[0] == key:
+            return held[1]
+        value = compute()
+        self._derived[name] = (key, value)
+        return value
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def reserve(self, paths: Iterable[Path | str]) -> None:
+        """Room for every file in `paths` (with those declared before) at once."""
+        self._declared.update(str(p) for p in paths)
+        self.capacity = max(self.capacity, len(self._declared))
+
+    def parse(self, path: Path | str, max_bytes: int) -> ast.Module | None:
+        path = str(path)
+        text = _read(path, max_bytes)
+        if text is None:
+            return None
+        digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest()
+        key = (path, max_bytes)
+        cached = self._entries.get(key)
+        if cached is not None and cached[0] == digest:
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return cached[1]
+        self.misses += 1
+        tree = _parse_source(path, text)
+        self._entries[key] = (digest, tree)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.capacity:
+            self._entries.popitem(last=False)
+        return tree
 
 
 def python_files(s: ScanSettings) -> list[Path]:
+    """The Python files the checks read: the admitted inventory when the analysis service
+    set one, else every `.py` under the configured roots except untracked gitignored ones."""
     if s.admitted_python_files is not None:
         return [s.root / path for path in s.admitted_python_files]
-    return iter_files(s.root, s.python_roots, [".py"], s.skip_parts)
+    return not_gitignored(s, iter_files(s.root, s.python_roots, [".py"], s.skip_parts))
+
+
+def not_gitignored(s: ScanSettings, paths: list[Path]) -> list[Path]:
+    """`paths` without the untracked files git ignores (with `respect_gitignore`). The git
+    listing is taken once per parse cache, which lives for one run: settings reused after the
+    working tree changes keep the old listing. When git cannot list them, every path is kept: reading
+    a backup is noise, skipping source would be a silent hole."""
+    if not s.respect_gitignore:
+        return paths
+    from ..core.git import under_ignored, untracked_ignored
+    listed = s.parse_cache.derived("gitignored", s.root, lambda: untracked_ignored(s.root)[0])
+    if not listed:
+        return paths
+    return [path for path in paths if not under_ignored(s.rel(path), listed)]
+
+
+def run_inputs(s: ScanSettings, trees: dict[str, ast.Module]) -> tuple:
+    """Everything a whole-tree index (`wiring.route_exposure`, `mounts.MountIndex`) is built
+    from: the settings those read and the parsed tree of each file, by identity."""
+    return (s.root, s.python_roots, s.skip_parts, s.internal_prefixes, s.entrypoints,
+            s.app_constructors, s.deployment_detection, s.respect_gitignore, s.max_file_bytes, s.admitted_python_files,
+            s.security.auth_scheme_classes, tuple(trees.items()))
+
+
+def parsed_files(s: ScanSettings, paths: list[Path] | None = None) -> Iterator[tuple[Path, ast.Module]]:
+    """(path, tree) for every file in `paths` (default: `python_files(s)`) that parses,
+    from the run's shared cache."""
+    files = python_files(s) if paths is None else paths
+    s.parse_cache.reserve(files)
+    for path in files:
+        tree = s.parse_cache.parse(path, s.max_file_bytes)
+        if tree is not None:
+            yield path, tree
 
 
 def functions(tree: ast.AST) -> Iterator[tuple[FunctionNode, str]]:
@@ -359,7 +492,7 @@ def _is_marker(node: ast.AST | None, names: tuple[str, ...]) -> bool:
     return isinstance(node, ast.Call) and last(node.func) in names
 
 
-def _dependency_name(call: ast.Call) -> str | None:
+def dependency_name(call: ast.Call) -> str | None:
     target = call.args[0] if call.args else next(
         (k.value for k in call.keywords if k.arg == "dependency"), None)
     if isinstance(target, ast.Call):
@@ -374,6 +507,55 @@ def _annotated_marker(annotation: ast.AST | None, names: tuple[str, ...]) -> ast
         return None
     elts = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else []
     return next((e for e in elts[1:] if _is_marker(e, names)), None)
+
+
+def _alias_statement(node: ast.AST) -> tuple[str, ast.AST] | None:
+    """(name, value) for `N = V`, `N: TypeAlias = V` and Python 3.12's `type N = V`."""
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        return node.targets[0].id, node.value
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+        return node.target.id, node.value
+    if type(node).__name__ == "TypeAlias" and isinstance(getattr(node, "name", None), ast.Name):
+        return node.name.id, node.value
+    return None
+
+
+def annotated_aliases(tree: ast.Module) -> dict[str, ast.Call]:
+    """Module-level `CurrentUser = Annotated[User, Depends(get_current_user)]` -> the
+    Depends/Security call each alias carries.
+
+    FastAPI's own docs, and its full-stack template (`SessionDep`, `CurrentUser`), declare
+    dependencies this way. A parameter annotated with the alias depends on exactly what
+    the alias names, and reading only an inline `Annotated[...]` reported every such
+    route as declaring no authentication."""
+    found: dict[str, ast.Call] = {}
+    for node in module_level(tree):
+        pair = _alias_statement(node)
+        if pair and (marker := _annotated_marker(pair[1], ("Depends", "Security"))) is not None:
+            found[pair[0]] = marker
+    return found
+
+
+def security_schemes(tree: ast.Module, classes: frozenset[str]) -> set[str]:
+    """Module-level names holding a FastAPI security scheme (`oauth2_scheme =
+    OAuth2PasswordBearer(tokenUrl="token")`), and module classes deriving from one.
+
+    Depending on a scheme instance authenticates: it raises 401/403 when the credential
+    is missing. Not with `auto_error=False`, which hands the handler None instead, so
+    that instance does not count. A class is counted by its base's NAME only."""
+    found: set[str] = set()
+    for node in module_level(tree):
+        if isinstance(node, ast.ClassDef) and any(last(b) in classes for b in node.bases):
+            found.add(node.name)
+            continue
+        pair = _alias_statement(node)
+        value = pair[1] if pair else None
+        if not (isinstance(value, ast.Call) and last(value.func) in classes):
+            continue
+        auto_error = keyword_value(value, "auto_error")
+        if not (isinstance(auto_error, ast.Constant) and auto_error.value is False):
+            found.add(pair[0])
+    return found
 
 
 def _parameters(fn: FunctionNode) -> list[tuple[ast.arg, ast.AST | None]]:
@@ -407,7 +589,7 @@ def dependency_names(value: ast.AST | None) -> tuple[str, ...]:
     if not isinstance(value, (ast.List, ast.Tuple)):
         return ()
     return tuple(name for elt in value.elts
-                 if _is_marker(elt, ("Depends", "Security")) and (name := _dependency_name(elt)))
+                 if _is_marker(elt, ("Depends", "Security")) and (name := dependency_name(elt)))
 
 
 def module_level(tree: ast.Module) -> Iterator[ast.stmt]:
@@ -442,41 +624,107 @@ def declared_routers(tree: ast.Module, constructors: frozenset[str]) -> dict[str
     return found
 
 
-def routes(tree: ast.AST, mounts: dict[str, Mount] | None = None) -> list[Route]:
-    """Every decorated route handler. `mounts` (router variable -> Mount) adds what each
-    route inherits from its router: without it, router-level auth reads as none."""
+def _text(node: ast.AST | None) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _methods(call: ast.Call) -> list[str] | None:
+    """`methods=["GET", "POST"]` on api_route/add_api_route, upper-cased and limited to
+    HTTP_VERBS; FastAPI's default is GET. None when the list is not literal: a guessed
+    method would either invent a mutation or hide one."""
+    value = keyword_value(call, "methods")
+    if value is None:
+        return ["GET"]
+    if not isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        return None
+    texts = [_text(e) for e in value.elts]
+    if any(t is None for t in texts):
+        return None
+    return list(dict.fromkeys(t.upper() for t in texts if t.lower() in HTTP_VERBS))
+
+
+def _route_path(call: ast.Call) -> str | None:
+    return _text(call.args[0] if call.args else keyword_value(call, "path"))
+
+
+def _endpoint_calls(tree: ast.AST) -> Iterator[tuple[ast.Call, str]]:
+    """`router.add_api_route("/p", handler, methods=[...])` anywhere in the module, with
+    the NAME of the handler it registers (positional or `endpoint=`)."""
+    if not may_mention(tree, "add_api_route"):
+        return
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_api_route"):
+            continue
+        endpoint = node.args[1] if len(node.args) > 1 else keyword_value(node, "endpoint")
+        if isinstance(endpoint, ast.Name):
+            yield node, endpoint.id
+
+
+def routes(tree: ast.AST, mounts: dict[str, Mount] | None = None,
+           aliases: dict[str, ast.Call] | None = None) -> list[Route]:
+    """Every route handler: decorated (`@router.post`, `@router.api_route(methods=...)`,
+    `@app.websocket`), or registered with `router.add_api_route(path, handler)`.
+
+    `mounts` (router variable -> Mount) adds what each route inherits from its router:
+    without it, router-level auth reads as none. `aliases` (annotation name -> the
+    Depends call it stands for) adds dependency aliases imported from other modules;
+    the module's own are always read. A path or method list that is not a literal is
+    skipped rather than guessed."""
+    # The module's own alias wins over an imported name it shadows: it is bound later.
+    known = {**(aliases or {}), **(annotated_aliases(tree) if isinstance(tree, ast.Module) else {})}
     found: list[Route] = []
+    by_name: dict[str, tuple[FunctionNode, str]] = {}
     for fn, qualname in functions(tree):
+        by_name.setdefault(qualname, (fn, qualname))
         for dec in fn.decorator_list:
             if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):
                 continue
-            verb = dec.func.attr.lower()
-            if verb not in HTTP_VERBS:
+            kind = dec.func.attr.lower()
+            if kind in HTTP_VERBS:
+                methods: list[str] | None = [kind.upper()]
+            elif dec.func.attr == "api_route":
+                methods = _methods(dec)
+            elif dec.func.attr == "websocket":
+                methods = ["WEBSOCKET"]
+            else:
                 continue
-            if not (dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str)):
+            declared = _route_path(dec)
+            if declared is None or not methods:
                 continue
-            declared = dec.args[0].value
-            receiver = dec.func.value.id if isinstance(dec.func.value, ast.Name) else ""
-            mount = (mounts or {}).get(receiver) or Mount()
-            route = Route(node=fn, qualname=qualname, method=verb.upper(),
-                          path=mount.prefix + declared, declared_path=declared)
-            route.dependencies.extend(Dependency(None, name) for name in mount.dependencies)
-            for kw in dec.keywords:
-                if kw.arg == "dependencies" and isinstance(kw.value, (ast.List, ast.Tuple)):
-                    for elt in kw.value.elts:
-                        if _is_marker(elt, ("Depends", "Security")) and (name := _dependency_name(elt)):
-                            route.dependencies.append(Dependency(None, name))
-            for arg, default in _parameters(fn):
-                if arg.arg in ("self", "cls"):
-                    continue
-                marker = default if _is_marker(default, ("Depends", "Security")) else \
-                    _annotated_marker(arg.annotation, ("Depends", "Security"))
-                if marker is not None:
-                    if name := _dependency_name(marker):
-                        route.dependencies.append(Dependency(arg.arg, name))
-                elif _is_marker(default, ("Header",)) or _annotated_marker(arg.annotation, ("Header",)):
-                    route.header_params.append(arg.arg)
-                else:
-                    route.request_params.append(arg.arg)
-            found.append(route)
+            for method in methods:
+                found.append(_route(fn, qualname, method, declared, dec, mounts, known))
+    for call, name in _endpoint_calls(tree):
+        declared, methods = _route_path(call), _methods(call)
+        if name in by_name and declared is not None and methods:
+            fn, qualname = by_name[name]
+            found.extend(_route(fn, qualname, m, declared, call, mounts, known) for m in methods)
     return found
+
+
+def _route(fn: FunctionNode, qualname: str, method: str, declared: str, call: ast.Call,
+           mounts: dict[str, Mount] | None, aliases: dict[str, ast.Call]) -> Route:
+    """One Route for `fn`, registered by `call` (a decorator or add_api_route) on the
+    router the call is made on."""
+    receiver = call.func.value.id if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) else ""
+    mount = (mounts or {}).get(receiver) or Mount()
+    route = Route(node=fn, qualname=qualname, method=method,
+                  path=mount.prefix + declared, declared_path=declared)
+    route.dependencies.extend(Dependency(None, name) for name in mount.dependencies)
+    route.dependencies.extend(Dependency(None, name)
+                              for name in dependency_names(keyword_value(call, "dependencies")))
+    for arg, default in _parameters(fn):
+        if arg.arg in ("self", "cls"):
+            continue
+        marker = default if _is_marker(default, ("Depends", "Security")) else \
+            _annotated_marker(arg.annotation, ("Depends", "Security"))
+        if marker is None and arg.annotation is not None:
+            marker = aliases.get(dotted(arg.annotation))
+        if marker is not None:
+            if name := dependency_name(marker):
+                route.dependencies.append(Dependency(arg.arg, name))
+        elif _is_marker(default, ("Header",)) or _annotated_marker(arg.annotation, ("Header",)):
+            route.header_params.append(arg.arg)
+        else:
+            route.request_params.append(arg.arg)
+    return route

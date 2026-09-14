@@ -32,6 +32,7 @@ COMMANDS: dict[str, tuple[str, str]] = {
 
 
 def usage() -> str:
+    """The top-level help text listing every command in `COMMANDS`."""
     width = max(len(name) for name in COMMANDS)
     rows = "\n".join(f"  {name:<{width}}  {desc}" for name, (_, desc) in COMMANDS.items())
     return (
@@ -42,6 +43,11 @@ def usage() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Dispatch to the command module's `main` and return its exit code.
+
+    Two-word command names are tried before one-word names. Returns 2 for an unknown
+    command.
+    """
     utf8_console()
     args = list(sys.argv[1:] if argv is None else argv)
     root = None
