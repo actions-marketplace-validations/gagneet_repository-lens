@@ -195,6 +195,9 @@ EDGE_COST: dict[str, int] = {
     "CALLS_API": 1, "HANDLES_API": 1,
     # Direct import, or a call resolved to exactly one definition.
     "IMPORTS": 1, "CALLS": 2, "RENDERS": 2,
+    # A function defined inside another (an inline callback in a component) runs as part of it.
+    # `impact()` walks it only from the inner function out, never across to its siblings.
+    "DEFINES": 2,
     # An endpoint's request/response model: changing the model changes the contract.
     "ACCEPTS_MODEL": 2, "RETURNS_MODEL": 2,
     # A foreign key: the referenced table's shape constrains the referencing one.
@@ -313,7 +316,10 @@ def impact(
 
     adjacency: dict[str, list[tuple[str, Edge]]] = {}
     for edge in graph.edges:
-        adjacency.setdefault(edge.source, []).append((edge.target, edge))
+        # From a component down to everything it defines would pull in every sibling of the callback
+        # that matched (a 70-method class, a page with dozens of helpers) and crowd out the page itself.
+        if edge.kind != "DEFINES":
+            adjacency.setdefault(edge.source, []).append((edge.target, edge))
         adjacency.setdefault(edge.target, []).append((edge.source, edge))
 
     # Budgets. A seed never counts against a cap — refusing to show what was asked for

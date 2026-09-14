@@ -23,13 +23,13 @@ from .plugins import Extractor, SourceFile, merge_extraction
 from .resolution import ImportIndex
 from .state import (MONGO_NOT_COLLECTIONS, MONGO_READ_METHODS, MONGO_WRITE_METHODS,  # noqa: F401
                     PendingCall, ScanState, _add_store_edge, _endpoint_id, _file_id, _rel,
-                    _symbol_id, mongo_operation, normalise_route, with_api_prefix)
+                    _symbol_id, mongo_operation, normalise_route, route_metadata, with_api_prefix)
 from .python_scan import PythonVisitor, _resolve_orm_references, _scan_python  # noqa: F401
 from .render import mark_unverified_stores, unverified_stores
 from ..core import javascript
 from ..core.files import is_test_path
 
-SCANNER_REVISION = 9
+SCANNER_REVISION = 10
 
 
 FEATURE_RE = re.compile(r"@featuretrace:([A-Za-z0-9_.-]+)")
@@ -245,10 +245,29 @@ def _scan_javascript_syntax(state: ScanState, path: Path, text: str, file_node: 
         if symbol.value_holders:
             # Same-file uses by value (`[{ loader: load }]`), read by _JavaScriptLiveness.
             metadata["value_holders"] = list(symbol.value_holders)
+        if symbol.role:
+            metadata["lexical_role"] = symbol.role
         graph.add_node(Node(node_id, "symbol", symbol.qualified, path=rel, line=symbol.line, language=language,
                             metadata=metadata))
         graph.add_edge(Edge(file_node, node_id, "CONTAINS", "exact", f"{rel}:{symbol.line}", origin="tree-sitter"))
         state.definitions[symbol.name].append(node_id)
+    # A function defined inside another runs as part of it: `OrdersPage` owns its `load` helper
+    # and its inline `onClick` callback, whose calls would otherwise reach a page only through
+    # the file. Object-literal members (`api.list`) have no symbol parent and get no edge.
+    for symbol in facts.symbols:
+        parent_name = symbol.qualified.rpartition(".")[0]
+        parent = _symbol_id(rel, parent_name) if parent_name else ""
+        if parent not in graph.nodes or graph.nodes[parent].kind != "symbol":
+            continue
+        owner = parent_name.rpartition(".")[2]
+        if not symbol.name.startswith("anonymous@"):
+            detail = f"`{symbol.name}` is defined inside `{owner}`"
+        elif symbol.role:
+            detail = f"inline `{symbol.role}` callback defined inside `{owner}`"
+        else:
+            detail = f"anonymous function defined inside `{owner}`"
+        graph.add_edge(Edge(parent, _symbol_id(rel, symbol.qualified), "DEFINES", "exact", f"{rel}:{symbol.line}",
+                            origin="tree-sitter", detail=detail))
     state.js_exports[rel] = dict(facts.exports)
     edges_before = len(graph.edges)
     _add_next_routes(state, rel, path, facts, file_node, language)
@@ -350,12 +369,14 @@ def _next_router_base(state: ScanState, parts: list[str], directory: str, *, len
     return indexes[0] if indexes and lenient else None
 
 
-def _next_route_variants(segments: list[str]) -> tuple[list[str], bool]:
-    """URL paths a Next.js route directory serves, and whether it ends in a catch-all.
+def _next_route_variants(segments: list[str]) -> tuple[list[str], bool, list[str]]:
+    """URL paths a Next.js route directory serves, whether it ends in a catch-all, and each
+    path as declared (`/orders/[orderId]`, for `state.route_metadata`).
 
     Route groups `(x)` and parallel-route slots `@x` add no URL segment; intercepting
     markers `(.)x` are dropped from the segment. `[[...slug]]` also serves its parent."""
     parts: list[str] = []
+    declared: list[str] = []
     optional = False
     for segment in segments:
         if segment.startswith("@") or (segment.startswith("(") and segment.endswith(")")):
@@ -363,6 +384,7 @@ def _next_route_variants(segments: list[str]) -> tuple[list[str], bool]:
         segment = re.sub(r"^(?:\((?:\.{1,3}|\.\.\)\(\.\.)\))+", "", segment)
         if not segment:
             continue
+        declared.append(segment)
         if segment.startswith("[[..."):
             optional = True
             parts.append("{dynamic}")
@@ -371,11 +393,12 @@ def _next_route_variants(segments: list[str]) -> tuple[list[str], bool]:
         else:
             parts.append(segment)
     route = "/" + "/".join(parts)
-    variants = [route]
+    variants, spelled = [route], ["/" + "/".join(declared)]
     if optional:
         variants.append("/" + "/".join(parts[:-1]))
+        spelled.append("/" + "/".join(declared[:-1]))
     catch_all = bool(segments) and segments[-1].startswith(("[...", "[[..."))
-    return variants, catch_all
+    return variants, catch_all, spelled
 
 
 def _add_next_routes(state: ScanState, rel: str, path: Path, facts, file_node: str, language: str) -> None:
@@ -386,18 +409,19 @@ def _add_next_routes(state: ScanState, rel: str, path: Path, facts, file_node: s
         symbol = _symbol_id(rel, local)
         return symbol if symbol in graph.nodes else file_node
 
-    def add_endpoint(method: str, route: str, target: str, origin: str, catch_all: bool) -> None:
+    def add_endpoint(method: str, route: str, target: str, origin: str, catch_all: bool, declared: str) -> None:
         endpoint = _endpoint_id(method, route)
         graph.add_node(Node(endpoint, "endpoint", f"{method} {normalise_route(route)}", path=rel,
                             line=graph.nodes[target].line, language=language,
                             metadata={"method": method, "route": normalise_route(route), "framework": "nextjs",
-                                      "catch_all": catch_all}))
+                                      "catch_all": catch_all, **route_metadata(graph, endpoint, declared)}))
         graph.add_edge(Edge(endpoint, target, "HANDLES_API", "exact", f"{rel}:{graph.nodes[target].line or 1}",
                             origin=origin))
 
-    def add_page(route: str, origin: str) -> None:
+    def add_page(route: str, origin: str, declared: str) -> None:
         page_id = stable_id("page", route)
-        graph.add_node(Node(page_id, "page", route, path=rel, metadata={"route": route, "framework": "nextjs"}))
+        graph.add_node(Node(page_id, "page", route, path=rel, metadata={"route": route, "framework": "nextjs",
+                                                                         **route_metadata(graph, page_id, declared)}))
         graph.add_edge(Edge(page_id, file_node, "IMPLEMENTED_BY", "exact", origin, origin="framework_path"))
         # The default export IS the page component. Reaching it only through the file's
         # CONTAINS edge made every page one expensive hop further from its data.
@@ -409,15 +433,15 @@ def _add_next_routes(state: ScanState, rel: str, path: Path, facts, file_node: s
         base = _next_router_base(state, parts, "app", lenient=True)
         if base is None:
             return
-        variants, catch_all = _next_route_variants(parts[base + 1:-1])
+        variants, catch_all, spelled = _next_route_variants(parts[base + 1:-1])
         if path.stem == "page":
-            for route in variants:
-                add_page(route, "next_app_router_path")
+            for route, declared in zip(variants, spelled):
+                add_page(route, "next_app_router_path", declared)
             return
         for public, local in sorted(facts.exports.items()):
             if public in _HTTP_HANDLER_NAMES:
-                for route in variants:
-                    add_endpoint(public, route, handler_target(local), "nextjs_app_router", catch_all)
+                for route, declared in zip(variants, spelled):
+                    add_endpoint(public, route, handler_target(local), "nextjs_app_router", catch_all, declared)
         return
     base = _next_router_base(state, parts, "pages", lenient=False)
     if base is None or "default" not in facts.exports:
@@ -427,14 +451,15 @@ def _add_next_routes(state: ScanState, rel: str, path: Path, facts, file_node: s
         return  # _app, _document, _error, _middleware: framework shells, not routes
     if segments[-1] == "index":
         segments = segments[:-1]
-    variants, catch_all = _next_route_variants(segments)
+    variants, catch_all, spelled = _next_route_variants(segments)
     if segments and segments[0] == "api":
         # A Pages Router API route is one default-export handler for every method.
-        for route in variants:
-            add_endpoint("ANY", route, handler_target(facts.exports["default"]), "nextjs_pages_router", catch_all)
+        for route, declared in zip(variants, spelled):
+            add_endpoint("ANY", route, handler_target(facts.exports["default"]), "nextjs_pages_router", catch_all,
+                         declared)
     else:
-        for route in variants:
-            add_page(route, "next_pages_router_path")
+        for route, declared in zip(variants, spelled):
+            add_page(route, "next_pages_router_path", declared)
 
 
 #: The `style` of a `ScanState.js_requests` entry that records a server route this scanner does not model.
@@ -467,10 +492,11 @@ def _add_route_registrations(state: ScanState, rel: str, facts, file_node: str, 
             what = "a NestJS controller route" if shape == "controller" else f"`{receiver}.{verb}()` on a router"
             unmodelled(what, line, method)
             continue
-        route = normalise_route(re.sub(r":([A-Za-z_]\w*)", r"{\1}", route))
+        declared, route = route, normalise_route(re.sub(r":([A-Za-z_]\w*)", r"{\1}", route))
         endpoint = _endpoint_id(method, route)
         graph.add_node(Node(endpoint, "endpoint", f"{method} {route}", path=rel, line=line, language=language,
-                            metadata={"method": method, "route": route, "framework": "javascript-server"}))
+                            metadata={"method": method, "route": route, "framework": "javascript-server",
+                                      **route_metadata(graph, endpoint, declared)}))
         graph.add_edge(Edge(endpoint, file_node, "HANDLES_API", "probable", f"{rel}:{line}", origin="tree-sitter",
                             detail=f"`{receiver}.{method.lower()}()` on a server this file starts; middleware unverified"))
     if routed:
@@ -1595,7 +1621,8 @@ def _scan_generic(state: ScanState, path: Path, text: str, file_node: str) -> No
             route_parts = [p for p in parts[app_index + 1:-1] if not (p.startswith("(") and p.endswith(")"))]
             route = "/" + "/".join(route_parts)
             page_id = stable_id("page", route)
-            state.graph.add_node(Node(page_id, "page", route, path=rel, metadata={"route": route}))
+            state.graph.add_node(Node(page_id, "page", route, path=rel,
+                                      metadata={"route": route, **route_metadata(state.graph, page_id, route)}))
             state.graph.add_edge(Edge(page_id, file_node, "IMPLEMENTED_BY", "exact", "next_app_router_path", origin="framework_path"))
         except ValueError:
             pass
@@ -1792,7 +1819,8 @@ def _load_routers(state: ScanState, payload: dict, configured: str, pattern_only
             endpoint_id = _endpoint_id(method, endpoint_path)
             state.graph.add_node(Node(
                 endpoint_id, "endpoint", f"{method} {endpoint_path}", path=router_path,
-                metadata={"method": method, "route": endpoint_path, "wired": router.get("wired")},
+                metadata={"method": method, "route": endpoint_path, "wired": router.get("wired"),
+                          **route_metadata(state.graph, endpoint_id, with_api_prefix(state, raw_path))},
             ))
             state.graph.add_edge(Edge(
                 endpoint_id, router_id, "IMPLEMENTED_BY", "declared", configured,

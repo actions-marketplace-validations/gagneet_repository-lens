@@ -65,6 +65,9 @@ class Symbol:
     #: `el.addEventListener("click", load)`): the top-level variable whose initializer holds
     #: the reference, or "" for any other position (a function body, a module statement).
     value_holders: list[str] = field(default_factory=list)
+    #: What receives an anonymous function, when the syntax says: the JSX attribute
+    #: (`onClick`) or the called function or method (`then`, `useEffect`). "" otherwise.
+    role: str = ""
 
 
 @dataclass
@@ -687,6 +690,24 @@ def parse_source(text: str, suffix: str) -> JSFacts:
         # calls being attributed to a neighbouring top-level function.
         return name or f"anonymous@{node.start_point.row + 1}:{node.start_point.column}", "function"
 
+    def callback_role(node) -> str:
+        """`onClick` for `<button onClick={() => …}>`, `then` for `p.then(() => …)`, else ""."""
+        parent = node.parent
+        while parent is not None and parent.type == "parenthesized_expression":
+            parent = parent.parent
+        if parent is None or parent.parent is None:
+            return ""
+        if parent.type == "jsx_expression" and parent.parent.type == "jsx_attribute":
+            name = next((c for c in parent.parent.named_children if c.type == "property_identifier"), None)
+            return value(name) if name is not None else ""
+        if parent.type == "arguments" and parent.parent.type == "call_expression":
+            function = parent.parent.child_by_field_name("function")
+            if function is not None and function.type == "member_expression":
+                return value(function.child_by_field_name("property"))
+            if function is not None and function.type == "identifier":
+                return value(function)
+        return ""
+
     def export_status(node) -> tuple[bool, bool]:
         current = node.parent
         if current is not None and current.type == "arguments" and current.parent is not None \
@@ -727,7 +748,8 @@ def parse_source(text: str, suffix: str) -> JSFacts:
             exported, default_export = export_status(node)
             facts.symbols.append(Symbol(name, qualified, node.start_point.row + 1, node.end_point.row + 1,
                                         node.start_byte, node.end_byte, symbol_kind, exported,
-                                        any(c.type == "async" for c in node.children), default_export))
+                                        any(c.type == "async" for c in node.children), default_export,
+                                        role=callback_role(node) if name.startswith("anonymous@") else ""))
             child_scope, child_owner = (*scope, name), qualified
         elif node.type == "variable_declarator":
             # `export const api = { list: () => fetch(...) }`: members are `api.list`,

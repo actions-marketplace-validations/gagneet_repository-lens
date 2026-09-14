@@ -124,6 +124,52 @@ def normalise_route(route: str) -> str:
     return route or "/"
 
 
+#: A whole-segment route parameter: Next.js `[id]`, `[...slug]`, `[[...slug]]`; Express/Hono `:id`, `:id?`,
+#: `:id(\\d+)`, `:id{[0-9]+}`.
+_BRACKET_PARAMETER = re.compile(r"^\[\[?(?:\.\.\.)?([^\[\]]+)\]\]?$")
+_COLON_PARAMETER = re.compile(r"^:([A-Za-z_$][\w$]*)(?:\([^/]*\)|\{[^/]*\})?\??$")
+#: A parameter inside a segment: FastAPI/OpenAPI `{file_path:path}` (converter dropped), or Express
+#: `:from-:to` and `:name.:ext`. A colon after a letter (`/v1:batch`, a custom method) stays text.
+_SEGMENT_PARAMETER = re.compile(r"\{([A-Za-z_][\w-]*)(?::[^{}]*)?\}|(?<![^-.]):([A-Za-z_]\w*)")
+
+
+def route_path_and_parameters(route: str) -> tuple[str, list[str]]:
+    """The declared route in OpenAPI spelling with the source's parameter names, and those names in order.
+
+    `/api/orders/[orderId]` -> (`/api/orders/{orderId}`, ["orderId"]); `/files/{file_path:path}` ->
+    (`/files/{file_path}`, ["file_path"]). Unlike `normalise_route`, names are kept: this is for
+    documentation, never for matching."""
+    names: list[str] = []
+    parts: list[str] = []
+
+    def inline(match: re.Match[str]) -> str:
+        names.append(match.group(1) or match.group(2))
+        return "{" + names[-1] + "}"
+
+    for segment in route.strip().split("/"):
+        if not segment:
+            continue
+        whole = _BRACKET_PARAMETER.match(segment) or _COLON_PARAMETER.match(segment)
+        if whole:
+            names.append(whole.group(1).strip())
+            parts.append("{" + names[-1] + "}")
+        else:
+            parts.append(_SEGMENT_PARAMETER.sub(inline, segment))
+    return "/" + "/".join(parts), names
+
+
+def route_metadata(graph: Graph, node_id: str, declared: str) -> dict:
+    """`path` and `parameters` for an endpoint or page node; empty when the node already has a path.
+
+    Two declarations that differ only in parameter spelling share one node id, and the first
+    declaration read keeps its names."""
+    existing = graph.nodes.get(node_id)
+    if existing is not None and "path" in existing.metadata:
+        return {}
+    path, parameters = route_path_and_parameters(declared)
+    return {"path": path, "parameters": parameters}
+
+
 def _add_store_edge(
     graph: Graph, source: str, kind: str, name: str, resolution: str, evidence: str,
     *, detail: str | None = None, origin: str = "syntax", metadata: dict | None = None,
