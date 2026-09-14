@@ -49,8 +49,28 @@ from ..featuretrace.model import MARKER_PREFIXES, MARKER_RE
 from .settings import LensSettings, from_config
 
 _LAYER_RE = re.compile(r"^\s*(?:#|//|\*)?\s*Layer:\s*(.+?)\s*$", re.M)
+_FUNCTION_LENS_RE = re.compile(r"^\s*(?://|#)\s*@functionlens:([A-Za-z][A-Za-z0-9_.-]*)\s*$")
 _HEAD_CHARS = 4000
 _HTTP_VERBS = {"get", "post", "put", "patch", "delete", "head", "options"}
+
+
+def _source_id(text: str, lineno: int) -> str | None:
+    """A Function Lens id attached to a declaration, without parsing or executing code.
+
+    Comments and decorators immediately above the declaration belong to it. A blank line or code
+    stops the search, which prevents an id on the preceding function from leaking forward.
+    """
+    lines = text.splitlines()
+    for line in reversed(lines[max(0, lineno - 13):max(0, lineno - 1)]):
+        stripped = line.strip()
+        if match := _FUNCTION_LENS_RE.match(stripped):
+            return match.group(1)
+        if not stripped:
+            break
+        if stripped.startswith(("//", "#", "/*", "*", "*/", "@")):
+            continue
+        break
+    return None
 
 #: Frontend declarations. Deliberately shallow — see the module docstring.
 _JS_DECL_RE = re.compile(
@@ -75,6 +95,8 @@ def limits(s: LensSettings) -> list[str]:
         "untested_upper_bound counts functions no test NAMES - not uncovered code.",
         ("postgres_tables adds the table of every ORM class (__tablename__) a function "
          "NAMES, matched by class name: two classes sharing a name share their tables."),
+        ("source_id is present only when an attached @functionlens comment declares it. It is a navigation "
+         "identity, not evidence about behavior; source_id_duplicate reports a copied id."),
         *s.extra_limits,
     ]
     if s.owners_yaml:
@@ -303,9 +325,10 @@ def _mongo_collections(s: LensSettings, node: ast.AST) -> list[str]:
 def _extract_python(s: LensSettings, path: Path, module_tags: list[str],
                     layer: str | None, orm: dict[str, set[str]] | None = None) -> list[dict[str, Any]]:
     try:
+        text = read_text(path)
         with warnings.catch_warnings():  # target code's own SyntaxWarnings are not ours to print
             warnings.simplefilter("ignore")
-            tree = ast.parse(read_text(path))
+            tree = ast.parse(text)
     except (SyntaxError, OSError, ValueError, RecursionError):
         return []
     if orm is not None:
@@ -339,6 +362,7 @@ def _extract_python(s: LensSettings, path: Path, module_tags: list[str],
                     "is_async": isinstance(child, ast.AsyncFunctionDef),
                     "is_private": child.name.startswith("_"),
                     "purpose": purpose,
+                    "source_id": _source_id(text, child.lineno),
                     "feature_tags": module_tags,
                     "layer": layer,
                     "routes": _decorator_route(child),
@@ -375,6 +399,7 @@ def _extract_frontend(s: LensSettings, path: Path, module_tags: list[str],
                 "qualname": symbol.qualified, "language": language, "lineno": symbol.line,
                 "is_async": symbol.is_async, "is_private": symbol.name.startswith("_"),
                 "purpose": "", "feature_tags": module_tags, "layer": layer, "routes": [],
+                "source_id": _source_id(text, symbol.line),
                 # JSX renders are recorded beside calls; a rendered component is not a callee.
                 "callees": sorted({called.rsplit(".", 1)[-1] for owner, called, _line, kind in facts.calls
                                    if owner == symbol.qualified and kind == "CALLS"}),
@@ -397,6 +422,7 @@ def _extract_frontend(s: LensSettings, path: Path, module_tags: list[str],
             "is_async": False,
             "is_private": name.startswith("_"),
             "purpose": "",
+            "source_id": _source_id(text, text.count("\n", 0, m.start()) + 1),
             "feature_tags": module_tags,
             "layer": layer,
             "routes": [],
@@ -479,8 +505,11 @@ def build(s: LensSettings, with_churn: bool = False) -> dict[str, Any]:
 
     # Name -> definitions, for the caller edges. Name-based by design.
     by_name: dict[str, list[str]] = defaultdict(list)
+    by_source_id: dict[str, list[str]] = defaultdict(list)
     for rec in records:
         by_name[rec["name"]].append(rec["key"])
+        if rec.get("source_id"):
+            by_source_id[rec["source_id"]].append(rec["key"])
 
     callers: dict[str, set[str]] = defaultdict(set)
     for rec in records:
@@ -506,6 +535,7 @@ def build(s: LensSettings, with_churn: bool = False) -> dict[str, Any]:
             "blast_radius": len(callers.get(key, ())),
             "homonyms": homonyms,
             "edges_ambiguous": homonyms > 1,
+            "source_id_duplicate": bool(rec.get("source_id") and len(by_source_id[rec["source_id"]]) > 1),
             "canonical": {
                 "owns": owns.get(f"{rec['path']}::{rec['name']}"),
                 "violates": violates.get(f"{rec['path']}:{rec['name']}"),
@@ -526,13 +556,15 @@ def build(s: LensSettings, with_churn: bool = False) -> dict[str, Any]:
         "counts": {
             "total": len(index),
             "python": sum(1 for r in index.values() if r["language"] == "python"),
-            "javascript": sum(1 for r in index.values() if r["language"] == "javascript"),
+            "javascript": sum(1 for r in index.values() if r["language"] != "python"),
             "routed": sum(1 for r in index.values() if r["routes"]),
             "guarded": sum(1 for r in index.values() if r["guards"]),
             # An UPPER BOUND on genuinely untested functions.
             "untested_upper_bound": sum(1 for r in index.values() if not r["tests"]),
             "tests_name_ambiguous": sum(1 for r in index.values() if r["tests_ambiguous"]),
             "ambiguous_edges": sum(1 for r in index.values() if r["edges_ambiguous"]),
+            "stable_ids": sum(1 for r in index.values() if r.get("source_id")),
+            "duplicate_stable_ids": len([stable_id for stable_id, keys in by_source_id.items() if len(keys) > 1]),
         },
         "limits": limits(s),
         "functions": index,
@@ -660,10 +692,13 @@ def load_index(s: LensSettings) -> dict[str, Any]:
 # ── Lookup ───────────────────────────────────────────────────────────────────
 
 def lookup(data: dict[str, Any], query: str, limit: int = 12) -> list[dict[str, Any]]:
-    """Find functions by exact key, exact name, then substring — in that order."""
+    """Find functions by exact key, stable source id, exact name, then substring."""
     fns = data["functions"]
     if query in fns:
         return [fns[query]]
+    stable = [r for r in fns.values() if r.get("source_id") == query]
+    if stable:
+        return stable[:limit]
     exact = [r for r in fns.values() if r["name"] == query or r["qualname"] == query]
     if exact:
         return exact[:limit]
@@ -682,6 +717,9 @@ def render_lens(rec: dict[str, Any]) -> str:
     L.append(f"  Purpose      {rec['purpose'] or '(no docstring — generated header or none)'}")
     L.append(f"  Location     {rec['path']}:{rec['lineno']}"
              f"  [{rec['language']}{', async' if rec['is_async'] else ''}]")
+    if rec.get("source_id"):
+        suffix = "  !! DUPLICATE" if rec.get("source_id_duplicate") else ""
+        L.append(f"  Stable id    {rec['source_id']}{suffix}")
     if rec.get("layer") or rec.get("feature_tags"):
         L.append(f"  Feature      {', '.join(rec['feature_tags']) or '(untagged)'}"
                  f"   Layer: {rec.get('layer') or '(none)'}")
@@ -768,7 +806,8 @@ def render_html(data: dict[str, Any], content_sha: str = "", s: LensSettings | N
 <h1>{title}</h1>
 <p>Content <code>{content_sha[:12] or 'unknown'}</code> —
  <b>{c['total']}</b> functions ({c['python']} python, {c['javascript']} frontend);
- {c['routed']} routed, {c['guarded']} guarded, <b>{c['untested_upper_bound']}</b> with no test naming them.</p>
+ {c['routed']} routed, {c['guarded']} guarded, {c.get('stable_ids', 0)} stable ids,
+ <b>{c['untested_upper_bound']}</b> with no test naming them.</p>
 <div class="warn"><b>Read the limits before citing a number:</b><ul>{limits_html}</ul></div>
 <p>Showing the {len(interesting)} routed / guarded / canonical-owner functions,
  highest blast radius first. Full data: <code>{full}</code>,
@@ -858,5 +897,6 @@ def main(argv: list[str] | None = None, *, config: Config | None = None,
         print(f"  wrote {s.rel(s.out_html)}")
     c = data["counts"]
     print(f"  {c['total']} functions — {c['python']} python, {c['javascript']} frontend, "
-          f"{c['routed']} routed, {c['guarded']} guarded, {c['untested_upper_bound']} with no test naming them")
+          f"{c['routed']} routed, {c['guarded']} guarded, {c.get('stable_ids', 0)} stable ids "
+          f"({c.get('duplicate_stable_ids', 0)} duplicate), {c['untested_upper_bound']} with no test naming them")
     return 0

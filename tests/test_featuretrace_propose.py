@@ -207,6 +207,41 @@ class ProposeTests(unittest.TestCase):
         result = javascript_file("app/api/orders/route.ts", text, docs_settings(load_config(self.root)))
         self.assertEqual({s.name: s.documented for s in result.symbols}, {"GET": False, "POST": False})
 
+    def test_function_lens_ids_are_reviewed_comments_and_survive_a_symbol_rename(self):
+        self.write("repolens.toml", '[lens]\nfrontend_roots = ["app", "lib"]\n'
+                                    'javascript_parser = "tree-sitter"\n')
+        code, output = self.draft("--jsdoc", "--function-lens")
+        self.assertEqual(code, 0, output)
+        payload = self.proposal()
+        orders = next(item for item in payload["files"] if item["path"] == "lib/orders.ts")
+        annotated = {item["symbol"]: item["id"] for item in orders["function_lens"]}
+        self.assertEqual(set(annotated), {"listOrders", "getOrder", "createOrder"})
+        self.assertIn(f"// @functionlens:{annotated['listOrders']}", self.patch())
+        self.assertIn(f"+// @functionlens:{annotated['listOrders']}\n+/**", self.patch())
+        self.assertIn("+ */\n export async function listOrders", self.patch())
+        self.assertNotIn("@functionlens", self.text("lib/orders.ts"), "drafting remains read-only")
+
+        code, output = self.apply("--allow-dirty")
+        self.assertEqual(code, 0, output)
+        path = self.root / "lib/orders.ts"
+        path.write_text(path.read_text(encoding="utf-8").replace("function listOrders", "function loadOrders"),
+                        encoding="utf-8")
+        from repolens.lens.build import build, lookup
+        from repolens.lens.settings import from_config as lens_settings
+        data = build(lens_settings(load_config(self.root)))
+        [renamed] = lookup(data, annotated["listOrders"])
+        self.assertEqual((renamed["name"], renamed["source_id"]), ("loadOrders", annotated["listOrders"]))
+
+    def test_a_tampered_function_lens_entry_cannot_insert_code(self):
+        self.draft("--function-lens")
+        payload = self.proposal()
+        item = next(item for item in payload["files"] if item["function_lens"])
+        item["function_lens"][0]["lines"] = ["process.exit(1);"]
+        (self.root / OUT / "proposal.json").write_text(json.dumps(payload), encoding="utf-8")
+        code, output = self.apply("--allow-dirty")
+        self.assertEqual(code, 2)
+        self.assertIn("Function Lens id line is not a comment", output)
+
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
     def test_the_owners_draft_validates_and_stays_out_of_the_repository(self):
         import yaml

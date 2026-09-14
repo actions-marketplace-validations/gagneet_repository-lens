@@ -88,8 +88,27 @@ class FrontendExtractionTests(unittest.TestCase):
             settings = from_config(load_config(root))
             data = build(settings)
             self.assertIn("web/page.tsx::Page", json.dumps(data))
+            self.assertEqual(data["counts"]["javascript"], 2)
             [page] = [r for r in _extract_frontend(settings, root / "web" / "page.tsx", [], None) if r["name"] == "Page"]
             self.assertEqual((page["extraction"], page["callees"]), ("tree-sitter", ["load"]))
+
+    def test_stable_comment_ids_are_indexed_and_duplicates_are_visible(self):
+        from repolens.lens.build import build, lookup
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repolens.toml").write_text('[lens]\nfrontend_roots = ["web"]\n'
+                                                'javascript_parser = "tree-sitter"\n', encoding="utf-8")
+            (root / "web").mkdir()
+            (root / "web" / "a.ts").write_text(
+                "// @functionlens:fn-orders-list\nexport function renamedOrders() { return []; }\n"
+                "// @functionlens:fn-orders-list\nexport function copiedOrders() { return []; }\n",
+                encoding="utf-8")
+            data = build(from_config(load_config(root)))
+        self.assertEqual(data["counts"]["stable_ids"], 2)
+        self.assertEqual(data["counts"]["duplicate_stable_ids"], 1)
+        self.assertEqual({item["name"] for item in lookup(data, "fn-orders-list")},
+                         {"renamedOrders", "copiedOrders"})
+        self.assertTrue(all(item["source_id_duplicate"] for item in lookup(data, "fn-orders-list")))
 
 
 class JavascriptParserSettingTests(unittest.TestCase):

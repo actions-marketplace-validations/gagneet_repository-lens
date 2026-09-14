@@ -38,8 +38,9 @@ repolens docs generate                 # writes .repolens/docs-generated/
 | `openapi.json` | OpenAPI 3.1 for the application's own routes, with source parameter names (`/api/orders/{orderId}`). Each operation names its handler, callers, stores and feature group. Every part the source does not declare is listed in `x-repolens-gaps` instead of being guessed; declared FastAPI models are named, not expanded. A route a generated router artifact declares is an operation with resolution `declared` and the gap "handler declared by an artifact, not scanned". Calls nobody serves are in `x-repolens-unserved-calls`; a call the scanner matched to a declared route is listed as that operation's caller, and calls from test code are not callers. Stores are those the handler reaches through import-bound or exact calls, never a name-only guess. A Pages Router API route answers every method, so it is under the path-item extension `x-repolens-any-method`, which Swagger UI and client generators do not show. |
 | `schema.md`, `schema.mmd` | A Mermaid ER diagram of declared tables, columns and foreign keys, with MongoDB collections marked as having no inferred fields. SQL files apply in path order (how numbered migrations sort), so a later `DROP TABLE`, `DROP COLUMN`, `RENAME` or `SET NOT NULL` changes the drawing; a dropped constraint does not, and `public.orders` and `orders` are drawn as two tables. A foreign key shows "exactly one" parent only when its columns are `NOT NULL`. Tables with columns or foreign keys are drawn first; past 150 entities the rest are counted by kind, and `schema.md` lists every store with whether it was drawn, and the tables a later statement dropped or renamed. |
 | `architecture.md`, `architecture.mmd` | Pages and clients, API, code and stores, one node per feature group. At most `--max-groups` groups (default 40), 60 stores (the ones most groups share) and 450 edges are drawn, because Mermaid refuses a flowchart with more than 500 edges; a comment counts what was left out. |
-| `features/<group>.md` | A mindmap (at most 25 leaves per section) and complete evidence tables for one route area, including its diagnostics and what the source cannot tell you. |
-| `features/<group>.context.json` | The same facts as data, for a person or an agent to write prose from. |
+| `debugging.md` | A repository-wide starting point for static debugging, linked to the exact caller, handler and store candidates on each feature page, plus guidance for bounded runtime telemetry when static evidence is insufficient. It installs no instrumentation. |
+| `features/<group>.md` | A mindmap (at most 25 leaves per section), evidence tables and an endpoint-by-endpoint debugging chain for one route area, including its diagnostics and what the source cannot tell you. |
+| `features/<group>.context.json` | The same facts as data, including structured debugging trace points and safe runtime fields, for a person or an agent to write prose or instrumentation from. |
 | `index.md` | Whether the analysis was complete, and the limits of each output. |
 
 A feature group is a route area named by its first path segment (`/orders` and
@@ -52,12 +53,13 @@ first line of a Markdown page, the last line of a Mermaid file, the build field 
 `repolens api export` is a different command: it documents Repository Lens's own local API,
 not the scanned application.
 
-## 3. Put FeatureTrace markers and JSDoc into the code
+## 3. Put FeatureTrace markers, Function Lens ids and JSDoc into the code
 
 ```bash
-repolens featuretrace propose --jsdoc --owners
+repolens featuretrace propose --jsdoc --function-lens --owners
 # review .repolens/featuretrace-proposal/proposal.patch and proposal.json
-repolens featuretrace propose --jsdoc --tag orders=order-management --apply
+repolens featuretrace propose --jsdoc --function-lens --tag orders=order-management
+repolens featuretrace propose --apply
 repolens featuretrace audit
 repolens featuretrace map order-management --out docs/featuretrace
 ```
@@ -91,8 +93,15 @@ handlers or data access of its own gets none. Each block starts with
 `[docs] placeholder_patterns` entry, whatever the repository lists, so `repolens docs coverage`
 keeps counting the symbol as undocumented until a person writes the purpose.
 
+With `--function-lens` it drafts a one-line `@functionlens:` id on public route handlers,
+functions that call an API or touch a store, and exported frontend entry functions. The id is
+created from the original path and symbol, then read from the comment thereafter; keep the comment
+with the declaration and Function Lens can find it after a rename or move. Duplicate ids are
+reported in the index. The comment stores identity only, not inferred callers or data flow, so
+changing code does not leave derived claims behind. It is a comment and has no runtime behavior.
+
 `--apply` writes the `proposal.json` you reviewed. It never drafts again, and it takes no `--tag`,
-`--only`, `--jsdoc` or `--owners`: tags are fixed when you draft.
+`--only`, `--jsdoc`, `--function-lens` or `--owners`: tags and symbol ids are fixed when you draft.
 
 It refuses the whole run (exit 2) when:
 - there is no proposal;
@@ -118,9 +127,10 @@ JSON graph (`featuretrace map --index` lists every tag).
 
 ## 4. Function Lens and capability owners
 
-Function Lens needs no markers in the code: `repolens lens` builds a function index the
-repository commits, and `repolens lens similar --clusters` lists groups of functions that may
-re-implement each other, for a person to review. `--owners` above writes `canonical_owners.draft.yaml` into the
+Function Lens still needs no markers: `repolens lens` builds a function index the repository
+commits, and `repolens lens similar --clusters` lists groups of functions that may re-implement
+each other, for a person to review. Optional `@functionlens:` ids give important boundary
+functions a durable lookup key; use `repolens lens --lookup <id>` after a rename. `--owners` above writes `canonical_owners.draft.yaml` into the
 proposal directory only, never into the repository: one concept per table or collection, with at
 most 10 consumers listed. The suggested owner is the application file outside route handlers that
 references it most, preferring files outside `scripts/`, `migrations/`, `tools/` and `vendor/`. Who
