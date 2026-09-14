@@ -8,9 +8,17 @@ Four shapes that cost every concurrent request and pass every functional test:
                            rows, a memory spike at ten thousand, and the rows grow.
   unbounded-sql-fetch      the PostgreSQL form of the same: asyncpg `fetch()` of a
                            SELECT with no LIMIT, or SQLAlchemy `.all()` / `.fetchall()`
-                           on a `select()` that never gets `.limit()`. Low confidence: a
-                           lookup by primary key returns one row either way.
-  query-in-loop            an awaited database call inside a loop is N+1 round trips.
+                           on a `select()` that never gets `.limit()` (also SQLModel's
+                           `session.exec(select(...)).all()`, the legacy
+                           `db.query(Model).all()`, and a result held in a name first:
+                           `result = await session.execute(stmt)`, `result.scalars().all()`).
+                           Low confidence: a lookup by primary key returns one row either way.
+  query-in-loop            a database call inside a loop is N+1 round trips: awaited in an
+                           async function, or on a database-looking receiver (`db`,
+                           `session`, `cur`) in a sync one, where no `await` marks I/O.
+
+Call names are matched after import aliases are resolved: `import requests as rq`
+makes `rq.get` requests.get, and `from time import sleep` makes `sleep` time.sleep.
 
 What this cannot see: whether an index exists, how many rows a filter matches, or what
 a query costs. Those need the database (`explain()`, `$indexStats`, pg_stat_statements).
@@ -19,21 +27,23 @@ from __future__ import annotations
 
 import ast
 import re
+from collections import defaultdict
 
 from ..core.findings import Finding
-from .mounts import MountIndex
+from .mounts import mount_index
 from .python_ast import (
+    FunctionNode,
     Mount,
     dotted,
     functions,
     last,
-    parse,
-    python_files,
+    parsed_files,
     routes,
     walk_body,
 )
+from .security import TOO_DEEP, could_not_scan
 from .settings import ScanSettings
-from .wiring import mark_unreachable, unreachable_route_files
+from .wiring import mark, route_exposure
 
 TOOL = "performance"
 _LOOPS = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
@@ -129,21 +139,53 @@ def _statement_values(fn: ast.AST, stmt: ast.AST) -> list[ast.AST]:
     return _assigned(fn, stmt.id) if isinstance(stmt, ast.Name) else [stmt]
 
 
-def _is_unbounded_sql_fetch(fn: ast.AST, call: ast.Call) -> bool:
-    """asyncpg `conn.fetch(<SELECT with no LIMIT>)`, or SQLAlchemy `.all()`/`.fetchall()`
-    on the result of executing such a SELECT or a `select()` with no `.limit()`."""
+#: Calls that run a statement handed to them as the first argument.
+_EXECUTES = frozenset({"execute", "scalars", "exec"})
+#: On the query itself, any of these bounds the rows fetched.
+_ROW_BOUNDS = frozenset({"limit", "slice", "first", "one", "one_or_none", "fetchmany", "paginate"})
+#: Everyday method names that are a round trip only on a database-looking receiver.
+_SESSION_METHODS = frozenset({"get", "exec", "query"})
+
+
+def _chain_root(call: ast.Call) -> ast.AST:
+    """What a method chain starts from, through calls and awaits:
+    `result.scalars().all()` -> the Name `result`."""
+    node: ast.AST = call.func
+    while isinstance(node, (ast.Attribute, ast.Await, ast.Call)):
+        node = node.func if isinstance(node, ast.Call) else node.value
+    return node
+
+
+def _db_receiver(call: ast.Call, pattern: re.Pattern[str]) -> bool:
+    """Whether a method is called on something spelled like a database handle: `db.get`,
+    `self.session.exec`, `db.users.find_one`. A call's result (`x().get`) is not one."""
     if not isinstance(call.func, ast.Attribute):
-        return False  # the builtin all() is not a query
-    method = call.func.attr
-    if method == "fetch" and call.args:
-        texts = [_sql_literal(v) for v in _statement_values(fn, call.args[0])]
-        return bool(texts) and all(t is not None and _unbounded_select(t) for t in texts)
-    if method not in ("all", "fetchall") or call.args:
         return False
-    executed = next((c for c in _receivers(call)
-                     if last(c.func) in ("execute", "scalars") and c.args), None)
+    return any(pattern.search(part) for part in dotted(call.func.value).split(".")
+               if part and part not in ("self", "cls"))
+
+
+def _round_trip(call: ast.Call, methods: frozenset[str], pattern: re.Pattern[str], *,
+                receiver_required: bool) -> bool:
+    """Whether `call` is a database round trip. `session.get(Item, i)` is one;
+    `request.session.get("user", None)` and `self.session.get(url)` (requests) are not:
+    SQLAlchemy's get takes an entity and a key, and an entity is not a literal."""
+    name = last(call.func)
+    if name in _SESSION_METHODS:
+        if not (call.args and _db_receiver(call, pattern)):
+            return False
+        return name != "get" or (len(call.args) >= 2 and not isinstance(call.args[0], ast.Constant))
+    return name in methods and (not receiver_required or _db_receiver(call, pattern))
+
+
+def _unbounded_chain(fn: ast.AST, chain: list[ast.Call], pattern: re.Pattern[str]) -> bool:
+    """Whether the calls under a terminal `.all()` fetch every row of an unbounded query."""
+    if {last(c.func) for c in chain} & _ROW_BOUNDS:
+        return False
+    executed = next((c for c in chain if last(c.func) in _EXECUTES and c.args), None)
     if executed is None:
-        return False
+        # `db.query(Item).filter(...).all()`: the chain IS the query.
+        return any(last(c.func) == "query" and c.args and _db_receiver(c, pattern) for c in chain)
     values = _statement_values(fn, executed.args[0])
     if not values:
         return False
@@ -152,6 +194,34 @@ def _is_unbounded_sql_fetch(fn: ast.AST, call: ast.Call) -> bool:
         return all(t is None or _unbounded_select(t) for t in texts)
     built = {last(sub.func) for v in values for sub in ast.walk(v) if isinstance(sub, ast.Call)}
     return "select" in built and not built & {"limit", "fetch", "slice"}
+
+
+def _is_unbounded_sql_fetch(fn: ast.AST, call: ast.Call,
+                            pattern: re.Pattern[str] | None = None) -> bool:
+    """asyncpg `conn.fetch(<SELECT with no LIMIT>)`, or SQLAlchemy/SQLModel `.all()` /
+    `.fetchall()` on the result of executing such a SELECT, a `select()` with no
+    `.limit()`, or a `db.query(Model)` with none."""
+    pattern = pattern or re.compile(r"(?!)")
+    if not isinstance(call.func, ast.Attribute):
+        return False  # the builtin all() is not a query
+    method = call.func.attr
+    if method == "fetch" and call.args:
+        texts = [_sql_literal(v) for v in _statement_values(fn, call.args[0])]
+        return bool(texts) and all(t is not None and _unbounded_select(t) for t in texts)
+    if method not in ("all", "fetchall") or call.args:
+        return False
+    chain = _receivers(call)
+    if any(last(c.func) in _EXECUTES and c.args or last(c.func) == "query" for c in chain):
+        return _unbounded_chain(fn, chain, pattern)
+    root = _chain_root(call)
+    if not isinstance(root, ast.Name):
+        return False
+    # `result = await session.execute(stmt)` then `result.scalars().all()`: the query is
+    # one statement up. Every value the name takes must be such a query.
+    values = [v.value if isinstance(v, ast.Await) else v for v in _assigned(fn, root.id)]
+    return bool(values) and all(
+        isinstance(v, ast.Call) and _unbounded_chain(fn, [*chain, v, *_receivers(v)], pattern)
+        for v in values)
 
 
 def _per_item(loop: ast.AST) -> list[ast.AST]:
@@ -168,9 +238,14 @@ def _per_item(loop: ast.AST) -> list[ast.AST]:
     return parts
 
 
-def _loop_awaits(fn: ast.AsyncFunctionDef, db_methods: frozenset[str]) -> list[tuple[ast.Await, str]]:
-    """Awaited DB calls inside a loop body in `fn` (not in nested functions)."""
-    found: dict[int, tuple[ast.Await, str]] = {}
+def _loop_round_trips(fn: FunctionNode, methods: frozenset[str],
+                      pattern: re.Pattern[str]) -> list[tuple[ast.AST, str]]:
+    """Database calls inside a loop body in `fn` (not in nested functions): awaited ones
+    in an async function; in a sync one, calls on a database-looking receiver
+    (`for i in ids: db.query(Item).filter(...).first()`), where nothing else says the
+    call does I/O."""
+    is_async = isinstance(fn, ast.AsyncFunctionDef)
+    found: dict[int, tuple[ast.AST, str]] = {}
     for loop in walk_body(fn):
         if not isinstance(loop, _LOOPS):
             continue
@@ -179,12 +254,44 @@ def _loop_awaits(fn: ast.AsyncFunctionDef, db_methods: frozenset[str]) -> list[t
             node = stack.pop()
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                 continue
-            if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-                hit = next((last(c.func) for c in _call_chain(node.value) if last(c.func) in db_methods), None)
+            call = node.value if is_async and isinstance(node, ast.Await) else node if not is_async else None
+            if isinstance(call, ast.Call):
+                chain = _call_chain(call)
+                hit = next((last(c.func) for c in chain
+                            if _round_trip(c, methods, pattern, receiver_required=not is_async)), None)
                 if hit:
                     found[id(node)] = (node, hit)
+                    if not is_async:
+                        # One chain is one round trip: only its arguments may hold another.
+                        stack.extend(v for c in chain for v in [*c.args, *(k.value for k in c.keywords)])
+                        continue
             stack.extend(ast.iter_child_nodes(node))
     return sorted(found.values(), key=lambda pair: pair[0].lineno)
+
+
+def _import_targets(tree: ast.Module) -> dict[str, str]:
+    """Local name -> the dotted name it stands for: `import requests as rq` -> rq:
+    requests, `from time import sleep` -> sleep: time.sleep. A name imported from two
+    places is left out, since which one a call uses depends on the line."""
+    bound: dict[str, set[str]] = defaultdict(set)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    bound[alias.asname].add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                bound[alias.asname or alias.name].add(f"{node.module}.{alias.name}")
+    return {name: next(iter(targets)) for name, targets in bound.items() if len(targets) == 1}
+
+
+def _qualified(func: ast.AST, imports: dict[str, str]) -> str:
+    name = dotted(func)
+    head, _, rest = name.partition(".")
+    target = imports.get(head)
+    if not target:
+        return name
+    return f"{target}.{rest}" if rest else target
 
 
 def _file_findings(s: ScanSettings, rel: str, tree: ast.Module,
@@ -192,6 +299,7 @@ def _file_findings(s: ScanSettings, rel: str, tree: ast.Module,
     perf = s.performance
     exposure = "internal" if s.is_internal(rel) else ""
     route_nodes = {id(r.node): r for r in routes(tree, mounts)}
+    imports = _import_targets(tree)
     findings: list[Finding] = []
     for fn, qualname in functions(tree):
         route = route_nodes.get(id(fn))
@@ -199,26 +307,31 @@ def _file_findings(s: ScanSettings, rel: str, tree: ast.Module,
 
         if isinstance(fn, ast.AsyncFunctionDef):
             for node in walk_body(fn):
-                if isinstance(node, ast.Call) and dotted(node.func) in perf.blocking_calls:
+                if not isinstance(node, ast.Call):
+                    continue
+                spelled, called = dotted(node.func), _qualified(node.func, imports)
+                if spelled in perf.blocking_calls or called in perf.blocking_calls:
+                    shown = spelled if spelled == called else f"{spelled} ({called})"
                     findings.append(Finding(
                         tool=TOOL, rule="performance/blocking-call-in-async",
                         severity="high" if route else "medium", confidence="high",
                         category="performance", exposure=exposure, file=rel, line=node.lineno,
-                        message=f"{where} calls {dotted(node.func)} on the event loop",
+                        message=f"{where} calls {shown} on the event loop",
                         remedy="Await an async client (httpx.AsyncClient, aiosmtplib, "
                                "asyncio.sleep, asyncio.create_subprocess_exec), or move the "
                                "call into a sync helper run with `await asyncio.to_thread(...)`.",
                     ))
-            for node, method in _loop_awaits(fn, perf.db_methods):
-                findings.append(Finding(
-                    tool=TOOL, rule="performance/query-in-loop",
-                    severity="medium" if route else "low", confidence="medium",
-                    category="performance", exposure=exposure, file=rel, line=node.lineno,
-                    message=f"{where} awaits {method}() inside a loop — one round trip per item (N+1)",
-                    remedy="Collect the keys and query once ({'$in': ids} / WHERE id = ANY($1)), "
-                           "or use a bulk write; if the calls are independent and few, "
-                           "asyncio.gather with a bounded semaphore.",
-                ))
+        verb = "awaits" if isinstance(fn, ast.AsyncFunctionDef) else "calls"
+        for node, method in _loop_round_trips(fn, perf.db_methods, perf.db_receiver):
+            findings.append(Finding(
+                tool=TOOL, rule="performance/query-in-loop",
+                severity="medium" if route else "low", confidence="medium",
+                category="performance", exposure=exposure, file=rel, line=node.lineno,
+                message=f"{where} {verb} {method}() inside a loop — one round trip per item (N+1)",
+                remedy="Collect the keys and query once ({'$in': ids} / WHERE id = ANY($1), "
+                       "select(...).where(Model.id.in_(ids))), or use a bulk write; if the "
+                       "calls are independent and few, asyncio.gather with a bounded semaphore.",
+            ))
 
         for node in walk_body(fn):
             if isinstance(node, ast.Call) and _is_unbounded_to_list(node):
@@ -231,7 +344,7 @@ def _file_findings(s: ScanSettings, rel: str, tree: ast.Module,
                            "fields used, or aggregate server-side ($group/$count) when only "
                            "a total is needed.",
                 ))
-            elif isinstance(node, ast.Call) and _is_unbounded_sql_fetch(fn, node):
+            elif isinstance(node, ast.Call) and _is_unbounded_sql_fetch(fn, node, perf.db_receiver):
                 findings.append(Finding(
                     tool=TOOL, rule="performance/unbounded-sql-fetch",
                     severity="medium" if route else "low", confidence="low",
@@ -246,16 +359,19 @@ def _file_findings(s: ScanSettings, rel: str, tree: ast.Module,
 
 
 def scan(s: ScanSettings) -> list[Finding]:
-    dead = unreachable_route_files(s)
-    mounts = MountIndex(s)
+    """Performance findings for every scanned Python file, demoted by reachability.
+
+    A file that cannot be analysed yields a could-not-scan finding instead."""
+    reach = route_exposure(s)
+    mounts = mount_index(s)
     findings: list[Finding] = []
-    for path in python_files(s):
-        tree = parse(str(path), s.max_file_bytes)
-        if tree is None:
-            continue
+    for path, tree in parsed_files(s):
         rel = s.rel(path)
-        file_findings = _file_findings(s, rel, tree, mounts.for_file(rel))
-        if rel in dead:
-            mark_unreachable(file_findings)
+        try:
+            file_findings = _file_findings(s, rel, tree, mounts.for_file(rel))
+        except RecursionError:
+            findings.append(could_not_scan(TOOL, rel, TOO_DEEP))
+            continue
+        mark(file_findings, rel, reach)
         findings.extend(file_findings)
     return findings

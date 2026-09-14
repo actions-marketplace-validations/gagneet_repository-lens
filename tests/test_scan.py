@@ -70,8 +70,8 @@ LIVE = """
     async def open_write(request: Request):
         return {}
 
-    @router.get("/orgs/{org_id}/buildings")
-    async def list_org_buildings(org_id: str, current_user: dict = Depends(get_current_user)):
+    @router.get("/orgs/{org_id}/projects")
+    async def list_org_projects(org_id: str, current_user: dict = Depends(get_current_user)):
         return await load(org_id)
 
     @router.delete("/orgs/{org_id}")
@@ -239,7 +239,7 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(len(self._for("security/unauthenticated-mutation-route", "/open")), 1)
 
     def test_a_guarded_sibling_raises_the_confidence_of_a_bola_candidate(self):
-        [finding] = self._for("security/object-route-without-ownership-check", "/buildings")
+        [finding] = self._for("security/object-route-without-ownership-check", "/projects")
         self.assertEqual(finding.confidence, "medium")
         self.assertIn("DELETE /orgs/{org_id}", finding.message)
 
@@ -292,6 +292,31 @@ LOOKALIKES = """
     async def listing():
         return await db.t.find({}).limit(0).to_list(None)
 """
+
+
+class ScopeDependencyTests(unittest.TestCase):
+    ROUTES = """
+        from fastapi import APIRouter, Depends
+        router = APIRouter()
+
+        @router.delete("/items/{item_id}")
+        async def remove_item(item_id: str, workspace: dict = Depends(get_current_workspace)):
+            return await delete(item_id, workspace)
+    """
+
+    def _ownership(self, toml: str = "") -> list[Finding]:
+        repo = Repo({"repolens.toml": '[scan]\npython_roots = ["."]\n' + toml, "routers/items.py": self.ROUTES})
+        try:
+            return [f for f in security.scan(repo.settings) if f.rule == "security/object-route-without-ownership-check"]
+        finally:
+            repo.close()
+
+    def test_reading_an_authenticating_dependency_counts_as_consulting_the_caller(self):
+        self.assertEqual(self._ownership(), [])
+
+    def test_a_dependency_listed_as_a_scope_is_not_the_caller(self):
+        [finding] = self._ownership('[scan.security]\nscope_dependency_patterns = ["workspace$"]\n')
+        self.assertIn("has no caller-identity parameter at all", finding.message)
 
 
 class LookalikeTests(unittest.TestCase):
@@ -417,10 +442,206 @@ class CountedBaselineTests(unittest.TestCase):
             repo.close()
         self.assertEqual(code, 2)
 
+    def test_the_report_writes_a_stamped_html_page_beside_markdown_and_sarif(self):
+        repo = Repo({"repolens.toml": '[report]\ntools = []\n', "app.py": "x = 1\n"})
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = runner.main(["--only", "security", "--out", str(repo.root / "out")],
+                                   config=load_config(str(repo.root)))
+            out = repo.root / "out"
+            page = (out / "report.html").read_text(encoding="utf-8")
+            markdown = (out / "report.md").read_text(encoding="utf-8")
+            sarif = json.loads((out / "report.sarif").read_text(encoding="utf-8"))
+        finally:
+            repo.close()
+        self.assertEqual(code, 0)
+        self.assertIn("default-src 'none'", page)
+        self.assertNotIn("<script", page.lower())
+        self.assertIn("no completeness claim", page)
+        self.assertIn("Produced by repolens ", page)
+        self.assertIn("Produced by repolens ", markdown)
+        self.assertIn("repolensBuild", sarif["runs"][0]["tool"]["driver"]["properties"])
+
     def test_check_with_update_baseline_is_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             runner.main(["--check", "--update-baseline"])
         self.assertEqual(caught.exception.code, 2)
+
+
+class RequiredToolTests(unittest.TestCase):
+    """A tool the command line requires must run, in every mode, and a tool installed
+    beside the interpreter running repolens is found."""
+
+    def setUp(self):
+        self.repo = Repo({"repolens.toml": '[report]\ntools = []\n'})
+        self.addCleanup(self.repo.close)
+
+    def main(self, *argv: str) -> tuple[int, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = runner.main([*argv, "--out", str(self.repo.root / "out")],
+                               config=load_config(str(self.repo.root)))
+        return code, err.getvalue()
+
+    @unittest.skipIf(os.name == "nt", "a POSIX executable bit")
+    def test_a_tool_beside_the_running_interpreter_is_found_off_path(self):
+        from unittest import mock
+        bindir = self.repo.root / "venv" / "bin"
+        bindir.mkdir(parents=True)
+        tool = bindir / "faketool"
+        tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        tool.chmod(0o755)
+        ctx = runner.Context(load_config(str(self.repo.root)), merge(runner.DEFAULTS, {}))
+        with mock.patch.dict(os.environ, {"PATH": "", "REPOLENS_TOOLS_BIN": ""}):
+            with self.assertRaises(runner.Skip):
+                ctx.executable("faketool")
+            with mock.patch.object(runner.sys, "executable", str(bindir / "python")):
+                self.assertEqual(ctx.executable("faketool"), str(tool))
+
+    def test_a_required_tool_that_is_skipped_fails_without_check(self):
+        # semgrep skips without a configured rules path, installed or not.
+        self.assertEqual(self.main("--only", "semgrep")[0], 0)
+        code, err = self.main("--only", "semgrep", "--require", "semgrep")
+        self.assertEqual(code, 1)
+        self.assertIn("required tool semgrep did not run: set [report] semgrep_config", err)
+
+    def test_a_required_tool_that_is_not_selected_fails_without_check(self):
+        code, err = self.main("--only", "commands", "--require", "bandit")
+        self.assertEqual(code, 1)
+        self.assertIn("required tool bandit did not run: not selected", err)
+
+    def test_a_required_tool_that_errors_fails_and_is_never_baselined(self):
+        from unittest import mock
+
+        def crash(ctx):
+            raise RuntimeError("boom")
+
+        with mock.patch.dict(runner.ADAPTERS, {"security": crash}):
+            code, err = self.main("--only", "security", "--require", "security")
+            self.assertEqual(code, 1)
+            self.assertIn("required tool security did not run: RuntimeError: boom", err)
+        with mock.patch.dict(runner.ADAPTERS, {"security": lambda ctx: []}):
+            code, err = self.main("--only", "security,semgrep", "--require", "semgrep", "--update-baseline")
+        self.assertEqual(code, 2)
+        self.assertIn("Cannot update the baseline: required tool(s) did not run: semgrep", err)
+        self.assertFalse((self.repo.root / ".repolens" / "report_baseline.json").exists())
+
+
+class ParseCacheTests(unittest.TestCase):
+    """One parsed-module cache per run, shared by the checks, content-keyed and
+    bounded by the run's own files."""
+
+    FILES = {"app.py": APP, "routers/live.py": """
+        from fastapi import APIRouter
+        router = APIRouter()
+        @router.post("/items")
+        async def create():
+            return 1
+    """}
+
+    def test_the_checks_of_one_run_parse_each_file_once(self):
+        from dataclasses import replace
+        from repolens.scan import migrations
+        repo = Repo(self.FILES)
+        self.addCleanup(repo.close)
+        s = repo.settings
+        security.scan(s)
+        performance.scan(replace(s, admitted_python_files=("app.py", "routers/live.py")))
+        migrations.scan(s)
+        cache = s.parse_cache
+        self.assertEqual((cache.misses, len(cache)), (2, 2))
+        self.assertGreaterEqual(cache.hits, 10)
+        # Fresh settings are a fresh run: nothing carries over between runs.
+        self.assertEqual(len(from_config(load_config(str(repo.root))).parse_cache), 0)
+
+    def test_a_file_edited_during_a_run_is_parsed_again(self):
+        from repolens.scan.python_ast import ParseCache
+        repo = Repo({"m.py": "A = 1\n"})
+        self.addCleanup(repo.close)
+        cache, path = ParseCache(), repo.root / "m.py"
+        first = cache.parse(path, 1000)
+        self.assertIs(cache.parse(path, 1000), first)
+        path.write_text("B = 2\n", encoding="utf-8")
+        second = cache.parse(path, 1000)
+        self.assertEqual(second.body[0].targets[0].id, "B")
+        self.assertEqual((cache.hits, cache.misses, len(cache)), (1, 2, 1))
+
+    def test_the_cache_holds_no_more_than_its_run_declares(self):
+        from repolens.scan.python_ast import ParseCache
+        repo = Repo({f"m{i}.py": f"X = {i}\n" for i in range(4)})
+        self.addCleanup(repo.close)
+        paths = sorted(repo.root.glob("m*.py"))
+        cache = ParseCache(capacity=2)
+        for path in paths:
+            cache.parse(path, 1000)
+        self.assertEqual(len(cache), 2)
+        cache.reserve(paths)
+        for path in paths:
+            cache.parse(path, 1000)
+        self.assertEqual((cache.capacity, len(cache)), (4, 4))
+
+    def test_route_exposure_and_the_mount_index_are_built_once_per_run(self):
+        from unittest import mock
+        from repolens.scan import mounts, wiring
+        repo = Repo(self.FILES)
+        self.addCleanup(repo.close)
+        s = repo.settings
+        with mock.patch.object(wiring, "_route_exposure", wraps=wiring._route_exposure) as exposure, \
+                mock.patch.object(mounts, "MountIndex", wraps=mounts.MountIndex) as index:
+            first = [(f.file, f.rule) for f in security.scan(s)]
+            performance.scan(s)
+            self.assertEqual((exposure.call_count, index.call_count), (1, 1))
+            # An edited file is a new tree, so both are rebuilt from it.
+            (repo.root / "routers" / "live.py").write_text(
+                "from fastapi import APIRouter\nrouter = APIRouter()\n", encoding="utf-8")
+            self.assertEqual(security.scan(s), [])
+            self.assertEqual((exposure.call_count, index.call_count), (2, 2))
+            # Different settings are different inputs, even sharing the cache.
+            from dataclasses import replace
+            security.scan(replace(s, entrypoints=("app.py",)))
+            self.assertEqual((exposure.call_count, index.call_count), (3, 3))
+        self.assertIn(("routers/live.py", "security/unauthenticated-mutation-route"), first)
+
+    def test_the_source_prefilter_never_rules_out_what_it_cannot_see(self):
+        from repolens.scan.python_ast import ParseCache, may_mention
+        repo = Repo({"a.py": "app.include_router(r)\n", "b.py": "X = 1\n",
+                     # NFKC: a fullwidth letter is the ASCII identifier to the parser.
+                     "c.py": "app.\uff49nclude_router(r)\n"})
+        self.addCleanup(repo.close)
+        cache = ParseCache()
+        a, b, c = (cache.parse(repo.root / name, 1000) for name in ("a.py", "b.py", "c.py"))
+        self.assertEqual(c.body[0].value.func.attr, "include_router")
+        self.assertEqual([may_mention(tree, "include_router") for tree in (a, b, c)], [True, False, True])
+        self.assertTrue(may_mention(ast.parse("X = 1"), "include_router"))  # source unknown
+
+    def test_the_report_runs_its_python_checks_on_one_parse_cache(self):
+        from unittest import mock
+        from repolens.scan import migrations
+        repo = Repo(self.FILES)
+        self.addCleanup(repo.close)
+        seen = []
+
+        def spy(real):
+            return lambda s: seen.append(s.parse_cache) or real(s)
+
+        with mock.patch.object(security, "scan", spy(security.scan)), \
+                mock.patch.object(performance, "scan", spy(performance.scan)), \
+                mock.patch.object(migrations, "scan", spy(migrations.scan)), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = runner.main(["--only", "security,performance,migrations", "--out", str(repo.root / "out")],
+                               config=load_config(str(repo.root)))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(seen[0] is seen[1] is seen[2])
+        self.assertEqual(seen[0].misses, 2)
+
+    def test_a_file_too_deep_for_the_parser_is_skipped_and_the_others_parse(self):
+        from repolens.scan.python_ast import ParseCache
+        repo = Repo({"deep.py": "x = " + "(" * 5000 + "1" + ")" * 5000 + "\n", "ok.py": "Y = 1\n"})
+        self.addCleanup(repo.close)
+        cache = ParseCache()
+        self.assertIsNone(cache.parse(repo.root / "deep.py", 100_000))
+        self.assertIsNotNone(cache.parse(repo.root / "ok.py", 100_000))
 
 
 class CommandRunTests(unittest.TestCase):
@@ -1040,6 +1261,663 @@ class PosixPathTests(unittest.TestCase):
                      for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
                      if pattern.search(line) and "as_posix" not in line]
         self.assertEqual(offenders, [])
+
+
+
+def _scan(files: dict[str, str], tool=security) -> list[Finding]:
+    repo = Repo(files)
+    try:
+        return tool.scan(repo.settings)
+    finally:
+        repo.close()
+
+
+def _rules_by_route(findings: list[Finding]) -> dict[str, set[str]]:
+    """"POST /path" -> the rules reported on it."""
+    out: dict[str, set[str]] = defaultdict(set)
+    for f in findings:
+        out[" ".join(f.message.split()[:2])].add(f.rule)
+    return out
+
+
+ALIAS_DEPS = """
+    from typing import Annotated
+    from fastapi import Depends
+    from fastapi.security import HTTPBearer, OAuth2PasswordBearer
+    oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+    optional_bearer = HTTPBearer(auto_error=False)
+    def get_current_user(token: str = Depends(oauth2_scheme)):
+        return token
+    def get_db():
+        yield 1
+    CurrentUser = Annotated[dict, Depends(get_current_user)]
+    SessionDep = Annotated[object, Depends(get_db)]
+    TokenDep = Annotated[str, Depends(oauth2_scheme)]
+    type UserAlias = Annotated[dict, Depends(get_current_user)]
+"""
+
+ALIAS_ROUTES = """
+    from typing import Annotated
+    from fastapi import APIRouter, Depends
+    from app import deps
+    from app.deps import CurrentUser, SessionDep, TokenDep, UserAlias, oauth2_scheme, optional_bearer
+    router = APIRouter()
+
+    @router.post("/alias")
+    def alias_route(user: CurrentUser, session: SessionDep, data: dict):
+        return user
+
+    @router.post("/module-alias")
+    def module_alias(user: deps.CurrentUser, data: dict):
+        return user
+
+    @router.post("/type-alias")
+    def type_alias(user: UserAlias, data: dict):
+        return user
+
+    @router.post("/scheme")
+    def scheme_route(token: Annotated[str, Depends(oauth2_scheme)], data: dict):
+        return token
+
+    @router.post("/scheme-alias")
+    def scheme_alias(token: TokenDep, data: dict):
+        return token
+
+    @router.post("/session-only")
+    def session_only(session: SessionDep, data: dict):
+        return data
+
+    @router.post("/optional-scheme")
+    def optional_scheme(creds=Depends(optional_bearer)):
+        return creds
+"""
+
+ALIAS_APP = """
+    from fastapi import FastAPI
+    from app import routes
+    app = FastAPI()
+    app.include_router(routes.router)
+"""
+
+
+class DependencyAliasTests(unittest.TestCase):
+    """`CurrentUser = Annotated[User, Depends(...)]` and security scheme instances, defined
+    in one module and used in another: the shape FastAPI's docs and template teach."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.rules = _rules_by_route(_scan({"app/__init__.py": "", "app/main.py": ALIAS_APP,
+                                           "app/deps.py": ALIAS_DEPS, "app/routes.py": ALIAS_ROUTES}))
+
+    def test_an_imported_annotated_alias_authenticates_the_route(self):
+        for route in ("POST /alias", "POST /module-alias", "POST /type-alias"):
+            self.assertNotIn("security/unauthenticated-mutation-route", self.rules[route], route)
+
+    def test_an_alias_that_does_not_authenticate_is_still_no_authentication(self):
+        self.assertIn("security/unauthenticated-mutation-route", self.rules["POST /session-only"])
+
+    def test_a_security_scheme_dependency_authenticates(self):
+        self.assertNotIn("security/unauthenticated-mutation-route", self.rules["POST /scheme"])
+        self.assertNotIn("security/unauthenticated-mutation-route", self.rules["POST /scheme-alias"])
+
+    def test_a_scheme_that_does_not_raise_authenticates_nothing(self):
+        self.assertIn("security/unauthenticated-mutation-route", self.rules["POST /optional-scheme"])
+
+    def test_an_alias_reexported_by_a_package_resolves(self):
+        rules = _rules_by_route(_scan({
+            "app/__init__.py": "", "app/main.py": ALIAS_APP,
+            "app/api/__init__.py": "from .deps import CurrentUser\n", "app/api/deps.py": ALIAS_DEPS,
+            "app/routes.py": """
+                from fastapi import APIRouter
+                from app.api import CurrentUser
+                router = APIRouter()
+                @router.post("/reexported")
+                def reexported(user: CurrentUser, data: dict):
+                    return user
+            """}))
+        self.assertNotIn("security/unauthenticated-mutation-route", rules["POST /reexported"])
+
+
+class RouteRegistrationTests(unittest.TestCase):
+    """Routes registered without a plain `@router.<verb>("/path")` decorator."""
+
+    def setUp(self) -> None:
+        self.rules = _rules_by_route(_scan({"main.py": """
+            from fastapi import APIRouter, Depends, FastAPI
+            app = FastAPI()
+            router = APIRouter()
+            METHODS = ["POST"]
+
+            @router.api_route("/multi", methods=["GET", "post"])
+            def multi(data: dict):
+                return data
+
+            @router.api_route("/read-only")
+            def read_only():
+                return 1
+
+            @router.api_route("/computed", methods=METHODS)
+            def computed(data: dict):
+                return data
+
+            def plain(data: dict):
+                return data
+
+            def guarded(data: dict):
+                return data
+
+            router.add_api_route("/added", plain, methods=["DELETE"])
+            router.add_api_route("/added-guarded", endpoint=guarded, methods=["PUT"],
+                                 dependencies=[Depends(get_current_user)])
+
+            @router.post(path="/kwpath")
+            def kwpath(data: dict):
+                return data
+
+            @app.websocket("/ws/{room_id}")
+            async def ws(websocket, room_id: str):
+                return None
+
+            app.include_router(router)
+        """}))
+
+    def test_api_route_is_expanded_over_its_literal_methods(self):
+        self.assertIn("security/unauthenticated-mutation-route", self.rules["POST /multi"])
+        self.assertNotIn("POST /read-only", self.rules)
+
+    def test_a_method_list_that_is_not_literal_is_skipped_not_guessed(self):
+        self.assertNotIn("POST /computed", self.rules)
+        self.assertNotIn("GET /computed", self.rules)
+
+    def test_add_api_route_registers_its_endpoint_with_its_dependencies(self):
+        self.assertIn("security/unauthenticated-mutation-route", self.rules["DELETE /added"])
+        self.assertNotIn("PUT /added-guarded", self.rules)
+
+    def test_a_path_keyword_and_a_websocket_are_routes(self):
+        self.assertIn("security/unauthenticated-mutation-route", self.rules["POST /kwpath"])
+        self.assertEqual(self.rules["WEBSOCKET /ws/{room_id}"], {"security/unauthenticated-object-read"})
+
+
+def _template(prefix: str) -> dict[str, str]:
+    """The full-stack-fastapi-template shape under `prefix`: `from app.api.main import
+    api_router`, with auth applied where the router is mounted."""
+    return {
+        f"{prefix}app/__init__.py": "", f"{prefix}app/api/__init__.py": "",
+        f"{prefix}app/api/routes/__init__.py": "",
+        f"{prefix}app/main.py": """
+            from fastapi import Depends, FastAPI
+            from app.api.main import api_router
+            app = FastAPI()
+            app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
+        """,
+        f"{prefix}app/api/main.py": """
+            from fastapi import APIRouter
+            from .routes import items
+            api_router = APIRouter()
+            api_router.include_router(items.router)
+        """,
+        f"{prefix}app/api/routes/items.py": """
+            from fastapi import APIRouter
+            router = APIRouter(prefix="/items")
+            @router.delete("/{item_id}")
+            def delete_item(item_id: int):
+                return remove(item_id)
+        """,
+    }
+
+
+class LayoutTests(unittest.TestCase):
+    """`backend/` and `src/` layouts, where the package root is not the repository root."""
+
+    def test_a_backend_or_src_layout_resolves_imports_mounts_and_router_auth(self):
+        for prefix in ("backend/", "src/", "services/api/"):
+            with self.subTest(prefix=prefix):
+                repo = Repo(_template(prefix))
+                try:
+                    self.assertEqual(unreachable_route_files(repo.settings), frozenset())
+                    found = {f.rule: f for f in security.scan(repo.settings)}
+                finally:
+                    repo.close()
+                self.assertNotIn("security/unauthenticated-mutation-route", found)
+                finding = found["security/object-route-without-ownership-check"]
+                self.assertIn("DELETE /api/v1/items/{item_id}", finding.message)
+                self.assertEqual(finding.exposure, "authenticated")
+
+    def test_a_name_two_layouts_claim_reaches_both_and_mounts_neither(self):
+        # `app.api.routes.items` is both backend/app/... and src/app/...: which one runs
+        # depends on sys.path. Reachability keeps both live; neither inherits the auth.
+        repo = Repo({**_template("backend/"), **_template("src/")})
+        try:
+            self.assertEqual(unreachable_route_files(repo.settings), frozenset())
+            rules = {(f.file.split("/")[0], f.rule) for f in security.scan(repo.settings)}
+        finally:
+            repo.close()
+        self.assertIn(("backend", "security/unauthenticated-mutation-route"), rules)
+        self.assertIn(("src", "security/unauthenticated-mutation-route"), rules)
+
+
+FACTORY = {
+    "app/__init__.py": "", "app/core/__init__.py": "", "app/routes/__init__.py": "",
+    "app/core/factory.py": "from fastapi import FastAPI\ndef get_application():\n    return FastAPI(title='x')\n",
+    "app/routes/items.py": "from fastapi import APIRouter\nrouter = APIRouter()\n"
+                           "@router.post('/x')\ndef x(d: dict):\n    return d\n",
+    "app/routes/orphan.py": "from fastapi import APIRouter\nrouter = APIRouter()\n"
+                            "@router.post('/y')\ndef y(d: dict):\n    return d\n",
+    "app/routes/aggregate.py": "from fastapi import APIRouter\nfrom app.routes import orphan\n"
+                               "api_router = APIRouter()\napi_router.include_router(orphan.router)\n",
+}
+
+
+class FactoryAppTests(unittest.TestCase):
+    def _dead(self, main: str) -> frozenset[str]:
+        repo = Repo({**FACTORY, "app/main.py": main})
+        try:
+            return unreachable_route_files(repo.settings)
+        finally:
+            repo.close()
+
+    def test_routers_registered_on_an_app_a_factory_built_are_live(self):
+        self.assertEqual(self._dead("from app.core.factory import get_application\n"
+                                    "from app.routes import items\n"
+                                    "app = get_application()\napp.include_router(items.router)\n"),
+                         frozenset({"app/routes/orphan.py"}))
+
+    def test_a_factory_function_that_registers_and_returns_the_app_is_a_root(self):
+        self.assertEqual(self._dead("from app.core.factory import get_application\n"
+                                    "def create():\n    from app.routes import items\n"
+                                    "    application = get_application()\n"
+                                    "    application.include_router(items.router)\n"
+                                    "    return application\n"),
+                         frozenset({"app/routes/orphan.py"}))
+
+    def test_a_router_aggregator_nothing_imports_is_not_a_root(self):
+        # aggregate.py registers orphan on a ROUTER; no app mounts it, so orphan is dead.
+        self.assertIn("app/routes/orphan.py", self._dead("from app.core.factory import get_application\n"
+                                                         "app = get_application()\n"
+                                                         "import requests\ns = requests.Session()\n"
+                                                         "s.mount('https://', None)\n"))
+
+
+DEEP_SUM = " + ".join(["x"] * 3000)
+
+
+class RecursionIsolationTests(unittest.TestCase):
+    """One pathological file must not cost the findings in every other file."""
+
+    APP = "from fastapi import FastAPI\napp = FastAPI()\n@app.post('/x')\ndef x(d: dict):\n    return d\n"
+
+    def test_a_very_long_concatenation_is_read_without_overflowing(self):
+        found = _scan({"gen.py": f"def q(conn, x):\n    return conn.execute('SELECT 1 ' + {DEEP_SUM})\n",
+                       "app.py": self.APP})
+        self.assertEqual({(f.file, f.rule) for f in found},
+                         {("app.py", "security/unauthenticated-mutation-route"),
+                          ("gen.py", "security/sql-built-from-string")})
+
+    def test_a_file_that_overflows_is_reported_and_the_others_are_still_scanned(self):
+        from unittest import mock
+        real_security, real_performance = security._model_findings, performance._file_findings
+
+        def overflow(real):
+            def run(s, rel, *args, **kwargs):
+                if rel == "gen.py":
+                    raise RecursionError
+                return real(s, rel, *args, **kwargs)
+            return run
+
+        files = {"gen.py": "def q():\n    return 1\n", "app.py": self.APP + "import time\n"
+                 "async def slow():\n    time.sleep(1)\n"}
+        with mock.patch.object(security, "_model_findings", overflow(real_security)):
+            found = {(f.file, f.rule, f.severity, f.confidence) for f in _scan(files)}
+        self.assertEqual(found, {("app.py", "security/unauthenticated-mutation-route", "high", "medium"),
+                                 ("gen.py", "security/could-not-scan", "medium", "high")})
+        with mock.patch.object(performance, "_file_findings", overflow(real_performance)):
+            found = {(f.file, f.rule) for f in _scan(files, performance)}
+        self.assertEqual(found, {("app.py", "performance/blocking-call-in-async"),
+                                 ("gen.py", "performance/could-not-scan")})
+
+    def test_a_migration_too_deep_to_render_is_reported_and_the_others_are_read(self):
+        from repolens.scan import migrations
+        deep = ("revision = 'a1'\nfrom alembic import op\ndef upgrade():\n"
+                f"    op.execute('CREATE TABLE t (' + {DEEP_SUM} + ')')\n")
+        ok = ("revision = 'b2'\nfrom alembic import op\ndef upgrade():\n"
+              "    op.execute('ALTER TABLE t ADD COLUMN c int NOT NULL')\n")
+        found = {(f.file.rsplit("/", 1)[-1], f.rule)
+                 for f in _scan({"alembic/versions/a1.py": deep, "alembic/versions/b2.py": ok}, migrations)}
+        self.assertIn(("a1.py", "migrations/could-not-scan"), found)
+        self.assertTrue(any(file == "b2.py" and rule != "migrations/could-not-scan" for file, rule in found),
+                        found)
+
+
+ORM_PERF = """
+    import requests as rq
+    import httpx
+    from time import sleep
+    from sqlmodel import select
+
+    async def aliased_blocking():
+        rq.get("http://x")
+        sleep(1)
+        httpx.get("http://x")
+
+    async def async_client_is_fine():
+        async with httpx.AsyncClient() as client:
+            await client.get("http://x")
+        await httpx.AsyncClient().get("http://x")
+
+    def sync_requests_is_fine():
+        rq.get("http://x")
+        sleep(1)
+
+    async def held_result(session):
+        stmt = select(Item)
+        result = await session.execute(stmt)
+        return result.scalars().all()
+
+    async def held_bounded_result(session):
+        result = await session.execute(select(Item).limit(10))
+        return result.scalars().all()
+
+    def sqlmodel_exec(session):
+        return session.exec(select(Item)).all()
+
+    def sqlmodel_exec_paged(session, skip, limit):
+        return session.exec(select(Item).offset(skip).limit(limit)).all()
+
+    def legacy_query(db):
+        return db.query(Item).filter(Item.owner == 1).all()
+
+    def legacy_query_paged(db, skip, limit):
+        return db.query(Item).offset(skip).limit(limit).all()
+
+    def sync_loop(db, ids):
+        out = []
+        for i in ids:
+            out.append(db.query(Item).filter(Item.id == i).first())
+        return out
+
+    async def session_get_per_item(session, ids):
+        return [await session.get(Item, i) for i in ids]
+
+    def not_round_trips(cache, lines, ids, request):
+        for i in ids:
+            cache.get(i, None)
+            request.session.get("user", None)
+        return [line.find(":") for line in lines]
+
+    async def awaited_non_db_get(client, urls):
+        return [await client.get(u) for u in urls]
+"""
+
+
+class OrmPerformanceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        tree = ast.parse(textwrap.dedent(ORM_PERF))
+        spans = [(fn.lineno, fn.end_lineno, fn.name) for fn in tree.body
+                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        cls.found: dict[str, list[str]] = defaultdict(list)
+        for f in _scan({"svc/items.py": ORM_PERF}, performance):
+            name = next(n for start, end, n in spans if start <= f.line <= end)
+            cls.found[f.rule.split("/")[1]].append(name)
+
+    def test_import_aliases_and_httpx_are_blocking_in_async_code_only(self):
+        self.assertEqual(sorted(self.found["blocking-call-in-async"]), ["aliased_blocking"] * 3)
+
+    def test_sqlmodel_exec_legacy_query_and_a_held_result_are_unbounded_fetches(self):
+        self.assertEqual(sorted(self.found["unbounded-sql-fetch"]),
+                         ["held_result", "legacy_query", "sqlmodel_exec"])
+
+    def test_a_query_per_item_in_a_sync_loop_or_a_session_get_is_n_plus_one(self):
+        self.assertEqual(sorted(self.found["query-in-loop"]), ["session_get_per_item", "sync_loop"])
+
+
+SERVER_APP = """
+    from fastapi import FastAPI
+    import uvicorn
+    app = FastAPI()
+
+    @app.post("/upload")
+    async def upload(d: dict):
+        return d
+
+    if __name__ == "__main__":
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+"""
+
+SERVICE_UNIT = """
+    [Service]
+    WorkingDirectory=/srv/example/svc
+    ExecStart=/srv/example/svc/venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+"""
+
+TWO_SERVERS = {"svc/__init__.py": "", "svc/server.py": SERVER_APP, "svc/server_copy.py": SERVER_APP}
+#: A deployed app, an admin app a second process runs, and a copy nothing runs.
+THREE_APPS = {"app/__init__.py": "", "app/main.py": SERVER_APP, "admin/__init__.py": "",
+              "admin/main.py": SERVER_APP, "legacy/__init__.py": "", "legacy/server.py": SERVER_APP}
+
+
+class DeploymentTests(unittest.TestCase):
+    """A route file only an app no deployment manifest runs reaches is "undeployed"."""
+
+    def _exposures(self, files: dict[str, str]) -> dict[str, tuple[str, str, str]]:
+        out = {}
+        for f in _scan(files):
+            if f.rule == "security/unauthenticated-mutation-route":
+                out[f.file] = (f.exposure, f.priority, f.message)
+        return out
+
+    def _targets(self, files: dict[str, str]):
+        from repolens.scan import deploy
+        from repolens.scan.wiring import ModuleMap
+        repo = Repo(files)
+        try:
+            rels = [p for p in files if p.endswith(".py")]
+            return deploy.discover(repo.settings, rels, ModuleMap(rels, repo.settings.python_roots))
+        finally:
+            repo.close()
+
+    def assertDemoted(self, found, demoted: set[str]) -> None:
+        self.assertGreaterEqual(len(found), 2, found)
+        self.assertLessEqual(demoted, set(found))
+        for rel, (exposure, priority, _) in found.items():
+            if rel in demoted:
+                self.assertEqual((exposure, priority), ("undeployed", "P3"), rel)
+            else:
+                self.assertEqual((exposure, priority), ("unauthenticated", "P1"), rel)
+
+    def test_a_systemd_unit_running_one_of_two_apps_demotes_only_the_other(self):
+        found = self._exposures({**TWO_SERVERS, "api.service": SERVICE_UNIT,
+                                 "scripts/notes.sh": 'echo "   python server_copy.py"\n'})
+        self.assertEqual(set(found), {"svc/server.py", "svc/server_copy.py"})
+        self.assertDemoted(found, {"svc/server_copy.py"})
+        self.assertIn("[not run by any deployment manifest found: api.service runs "
+                      "svc/server.py]", found["svc/server_copy.py"][2])
+
+    def test_without_a_manifest_nothing_changes(self):
+        self.assertDemoted(self._exposures(TWO_SERVERS), set())
+
+    def test_an_application_chosen_at_run_time_makes_the_deployment_unknown(self):
+        dynamic = "[Service]\nExecStart=/usr/bin/uvicorn $APP_MODULE --port 9000\n"
+        self.assertDemoted(self._exposures({**TWO_SERVERS, "api.service": SERVICE_UNIT,
+                                            "other.service": dynamic}), set())
+
+    def test_the_setting_turns_detection_off(self):
+        files = {**TWO_SERVERS, "api.service": SERVICE_UNIT,
+                 "repolens.toml": '[scan]\npython_roots = ["."]\ndeployment_detection = false\n'}
+        self.assertDemoted(self._exposures(files), set())
+
+    def test_a_dockerfile_cmd_with_a_workdir(self):
+        files = {"app/__init__.py": "", "app/main.py": SERVER_APP, "legacy/server.py": SERVER_APP,
+                 "Dockerfile": 'FROM python:3.12\nWORKDIR /app\nCOPY . .\n'
+                               'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0"]\n'}
+        self.assertDemoted(self._exposures(files), {"legacy/server.py"})
+
+    def test_a_package_json_script_adds_to_what_runs_but_is_not_the_deployment(self):
+        files = {**TWO_SERVERS, "package.json": json.dumps({"scripts": {
+            "dev": "next dev", "api": "cd svc && uvicorn server_copy:app"}})}
+        self.assertEqual([(t.files, t.auxiliary) for t in self._targets(files).targets],
+                         [(("svc/server_copy.py",), True)])
+        self.assertDemoted(self._exposures(files), set())
+        self.assertDemoted(self._exposures({**files, "api.service": SERVICE_UNIT}), set())
+
+    def test_a_ci_test_or_dev_script_never_makes_the_deployment_known(self):
+        fake = {"tests/__init__.py": "", "tests/fake.py": SERVER_APP}
+        for rel, text in ((".github/scripts/e2e.sh", "uvicorn tests.fake:app &\npytest\n"),
+                          ("scripts/dev.sh", "exec uvicorn tests.fake:app\n"),
+                          ("svc/run_tests.sh", "uvicorn tests.fake:app\n"),
+                          ("docker-compose.test.yml", "services:\n  api:\n    command: uvicorn tests.fake:app\n"),
+                          ("Procfile", "web: uvicorn tests.fake:app --reload\n")):
+            with self.subTest(rel):
+                files = {**TWO_SERVERS, **fake, rel: text}
+                targets = self._targets(files).targets
+                self.assertTrue(targets and all(t.auxiliary and t.files for t in targets), targets)
+                self.assertDemoted(self._exposures(files), set())
+
+    def test_what_an_auxiliary_script_runs_is_still_live(self):
+        files = {**TWO_SERVERS, "api.service": SERVICE_UNIT,
+                 "scripts/run_copy.sh": "cd svc && python server_copy.py\n"}
+        self.assertDemoted(self._exposures(files), set())
+
+    def test_a_deployment_format_that_is_not_read_makes_the_deployment_unknown(self):
+        unread = {
+            "deploy/k8s/api.yaml": "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n"
+                                   "      containers:\n        - name: api\n          image: registry/api\n",
+            "charts/api/Chart.yaml": "apiVersion: v2\nname: api\n",
+            "app.yaml": "runtime: python312\nentrypoint: gunicorn -k uvicorn.workers.UvicornWorker svc.server_copy:app\n",
+            "fly.toml": 'app = "api"\n[processes]\n  app = "uvicorn svc.server_copy:app"\n',
+            "render.yaml": "services:\n  - type: web\n    startCommand: uvicorn svc.server_copy:app\n",
+            "app.json": '{"name": "api", "formation": {"web": {"quantity": 1}}}\n',
+            "infra/ecs.tf": 'resource "aws_ecs_task_definition" "api" {\n  container_definitions = file("api.json")\n}\n',
+            "deploy/uwsgi.conf": "[uwsgi]\nmodule = svc.server_copy:app\n",
+            "deploy/api.service.j2": "[Service]\nExecStart={{ venv }}/bin/uvicorn svc.server_copy:app\n",
+            "deploy/playbook.yml": "- copy:\n    content: |\n      [Service]\n"
+                                  "      ExecStart=/opt/venv/bin/uvicorn svc.server_copy:app\n",
+            "deploy/stack.yml": "services:\n  api:\n    image: registry/api\n",
+        }
+        for rel, text in unread.items():
+            with self.subTest(rel):
+                files = {**TWO_SERVERS, "api.service": SERVICE_UNIT, rel: text}
+                self.assertEqual([t.manifest for t in self._targets(files).blocking], [rel])
+                self.assertDemoted(self._exposures(files), set())
+
+    def test_ordinary_yaml_ci_files_and_an_app_json_beside_its_procfile_do_not_block(self):
+        files = {**TWO_SERVERS, "Procfile": "web: uvicorn svc.server:app\n",
+                 "app.json": '{"name": "api", "formation": {"web": {"quantity": 1}}}\n',
+                 "config/settings.yaml": "database:\n  pool: 5\n",
+                 "openapi.yaml": "openapi: 3.1.0\npaths: {}\n",
+                 ".github/workflows/ci.yml": "jobs:\n  test:\n    services:\n      db:\n        image: postgres\n",
+                 "tests/k8s/api.yaml": "spec:\n  containers:\n    - name: api\n"}
+        self.assertEqual(self._targets(files).blocking, ())
+        self.assertDemoted(self._exposures(files), {"svc/server_copy.py"})
+
+    def test_a_python_script_serving_an_application_by_name(self):
+        procfile = "web: python run.py\nadmin: uvicorn admin.main:app\n"
+        scripts = {
+            "uvicorn.run": 'import uvicorn\nif __name__ == "__main__":\n    uvicorn.run("app.main:app", port=8000)\n',
+            "keyword": 'import uvicorn\nuvicorn.run(app="app.main:app")\n',
+            "imported run": 'from uvicorn import run as serve\nAPP = "app.main:app"\nserve(APP)\n',
+            "granian": 'from granian import Granian\nGranian("app.main:app", interface="asgi").serve()\n',
+        }
+        for label, run in scripts.items():
+            with self.subTest(label):
+                files = {**THREE_APPS, "run.py": run, "Procfile": procfile}
+                self.assertDemoted(self._exposures(files), {"legacy/server.py"})
+                served = [t for t in self._targets(files).targets if t.command == "python run.py"]
+                self.assertEqual([(t.server, t.files) for t in served],
+                                 [(True, ("run.py", "app/main.py", "app/__init__.py"))])
+
+    def test_a_python_script_serving_an_application_chosen_at_run_time_is_unknown(self):
+        for run in ('import os, uvicorn\nuvicorn.run(os.environ["APP"])\n',
+                    'import uvicorn\nname = "app.main"\nuvicorn.run(f"{name}:app")\n',
+                    'import os, uvicorn\nuvicorn.run(os.getenv("APP", "app.main:app"))\n'):
+            with self.subTest(run):
+                files = {**THREE_APPS, "run.py": run, "Procfile": "web: python run.py\nadmin: uvicorn admin.main:app\n"}
+                self.assertTrue(self._targets(files).blocking)
+                self.assertDemoted(self._exposures(files), set())
+
+    def test_python_dash_m_on_a_package_runs_its_main_module(self):
+        for label, main in (("object", "import uvicorn\nfrom app.main import app\nuvicorn.run(app)\n"),
+                            ("by name", 'import uvicorn\nuvicorn.run("app.main:app")\n')):
+            with self.subTest(label):
+                files = {**THREE_APPS, "app/__main__.py": main,
+                         "Dockerfile": 'FROM python:3.12\nCMD ["python", "-m", "app"]\n',
+                         "admin/Dockerfile": 'FROM python:3.12\nWORKDIR /srv\nCOPY . /srv\nCMD ["uvicorn", "main:app"]\n'}
+                self.assertDemoted(self._exposures(files), {"legacy/server.py"})
+                self.assertIn("app/__main__.py", [f for t in self._targets(files).targets for f in t.files])
+
+    def test_an_image_that_copies_no_code_cannot_name_its_module(self):
+        # Without COPY/ADD the image's working directory holds nothing from the repository
+        # (a base image or a volume supplies the code), so `main` could be any main.py.
+        files = {**THREE_APPS, "Procfile": "web: uvicorn app.main:app\n",
+                 "admin/Dockerfile": 'FROM python:3.12\nCMD ["uvicorn", "main:app"]\n'}
+        [blocking] = self._targets(files).blocking
+        self.assertIn("main could be more than one file", blocking.unresolved)
+        self.assertDemoted(self._exposures(files), set())
+
+    def test_a_cmd_before_the_entrypoint_in_the_same_stage_is_kept(self):
+        entrypoint = '#!/bin/sh\nset -e\nexec "$@"\n'
+        files = {**THREE_APPS, "admin/Procfile": "web: uvicorn main:app\n", "docker/entrypoint.sh": entrypoint,
+                 "Dockerfile": 'FROM python:3.12\nCOPY docker/entrypoint.sh /entrypoint.sh\n'
+                               'CMD ["uvicorn", "app.main:app"]\nENTRYPOINT ["/entrypoint.sh"]\n'}
+        self.assertDemoted(self._exposures(files), {"legacy/server.py"})
+        self.assertIn(("app/main.py", "app/__init__.py"), [t.files for t in self._targets(files).targets])
+
+    def test_an_entrypoint_the_repository_does_not_hold_blocks_demotion(self):
+        # Fail closed: a script the image gets from elsewhere can start anything.
+        for dockerfile in ('FROM python:3.12\nCMD ["uvicorn", "app.main:app"]\nENTRYPOINT ["/entrypoint.sh"]\n',
+                           'FROM python:3.12\nENTRYPOINT ["/entrypoint.sh"]\n'):
+            with self.subTest(dockerfile=dockerfile):
+                files = {**THREE_APPS, "admin/Procfile": "web: uvicorn main:app\n", "Dockerfile": dockerfile}
+                [blocking] = self._targets(files).blocking
+                self.assertEqual(blocking.unresolved, "/entrypoint.sh is not a file in the repository")
+                self.assertDemoted(self._exposures(files), set())
+
+    def test_an_echoed_command_a_comment_and_a_heredoc_run_nothing(self):
+        script = ('#!/bin/bash\n# python server.py\necho "python server.py"\n'
+                  'printf "%s\\n" "uvicorn server:app"\ncat <<EOF\npython server.py\nEOF\n'
+                  'echo "multi\npython server.py\n"\n')
+        self.assertEqual(self._targets({**TWO_SERVERS, "svc/run.sh": script}).targets, ())
+        self.assertDemoted(self._exposures({**TWO_SERVERS, "svc/run.sh": script}), set())
+
+    def test_a_shell_script_that_does_run_a_file_counts(self):
+        script = '#!/bin/bash\ncd "$(dirname "$0")"\nsource venv/bin/activate\nexec python server.py\n'
+        self.assertDemoted(self._exposures({**TWO_SERVERS, "svc/run.sh": script}),
+                           {"svc/server_copy.py"})
+
+    def test_an_app_the_deployed_app_imports_is_not_demoted(self):
+        main = "from admin import app as admin_app\n" + textwrap.dedent(SERVER_APP)
+        files = {"main.py": main, "admin.py": SERVER_APP, "old_main.py": SERVER_APP,
+                 "Procfile": "web: uvicorn main:app --port $PORT\n"}
+        self.assertDemoted(self._exposures(files), {"old_main.py"})
+
+    def test_gunicorn_with_a_uvicorn_worker_names_the_app_not_the_worker(self):
+        files = {"main.py": SERVER_APP, "old_main.py": SERVER_APP,
+                 "Procfile": "web: gunicorn -k uvicorn.workers.UvicornWorker -w 4 main:app\n"}
+        self.assertDemoted(self._exposures(files), {"old_main.py"})
+
+    def test_compose_and_supervisord_commands_resolve_against_their_directories(self):
+        compose = ("services:\n  api:\n    build:\n      context: ../backend\n"
+                   "    command:\n      - gunicorn\n      - --chdir\n      - /srv/backend\n"
+                   "      - wsgi:app\n    ports:\n      - \"8000:8000\"\n")
+        supervisor = ("[program:api]\ndirectory=/srv/example/worker\n"
+                      "command=/opt/venv/bin/python -m flask --app service run\n")
+        deployment = self._targets({"backend/wsgi.py": SERVER_APP, "worker/service.py": SERVER_APP,
+                                    "deploy/docker-compose.yml": compose,
+                                    "deploy/supervisord.conf": supervisor})
+        self.assertEqual(sorted(f for t in deployment.targets for f in t.files),
+                         ["backend/wsgi.py", "worker/service.py"])
+        self.assertEqual(deployment.blocking, ())
+
+    def test_the_note_does_not_change_the_fingerprint(self):
+        live = Finding("security", "r", "high", "POST /x (x) changes state")
+        demoted = Finding("security", "r", "high", live.message
+                          + " [not run by any deployment manifest found: a.service runs a.py]")
+        self.assertEqual(live.fingerprint, demoted.fingerprint)
+        bracketed = Finding("security", "r", "high", live.message
+                            + " [not run by any deployment manifest found: deploy/[prod]/Dockerfile runs a.py]")
+        self.assertEqual(live.fingerprint, bracketed.fingerprint)
+        self.assertNotEqual(live.fingerprint, Finding("security", "r", "high", live.message + " [other]").fingerprint)
+        self.assertEqual(Finding("t", "r", "critical", "m", confidence="high", exposure="undeployed").priority, "P2")
 
 
 if __name__ == "__main__":

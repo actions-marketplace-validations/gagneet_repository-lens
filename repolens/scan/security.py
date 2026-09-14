@@ -10,8 +10,8 @@ A handler that passes `current_user` to a service that checks ownership is not f
 a service that forgets is invisible here.
 
 Confidence comes from CONTRAST, not from the route alone. A route that never consults
-the caller is ordinary when the object belongs to the whole building (an asset's health
-history); it is suspicious when a SIBLING route addressing the same `{id}` does consult
+the caller is ordinary when the object is shared by everyone in the tenant (a catalogue
+entry); it is suspicious when a SIBLING route addressing the same `{id}` does consult
 the caller — someone thought a check was needed there. That contrast (the MACE idea:
 an access check present on one path and absent on its sibling) lifts the confidence;
 without it the finding stays low-confidence, a review candidate.
@@ -19,9 +19,9 @@ without it the finding stays low-confidence, a review candidate.
 Proving object-level authorisation needs a request replayed as a second user against
 real data (a DAST pass), which no source scan can substitute for.
 
-Tenant scoping by a database wrapper (one building cannot read another's rows) is not
+Tenant scoping by a database wrapper (one organisation cannot read another's rows) is not
 object-level authorisation: it stops cross-TENANT access, and says nothing about one
-member of a building addressing another member's object.
+member of an organisation addressing another member's object.
 
 A signed webhook authenticates in its BODY — it verifies an HMAC over the raw payload —
 so a call matching `body_auth_call_pattern` counts as authentication. The pattern is a
@@ -38,6 +38,11 @@ shape heuristic, and each was reproduced against a fixture):
   * A guard is recognised by name (`guard_calls`, `guard_call_patterns`); a guard called
     something else is invisible, and a non-guard that matches is taken on trust.
   * An ownership check inside a service the handler calls is invisible; so is its absence.
+
+A file the checks cannot finish (an expression nested deeper than the interpreter's
+recursion limit, typically generated code) is reported as `security/could-not-scan` and
+the rest of the tree is still scanned: one such file used to abort the whole tool, and
+lose every finding in every other file with it.
 """
 from __future__ import annotations
 
@@ -45,11 +50,11 @@ import ast
 
 from ..core.findings import Finding
 from .python_ast import (MUTATING, Route, bound_names, dotted, functions, last, literal_locals,
-                         literal_text, names_read, parse, python_files, raises_auth_error,
+                         literal_text, names_read, parsed_files, raises_auth_error,
                          routes, walk_body)
-from .mounts import MountIndex
+from .mounts import mount_index
 from .settings import ScanSettings
-from .wiring import mark_unreachable, unreachable_route_files
+from .wiring import mark, route_exposure
 
 TOOL = "security"
 
@@ -61,10 +66,14 @@ def _exposure(authenticated: bool) -> str:
 class RouteAuth:
     """What a route's signature and body say about who may call it."""
 
-    def __init__(self, route: Route, s: ScanSettings):
+    def __init__(self, route: Route, s: ScanSettings, schemes: frozenset[str] = frozenset()):
+        """`schemes`: dependency names that are security scheme instances for this
+        file (`MountIndex.schemes`). `Depends(oauth2_scheme)` refuses a request without a
+        token, so it authenticates whatever the instance is called."""
         sec = s.security
         names = [d.name for d in route.dependencies]
-        self.authn = [n for n in names if sec.authenticates(n) and n not in sec.optional_dependencies]
+        self.authn = [n for n in names if (sec.authenticates(n) or n in schemes)
+                      and n not in sec.optional_dependencies]
         self.optional = [n for n in names if n in sec.optional_dependencies]
         self.role = [n for n in names if sec.restricts_role(n)]
         body = names_read(route.node)
@@ -73,7 +82,8 @@ class RouteAuth:
         self.secret_header = [h for h in route.header_params
                               if sec.secret_header.search(h) and h in body]
         self.identity_params = [d.param for d in route.dependencies
-                                if d.param and d.name in self.authn and "building" not in d.name]
+                                if d.param and d.name in self.authn
+                                and not any(p.search(d.name) for p in sec.scope_patterns)]
         self.identity_used = any(p in body for p in self.identity_params)
         called = {last(n.func) for n in walk_body(route.node, lambdas=True) if isinstance(n, ast.Call)}
         self.guard_called = sorted(c for c in called if sec.is_guard(c))
@@ -82,6 +92,8 @@ class RouteAuth:
 
     @property
     def authenticated(self) -> bool:
+        """Any evidence the caller is authenticated: a dependency, a read secret header,
+        a verified secret, or a 401/403 raised."""
         return bool(self.authn or self.secret_header or self.raises_auth or self.secret_verified)
 
     @property
@@ -163,10 +175,10 @@ def _route_findings(s: ScanSettings, rel: str, route: Route, auth: RouteAuth,
                 message=f"{where} addresses an object by {{{used[0]}}} and {who}: any "
                         f"authenticated caller who can reach the route can name any id "
                         f"(BOLA/IDOR candidate){contrast}",
-                remedy="Load the object, then compare its owner/unit/building with the caller "
+                remedy="Load the object, then compare its owner (or tenant) with the caller "
                        "(or call the ownership helper) before acting; a role dependency is "
                        "function-level authorisation and does not replace an object check. "
-                       "If the object belongs to the whole building, say so in a comment and "
+                       "If the object is shared by everyone who can reach the route, say so in a comment and "
                        "suppress by fingerprint. Confirm with a two-user replay test.",
             ))
     return out
@@ -182,10 +194,19 @@ def _numeric_cast(node: ast.AST) -> bool:
 
 
 def _add_operands(node: ast.AST) -> list[ast.AST]:
-    """The operands of a `+` chain, left to right."""
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return [*_add_operands(node.left), *_add_operands(node.right)]
-    return [node]
+    """The operands of a `+` chain, left to right.
+
+    Iterative: `a + b + c` nests as ((a + b) + c), so recursion depth is the chain's
+    length, and a generated 3000-term concatenation raised RecursionError."""
+    out: list[ast.AST] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            stack.extend((current.right, current.left))
+        else:
+            out.append(current)
+    return out
 
 
 #: Keyword arguments that carry the SQL text when it is not passed positionally.
@@ -373,7 +394,8 @@ def _guarded_at(call: ast.AST, guards: dict[str, list[ast.If]], fn: ast.AST,
     return held
 
 
-def _sql_findings(s: ScanSettings, rel: str, tree: ast.Module, route_by_node: dict[int, Route]) -> list[Finding]:
+def _sql_findings(s: ScanSettings, rel: str, tree: ast.Module, route_by_node: dict[int, Route],
+                 schemes: frozenset[str] = frozenset()) -> list[Finding]:
     sec = s.security
     safe = sec.sql_safe_interpolation
     out: list[Finding] = []
@@ -430,7 +452,7 @@ def _sql_findings(s: ScanSettings, rel: str, tree: ast.Module, route_by_node: di
             else:
                 severity, confidence = "medium", "low"
             exposure = ("internal" if s.is_internal(rel) else
-                        _exposure(RouteAuth(route, s).authenticated) if route else "")
+                        _exposure(RouteAuth(route, s, schemes).authenticated) if route else "")
             out.append(Finding(
                 tool=TOOL, rule="security/sql-built-from-string", severity=severity,
                 confidence=confidence, category="security", exposure=exposure,
@@ -440,7 +462,7 @@ def _sql_findings(s: ScanSettings, rel: str, tree: ast.Module, route_by_node: di
                             f" of {', '.join(names[:4])}") + via),
                 remedy="Bind values as parameters (text(':x') with params, asyncpg $1). An "
                        "identifier cannot be bound: check it against an allow-list. For "
-                       "`SET app.tenant_id = '…'` use `SELECT set_config('app.tenant_id', $1, false)`.",
+                       "`SET app.current_tenant = '…'` use `SELECT set_config('app.current_tenant', $1, false)`.",
             ))
     return out
 
@@ -465,26 +487,48 @@ def _model_findings(s: ScanSettings, rel: str, tree: ast.Module) -> list[Finding
     return out
 
 
+def could_not_scan(tool: str, rel: str, reason: str) -> Finding:
+    """A file a built-in check could not finish. Same shape as the report runner's
+    `_unscanned`; the `<tool>/could-not-scan` rule marks the analysis incomplete, so an
+    unread file never looks like a clean one."""
+    return Finding(tool=tool, rule=f"{tool}/could-not-scan", severity="medium", confidence="high",
+                   category=tool, file=rel,
+                   message=f"{tool} could not scan this file: {reason}",
+                   remedy="Simplify or exclude the construct (generated code can go under "
+                          "[scan] skip_parts); until then no rule of this tool sees the file.")
+
+
+TOO_DEEP = "an expression is nested too deeply to analyse (RecursionError)"
+
+
 def scan(s: ScanSettings) -> list[Finding]:
+    """Route, SQL and request-model security findings for every scanned Python file.
+
+    Findings are demoted by reachability, never dropped; a file that cannot be analysed
+    keeps what was found and adds a could-not-scan finding."""
     findings: list[Finding] = []
-    dead = unreachable_route_files(s)
-    mounts = MountIndex(s)
-    for path in python_files(s):
-        tree = parse(str(path), s.max_file_bytes)
-        if tree is None:
-            continue
+    reach = route_exposure(s)
+    mounts = mount_index(s)
+    for path, tree in parsed_files(s):
         rel = s.rel(path)
-        found_routes = routes(tree, mounts.for_file(rel))
-        peers = [(r, RouteAuth(r, s)) for r in found_routes]
         file_findings: list[Finding] = []
-        for route, auth in peers:
-            for finding in _route_findings(s, rel, route, auth, peers):
-                if s.is_internal(rel):
-                    finding.exposure = "internal"
-                file_findings.append(finding)
-        file_findings.extend(_sql_findings(s, rel, tree, {id(r.node): r for r in found_routes}))
-        file_findings.extend(_model_findings(s, rel, tree))
-        if rel in dead:
-            mark_unreachable(file_findings)
+        failed = False
+        try:
+            schemes = mounts.schemes(rel)
+            found_routes = routes(tree, mounts.for_file(rel), mounts.dependency_aliases(rel))
+            peers = [(r, RouteAuth(r, s, schemes)) for r in found_routes]
+            for route, auth in peers:
+                for finding in _route_findings(s, rel, route, auth, peers):
+                    if s.is_internal(rel):
+                        finding.exposure = "internal"
+                    file_findings.append(finding)
+            file_findings.extend(_sql_findings(s, rel, tree, {id(r.node): r for r in found_routes},
+                                               schemes))
+            file_findings.extend(_model_findings(s, rel, tree))
+        except RecursionError:
+            failed = True  # what was found before the failure is still true: keep it
+        mark(file_findings, rel, reach)
+        if failed:
+            file_findings.append(could_not_scan(TOOL, rel, TOO_DEEP))
         findings.extend(file_findings)
     return findings
