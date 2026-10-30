@@ -48,6 +48,35 @@ class Repo(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_STACK, "install repolens[stack]")
+class AnchorNavigationTests(Repo):
+    def test_native_links_to_get_handlers_are_callers_but_page_links_are_not_api_gaps(self):
+        self.write("app/reports/[id]/pdf/route.ts", "export async function GET() { return Response.json({}); }")
+        self.write("app/assets/[id]/route.ts", "export async function GET() { return Response.json({}); }")
+        self.write("app/preview/[id]/route.ts", "export async function GET() { return Response.json({}); }")
+        self.write("app/page.tsx", '''export default function Page({id}: {id: string}) {
+          return <><a href={`/reports/${id}/pdf`} download>PDF</a>
+            <img src={`/assets/${id}`} alt="cover" />
+            <iframe src={`/preview/${id}`} title="preview" />
+            <img src="/static.png" alt="static" />
+            <a href="/plain-page">Page</a><a href="https://example.org/report">External</a></>;
+        }''')
+        self.scan()
+        self.assertIn(("Page", "GET /reports/{dynamic}/pdf"), self.edges("CALLS_API"))
+        self.assertIn(("Page", "GET /assets/{dynamic}"), self.edges("CALLS_API"))
+        self.assertIn(("Page", "GET /preview/{dynamic}"), self.edges("CALLS_API"))
+        self.assertNotIn("API_HANDLER_WITHOUT_STATIC_CALLER", self.codes())
+        self.assertNotIn("API_CALL_WITHOUT_HANDLER", self.codes())
+        self.assertNotIn("EXTERNAL_API_REFERENCE", self.codes())
+
+    def test_unlinked_handler_remains_diagnostic(self):
+        self.write("app/reports/route.ts", "export async function GET() { return Response.json({}); }")
+        self.write("app/page.tsx", 'export default function Page(){ return <a href="/plain-page">Page</a>; }')
+        self.scan()
+        self.assertIn("API_HANDLER_WITHOUT_STATIC_CALLER", self.codes())
+        self.assertNotIn("API_CALL_WITHOUT_HANDLER", self.codes())
+
+
+@unittest.skipUnless(HAS_STACK, "install repolens[stack]")
 class ImportResolutionTests(Repo):
     def test_stylesheets_images_and_declaration_files_are_not_missing_modules(self):
         self.write("types/env.d.ts", "declare const X: string;")
@@ -86,6 +115,36 @@ class ImportResolutionTests(Repo):
         self.scan()
         self.assertNotIn(("main", "parse"), self.edges("CALLS"))
         self.assertNotIn(("main", "format"), self.edges("CALLS"))
+
+    def test_a_bare_name_in_a_module_never_joins_another_modules_function(self):
+        # ES modules share no scope: `fetch`/`resolve` here are a global and a parameter.
+        self.write("lib/a.ts", "export function fetch(){}\nexport function resolve(){}\nexport function helper(){}")
+        self.write("lib/b.ts", "export function resolve(){}")
+        self.write("use.ts", "export async function main(){ await fetch('/x'); new Promise((resolve) => resolve(1)); "
+                             "local(); }\nfunction local(){}")
+        self.write("legacy.js", "function boot(){ helper(); }")  # a classic script shares the global scope
+        self.scan()
+        calls = self.edges("CALLS")
+        self.assertNotIn(("main", "fetch"), calls)
+        self.assertNotIn(("main", "resolve"), calls)
+        self.assertIn(("main", "local"), calls)
+        # The module's own top-level declaration is what the bare name binds to.
+        self.assertEqual({e.resolution for e in self.graph.edges if e.kind == "CALLS"
+                          and self.graph.nodes[e.target].label == "local"}, {"high"})
+        self.assertIn(("boot", "helper"), calls)
+        self.assertNotIn("AMBIGUOUS_CALL", self.codes())
+
+    def test_a_use_server_prologue_marks_the_file_and_never_backtracks(self):
+        from repolens.impact.scanner import _USE_SERVER
+        for text in ('"use server";\n', "// actions\n/* x */\n'use strict';\n'use server'\n", '\ufeff"use server"'):
+            self.assertTrue(_USE_SERVER.match(text), text)
+        started = time.perf_counter()
+        for text in ('const a = "use server";', "\n// " * 5000 + "x", "/* a */ " * 5000, " " * 50000 + "x"):
+            self.assertIsNone(_USE_SERVER.match(text))
+        self.assertLess(time.perf_counter() - started, 1.0)
+        self.write("app/actions.ts", '"use server";\nexport async function save() {}\n')
+        self.scan()
+        self.assertEqual(self.node("app/actions.ts", "file").metadata.get("directive"), "use server")
 
     def test_a_barrel_export_star_and_a_renamed_reexport_resolve(self):
         self.write("lib/a.ts", "export const arrow = () => 1;\nexport function inner(){}")

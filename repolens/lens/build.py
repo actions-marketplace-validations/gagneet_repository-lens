@@ -45,6 +45,7 @@ from ..core.git import run_git
 from ..config import Config, load_config
 from ..core.console import utf8_console
 from ..core.files import iter_files, read_text, read_text_or_none
+from ..docs.coverage import _jsdoc_before
 from ..featuretrace.model import MARKER_PREFIXES, MARKER_RE
 from .settings import LensSettings, from_config
 
@@ -54,23 +55,80 @@ _HEAD_CHARS = 4000
 _HTTP_VERBS = {"get", "post", "put", "patch", "delete", "head", "options"}
 
 
-def _source_id(text: str, lineno: int) -> str | None:
-    """A Function Lens id attached to a declaration, without parsing or executing code.
+#: Comment lines an id may sit among, above a declaration, outside a JSDoc block.
+_ID_WINDOW = 12
 
-    Comments and decorators immediately above the declaration belong to it. A blank line or code
-    stops the search, which prevents an id on the preceding function from leaking forward.
+
+def attached_source_id(lines: list[str], index: int) -> str | None:
+    """The Function Lens id attached to the declaration on `lines[index]`, without parsing code.
+
+    Comments and decorators immediately above the declaration belong to it, up to `_ID_WINDOW`
+    lines. A `/** */` block is skipped whole, however long, so an id written above a JSDoc block
+    (where a line comment cannot hide the JSDoc from linters) attaches. A blank line or code stops
+    the search, which prevents an id on the preceding function from leaking forward.
     """
-    lines = text.splitlines()
-    for line in reversed(lines[max(0, lineno - 13):max(0, lineno - 1)]):
-        stripped = line.strip()
+    i, budget = index - 1, _ID_WINDOW
+    while i >= 0 and budget > 0:
+        stripped = lines[i].strip()
         if match := _FUNCTION_LENS_RE.match(stripped):
             return match.group(1)
         if not stripped:
             break
-        if stripped.startswith(("//", "#", "/*", "*", "*/", "@")):
+        if stripped.endswith("*/") and (start := _jsdoc_start(lines, i)) is not None:
+            i = start - 1
             continue
-        break
+        if not stripped.startswith(("//", "#", "/*", "*", "*/", "@")):
+            break
+        i -= 1
+        budget -= 1
     return None
+
+
+#: Lines a declaration may run above the line its function starts on.
+_DECL_WINDOW = 3
+
+
+def declaration_line(lines: list[str], index: int, name: str) -> int:
+    """The line that declares `name` when its function starts on `lines[index]`.
+
+    `export const k =` with the arrow on the next line, or `export const GET = withAuth(` with
+    it inside the call: tree-sitter places the function on the arrow's line, yet its id and its
+    JSDoc sit above the `const` line. Steps back, at most `_DECL_WINDOW` lines and only past
+    lines ending mid-statement (`=`, `(`, `,`), to a `const`/`let`/`var` of exactly `name`;
+    otherwise `index` itself.
+    """
+    declares = re.compile(rf"\b(?:const|let|var)\s+{re.escape(name)}(?![\w$])")
+    i = index
+    while (i > 0 and index - i < _DECL_WINDOW and not declares.search(lines[i])
+           and lines[i - 1].rstrip().endswith(("=", "(", ","))):
+        i -= 1
+    return i if declares.search(lines[i]) else index
+
+
+def _jsdoc_start(lines: list[str], end: int) -> int | None:
+    """The line opening the `/** */` block that closes on `lines[end]`, or None if it is not JSDoc."""
+    i = end
+    while i >= 0 and "/*" not in lines[i]:
+        i -= 1
+    if i < 0:
+        return None
+    opener = lines[i].strip()
+    return i if opener.startswith("/**") and not opener.startswith("/**/") else None
+
+
+def _jsdoc_purpose(s: LensSettings, lines: list[str], index: int) -> str:
+    """The summary of the JSDoc block documenting the declaration on `lines[index]`: its first
+    paragraph, joined onto one line, ending at a blank line or the first `@` tag."""
+    summary: list[str] = []
+    for line in (_jsdoc_before(lines, index) or "").splitlines():
+        text = line.strip().lstrip("*").strip()
+        if text.startswith("@") or (not text and summary):
+            break
+        if text:
+            summary.append(text)
+    purpose = " ".join(summary)
+    return "" if purpose.startswith(s.placeholder_prefixes) else purpose
+
 
 #: Frontend declarations. Deliberately shallow — see the module docstring.
 _JS_DECL_RE = re.compile(
@@ -197,7 +255,7 @@ def _file_churn(s: LensSettings) -> dict[str, dict[str, Any]]:
 def _test_references(s: LensSettings) -> dict[str, list[str]]:
     """symbol -> test files naming it. Word-boundary matched to avoid substrings."""
     refs: dict[str, set[str]] = defaultdict(set)
-    for path in iter_files(s.root, [s.tests_dir], s.test_extensions, s.skip_parts):
+    for path in iter_files(s.root, [s.tests_dir], s.test_extensions, s.skip_parts, respect_gitignore=True):
         text = read_text_or_none(path)
         if text is None:
             continue
@@ -338,6 +396,7 @@ def _extract_python(s: LensSettings, path: Path, module_tags: list[str],
 
     records: list[dict[str, Any]] = []
     rel = s.rel(path)
+    lines = text.splitlines()
 
     def visit(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
@@ -362,7 +421,7 @@ def _extract_python(s: LensSettings, path: Path, module_tags: list[str],
                     "is_async": isinstance(child, ast.AsyncFunctionDef),
                     "is_private": child.name.startswith("_"),
                     "purpose": purpose,
-                    "source_id": _source_id(text, child.lineno),
+                    "source_id": attached_source_id(lines, child.lineno - 1),
                     "feature_tags": module_tags,
                     "layer": layer,
                     "routes": _decorator_route(child),
@@ -385,6 +444,7 @@ def _extract_frontend(s: LensSettings, path: Path, module_tags: list[str],
     if text is None:
         return []
     rel = s.rel(path)
+    lines = text.splitlines()
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     if s.javascript_parser == "tree-sitter":
@@ -394,12 +454,14 @@ def _extract_frontend(s: LensSettings, path: Path, module_tags: list[str],
         for symbol in facts.symbols:
             if symbol.kind != "function":
                 continue
+            anchor = declaration_line(lines, symbol.line - 1, symbol.name)
             out.append({
                 "key": f"{rel}::{symbol.qualified}", "path": rel, "name": symbol.name,
                 "qualname": symbol.qualified, "language": language, "lineno": symbol.line,
                 "is_async": symbol.is_async, "is_private": symbol.name.startswith("_"),
-                "purpose": "", "feature_tags": module_tags, "layer": layer, "routes": [],
-                "source_id": _source_id(text, symbol.line),
+                "purpose": _jsdoc_purpose(s, lines, anchor),
+                "feature_tags": module_tags, "layer": layer, "routes": [],
+                "source_id": attached_source_id(lines, anchor),
                 # JSX renders are recorded beside calls; a rendered component is not a callee.
                 "callees": sorted({called.rsplit(".", 1)[-1] for owner, called, _line, kind in facts.calls
                                    if owner == symbol.qualified and kind == "CALLS"}),
@@ -412,17 +474,18 @@ def _extract_frontend(s: LensSettings, path: Path, module_tags: list[str],
         if not name or name in seen:
             continue
         seen.add(name)
+        lineno = text.count("\n", 0, m.start()) + 1
         out.append({
             "key": f"{rel}::{name}",
             "path": rel,
             "name": name,
             "qualname": name,
             "language": "javascript",
-            "lineno": text.count("\n", 0, m.start()) + 1,
+            "lineno": lineno,
             "is_async": False,
             "is_private": name.startswith("_"),
-            "purpose": "",
-            "source_id": _source_id(text, text.count("\n", 0, m.start()) + 1),
+            "purpose": _jsdoc_purpose(s, lines, lineno - 1),
+            "source_id": attached_source_id(lines, lineno - 1),
             "feature_tags": module_tags,
             "layer": layer,
             "routes": [],
@@ -492,7 +555,7 @@ def build(s: LensSettings, with_churn: bool = False) -> dict[str, Any]:
         (s.python_roots, [".py"], partial(_extract_python, orm=orm)),
         (s.frontend_roots, s.frontend_extensions, _extract_frontend),
     ):
-        for path in iter_files(s.root, roots, suffixes, s.skip_parts):
+        for path in iter_files(s.root, roots, suffixes, s.skip_parts, respect_gitignore=True):
             tags, layer = _module_context(path)
             records.extend(extract(s, path, tags, layer))
 
@@ -631,9 +694,9 @@ def source_stamp(s: LensSettings) -> str:
     h = hashlib.sha256(json.dumps({f.name: _canonical(getattr(s, f.name)) for f in fields(s)},
                                   sort_keys=True).encode())
     inputs = {
-        *iter_files(s.root, s.python_roots, [".py"], s.skip_parts),
-        *iter_files(s.root, s.frontend_roots, s.frontend_extensions, s.skip_parts),
-        *iter_files(s.root, [s.tests_dir], s.test_extensions, s.skip_parts),
+        *iter_files(s.root, s.python_roots, [".py"], s.skip_parts, respect_gitignore=True),
+        *iter_files(s.root, s.frontend_roots, s.frontend_extensions, s.skip_parts, respect_gitignore=True),
+        *iter_files(s.root, [s.tests_dir], s.test_extensions, s.skip_parts, respect_gitignore=True),
         *(s.root / p for p in (s.owners_yaml, s.datastore_json) if p),
     }
     for path in sorted(inputs):

@@ -111,6 +111,79 @@ class FrontendExtractionTests(unittest.TestCase):
         self.assertTrue(all(item["source_id_duplicate"] for item in lookup(data, "fn-orders-list")))
 
 
+class JSDocAttachmentTests(unittest.TestCase):
+    """An `@functionlens` id sits above a declaration's JSDoc (a line comment between the two
+    would hide the JSDoc from ESLint's jsdoc rules), and the JSDoc is the function's purpose.
+    Read with the default regex parser, which needs no extra."""
+
+    LONG_DOC = "/**\n" + "".join(f" * Line {n} of a long description.\n" for n in range(20)) + " */\n"
+
+    def records(self, source: str, lens: str = "") -> dict[str, dict]:
+        from repolens.lens.build import build
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "repolens.toml").write_text('[lens]\npython_roots = []\nfrontend_roots = ["web"]\n' + lens,
+                                            encoding="utf-8")
+        (root / "web").mkdir()
+        (root / "web" / "a.ts").write_text(source, encoding="utf-8")
+        return {r["name"]: r for r in build(from_config(load_config(root)))["functions"].values()}
+
+    def test_an_id_above_a_jsdoc_block_attaches_however_long_the_block_is(self):
+        recs = self.records("// @functionlens:fn-long\n" + self.LONG_DOC + "export function longDoc() {}\n")
+        self.assertEqual(recs["longDoc"]["source_id"], "fn-long")
+
+    def test_an_id_does_not_attach_across_another_declaration(self):
+        recs = self.records("// @functionlens:fn-first\nexport function first() {}\n"
+                            + self.LONG_DOC + "export function second() {}\n")
+        self.assertEqual((recs["first"]["source_id"], recs["second"]["source_id"]), ("fn-first", None))
+
+    def test_other_comments_keep_the_twelve_line_window(self):
+        recs = self.records("// @functionlens:fn-far\n" + "// note\n" * 12 + "export function far() {}\n")
+        self.assertIsNone(recs["far"]["source_id"])
+
+    def test_the_jsdoc_first_paragraph_is_the_purpose_of_functions_and_arrow_constants(self):
+        recs = self.records(
+            "// @functionlens:fn-load\n/**\n * Loads the orders\n * of one client.\n *\n * Not the summary.\n * @param id the order\n */\n"
+            "export async function load(id: string) {}\n"
+            "/** Saves an order. */\nexport const save = async (id: string): Promise<void> => {};\n"
+            "export function bare() {}\n")
+        self.assertEqual({name: recs[name]["purpose"] for name in recs},
+                         {"load": "Loads the orders of one client.", "save": "Saves an order.", "bare": ""})
+
+    @unittest.skipUnless(__import__("importlib").util.find_spec("tree_sitter"), "requires repolens[stack]")
+    def test_the_tree_sitter_parser_reads_ids_and_jsdoc_the_same_way(self):
+        recs = self.records("// @functionlens:fn-long\n" + self.LONG_DOC + "export function longDoc() {}\n"
+                            "/** Saves an order. */\nexport const save = (id: string) => id;\n",
+                            'javascript_parser = "tree-sitter"\n')
+        self.assertEqual((recs["longDoc"]["source_id"], recs["longDoc"]["purpose"], recs["save"]["purpose"]),
+                         ("fn-long", " ".join(f"Line {n} of a long description." for n in range(20)), "Saves an order."))
+
+    ARROW_BELOW = ("// @functionlens:fn-intake\n/**\n * Makes the intake hook.\n * @param on Whether intake is on.\n */\n"
+                   "export const intake =\n  (on: boolean) =>\n  async () => on;\n")
+
+    def test_an_arrow_starting_below_its_declaration_takes_the_id_and_jsdoc(self):
+        # `export const k =` with the arrow on the next line: the id and the JSDoc sit above
+        # the declaration, which is where the record is anchored.
+        recs = self.records(self.ARROW_BELOW)
+        self.assertEqual((recs["intake"]["source_id"], recs["intake"]["purpose"], recs["intake"]["lineno"]),
+                         ("fn-intake", "Makes the intake hook.", 6))
+
+    @unittest.skipUnless(__import__("importlib").util.find_spec("tree_sitter"), "requires repolens[stack]")
+    def test_tree_sitter_anchors_an_arrow_starting_below_its_declaration_on_the_declaration(self):
+        # Tree-sitter places the function on the arrow's line; the declaration's line is the anchor.
+        recs = self.records(self.ARROW_BELOW + "// @functionlens:fn-get\n/** Serves the list. */\n"
+                            "export const GET = withAuth(\n  async (req: Request) => req,\n);\n",
+                            'javascript_parser = "tree-sitter"\n')
+        self.assertEqual({name: (recs[name]["source_id"], recs[name]["purpose"]) for name in ("intake", "GET")},
+                         {"intake": ("fn-intake", "Makes the intake hook."), "GET": ("fn-get", "Serves the list.")})
+
+    def test_drafting_ids_sees_an_existing_id_above_a_long_jsdoc(self):
+        from repolens.featuretrace.propose import _has_function_lens_id
+        lines = ("// @functionlens:fn-long\n" + self.LONG_DOC + "export function longDoc() {}\n").splitlines()
+        self.assertTrue(_has_function_lens_id(lines, len(lines) - 1))
+
+
 class JavascriptParserSettingTests(unittest.TestCase):
     """The frontend parser is configured, never detected, and recorded, so an
     optional extra cannot change a committed artefact."""
@@ -229,3 +302,41 @@ class JavascriptParserSettingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(__import__("shutil").which("git"), "git is not installed")
+class GitignoreTests(unittest.TestCase):
+    """A file git ignores (a bundle a build copies in) is not the repository's code: indexing it
+    made `lens --check` fail on a tree whose tracked files had not changed."""
+
+    def tree(self, *, git: bool) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "repolens.toml").write_text('[lens]\npython_roots = []\nfrontend_roots = ["web"]\n', encoding="utf-8")
+        (root / ".gitignore").write_text("web/public/swagger/\n", encoding="utf-8")
+        (root / "web" / "public" / "swagger").mkdir(parents=True)
+        (root / "web" / "a.ts").write_text("export function kept() {}\n", encoding="utf-8")
+        if git:
+            subprocess.run(_GIT + ["init", "-q"], cwd=root, check=True)
+            subprocess.run(_GIT + ["add", "-A"], cwd=root, check=True)
+            subprocess.run(_GIT + ["commit", "-q", "-m", "app"], cwd=root, check=True)
+        (root / "web" / "public" / "swagger" / "bundle.js").write_text("export function bundled() {}\n",
+                                                                        encoding="utf-8")
+        return root
+
+    def names(self, root: Path) -> set[str]:
+        from repolens.lens.build import build
+        return {r["name"] for r in build(from_config(load_config(root)))["functions"].values()}
+
+    def test_files_git_ignores_are_not_indexed_or_stamped(self):
+        from repolens.lens.build import source_stamp
+        root = self.tree(git=True)
+        self.assertEqual(self.names(root), {"kept"})
+        before = source_stamp(from_config(load_config(root)))
+        (root / "web" / "public" / "swagger" / "bundle.js").write_text("export function rebuilt() {}\n",
+                                                                        encoding="utf-8")
+        self.assertEqual(source_stamp(from_config(load_config(root))), before)
+
+    def test_outside_git_every_file_is_indexed(self):
+        self.assertEqual(self.names(self.tree(git=False)), {"kept", "bundled"})

@@ -90,7 +90,10 @@ on top of the repository policy.
   4. FastAPI routes/mounts (`fastapi.py`)
   5. call resolution: import bindings, JS barrels and export aliases, Python package
      re-exports, `self`/`this` methods, then name-only fallback; `external:` bindings
-     mean package imports and never name-match
+     mean package imports and never name-match, and a bare JS/TS name in an ES module
+     (`scanner._es_module`) matches only a definition in the same file (`high`, `module_scope`, when it is
+     the module's one top-level declaration of that name); a JSX attribute value (`PASSES`) links only
+     through an import
   6. declared artifacts, then the `API_PREFIX_ALREADY_RESOLVED` note
   7. `_match_endpoints` (route-shape matching, always `probable`)
   8. endpoint gaps (`API_CALL_WITHOUT_HANDLER`, `API_METHOD_MISMATCH`), structural
@@ -322,6 +325,11 @@ byte-identical, since `content_sha256` hashes `functions` and existing committed
 were regex-built. The digest carries `javascript_parser` outside the hash (a missing one
 counts as regex). `lens --check` exits 2 with a "committed with X, this run would use Y"
 message before building when they differ, and exits 1 only for real staleness.
+In a git checkout the lens and `docs coverage` walk skip untracked
+gitignored files (`iter_files(..., respect_gitignore=True)`, always on; `[impact] respect_gitignore`
+does not reach them). A function's anchor line for its id and JSDoc is its declaration's
+(`lens.build.declaration_line`), which `featuretrace propose` shares: tree-sitter places an arrow
+that starts below `export const k =` on the arrow's line.
 
 ### Local API (`repolens/api/app.py`)
 `create_app(root, token)` serves one fixed checkout. It uses TrustedHost with loopback

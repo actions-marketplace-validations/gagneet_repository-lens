@@ -11,6 +11,7 @@ from repolens.core.findings import Finding, ToolRun
 from repolens.impact.config import Config
 from repolens.impact.model import Graph, Node
 from repolens.impact.postgres import (
+    _positional_bind_workaround,
     add_sql,
     add_sql_file,
     looks_like_sql,
@@ -28,6 +29,7 @@ class LooksLikeSqlTests(unittest.TestCase):
         for text in ("SELECT 1", "select now()", "SELECT * FROM users", "SELECT a.id FROM accounts a JOIN b ON a.x = b.x",
                      "  -- leading comment\n SELECT count(*) FROM t", "(SELECT 1) UNION (SELECT 2)",
                      "INSERT INTO t (a) VALUES ($1)", "INSERT INTO archive SELECT * FROM live",
+                     "insert into app.case_scope as s\n  (org_id, area_key) select org_id, $2 from app.case_party",
                      "UPDATE accounts SET x = 1", "DELETE FROM sessions", "DELETE FROM t WHERE id = ?",
                      "MERGE INTO target t USING s ON true", "TRUNCATE staging", "TRUNCATE TABLE a, b",
                      "COPY audit_log FROM STDIN", "CREATE TABLE x (id int)", "CREATE UNIQUE INDEX CONCURRENTLY ix ON t (a)",
@@ -70,6 +72,20 @@ class LooksLikeSqlTests(unittest.TestCase):
         for text in ("COPY t (a, b) FROM '/data/t.csv' WITH (FORMAT csv)", "COPY (SELECT 1) TO STDOUT",
                      "COPY t FROM PROGRAM 'gunzip -c t.gz'", "TRUNCATE history", "Truncate history, sessions;"):
             self.assertEqual(looks_like_sql(text), text != "Truncate history, sessions;", text)
+
+
+class PositionalBindWorkaroundTests(unittest.TestCase):
+    def test_quoted_and_commented_binds_are_not_rewritten(self):
+        sql = ("SELECT E'it\\'s $1,$2', '$3,$4', \"col$5\", $tag$body $6,$7$tag$ "
+               "/* outer /* inner $8 */ still $9 */ FROM docs -- $10\n"
+               "WHERE id IN ($11,$12)")
+        expected = sql.replace("($11,$12)", "(?,?)")
+        self.assertEqual(_positional_bind_workaround(sql), expected)
+        self.assertIsNone(_positional_bind_workaround("SELECT '$1,$2' FROM docs"))
+
+    def test_identifier_suffix_is_not_a_bind(self):
+        self.assertEqual(_positional_bind_workaround("SELECT col$1 FROM docs WHERE id = $2"),
+                         "SELECT col$1 FROM docs WHERE id = ?")
 
 
 class SplitStatementsTests(unittest.TestCase):
@@ -227,7 +243,8 @@ class AddSqlTests(unittest.TestCase):
                                          ("items", "db/rls.sql:3"): "declares",
                                          ("public.customers", "db/rls.sql:4"): "declares",
                                          ("things", "db/rls.sql:5"): "declares"})
-        self.assertEqual(set(self.codes()), {("SQL_UNSUPPORTED_STATEMENT", "info")})
+        # The lexical reader records everything these do, so they are read, not "unsupported".
+        self.assertEqual(self.codes(), [])
         self.assertTrue(self.complete())
 
     def test_gated_prose_is_ignored_and_unparseable_gated_sql_is_only_info(self):
@@ -237,6 +254,24 @@ class AddSqlTests(unittest.TestCase):
         add_sql(self.graph, "src", "SELECT * FROM WHERE", "ui.py:2", gated=True)
         self.assertEqual(self.codes(), [("SQL_NOT_PARSED", "info")])
         self.assertTrue(self.complete())
+
+    def test_adjacent_postgres_binds_are_parsed_without_touching_quoted_text(self):
+        add_sql(self.graph, "src",
+                "INSERT INTO app.docs (id, note) VALUES ($1,$2), ($3,$4) "
+                "ON CONFLICT (id) DO UPDATE SET note = excluded.note RETURNING id",
+                "app/docs.ts:1", gated=True)
+        self.assertEqual(self.tables(), {("app.docs", "app/docs.ts:1"): "writes"})
+        self.assertEqual(self.codes(), [])
+        add_sql(self.graph, "src", "SELECT '$1,$2' AS literal, id FROM app.docs WHERE id = $1",
+                "app/docs.ts:2", gated=True)
+        self.assertIn(("app.docs", "app/docs.ts:2"), self.tables())
+        self.assertEqual(self.codes(), [])
+
+    def test_adjacent_template_binds_still_reject_dynamic_identifiers(self):
+        add_sql(self.graph, "src", "SELECT $1 FROM $2 WHERE id IN ($3,$4)",
+                "app/query.ts:1", gated=True, parameterized=True)
+        self.assertIn(("DYNAMIC_SQL", "info"), self.codes())
+        self.assertNotIn(("$2", "app/query.ts:1"), self.tables())
 
     def test_a_broken_statement_in_a_sql_file_is_a_located_gap_and_keeps_its_neighbours(self):
         add_sql_file(self.graph, "src", "CREATE TABLE good_before (id int);\nCREATE TABLE (;\nCREATE TABLE good_after (id int);\n",
@@ -347,7 +382,7 @@ class AddSqlTests(unittest.TestCase):
                      "db/mixed.sql")
         self.assertEqual([(i.code, i.evidence) for i in self.graph.issues],
                          [("SQL_PARSE_ERROR", "db/mixed.sql:1"), ("SQL_PARSE_ERROR", "db/mixed.sql:2"),
-                          ("SQL_PARSE_ERROR", "db/mixed.sql:3"), ("SQL_UNSUPPORTED_STATEMENT", "db/mixed.sql:4")])
+                          ("SQL_PARSE_ERROR", "db/mixed.sql:3")])
         self.assertEqual(self.names(), {"invoices": "declares", "items": "declares"})
         self.assertFalse(self.complete())
 
@@ -387,6 +422,51 @@ class AddSqlTests(unittest.TestCase):
                                          ("audit", "db/rules.sql:2"): "writes in rule action",
                                          ("audit_copy", "db/rules.sql:2"): "writes in rule action"})
         self.assertEqual({i.code for i in self.graph.issues}, {"SQL_UNSUPPORTED_STATEMENT"})
+
+    def test_temp_tables_dropped_on_commit_and_newline_joined_strings_parse(self):
+        # Valid PostgreSQL sqlglot rejects: `ON COMMIT DROP` (kept as a Command, then a
+        # parse error) and string literals PostgreSQL joins across a newline.
+        text = ("create temp table tmp_forced (rel regclass primary key) on commit drop;\n"
+                "create temp table tmp_units (calc_id text, unit text,\n  primary key (calc_id)) on commit drop;\n"
+                "comment on function app.f() is\n  'it''s one '\n  'sentence';\n"
+                "comment on table app.t is 'on commit drop' -- 'x'\n  ;\n")
+        add_sql_file(self.graph, "src", text, "db/tmp.sql")
+        self.assertEqual(self.tables(), {("tmp_forced", "db/tmp.sql:1"): "declares", ("tmp_units", "db/tmp.sql:2"): "declares",
+                                         ("app.t", "db/tmp.sql:7"): "declares"})
+        self.assertEqual(self.codes(), [])
+        self.assertTrue(self.complete())
+        add_sql_file(self.graph, "src", "comment on table app.t is 'a' 'b';\n", "db/same_line.sql")
+        self.assertEqual(self.codes(), [("SQL_PARSE_ERROR", "warning")])  # PostgreSQL rejects that too
+
+    def test_policy_expressions_routine_bodies_and_dcl_are_read_not_unsupported(self):
+        text = ("create policy p on app.issue for all to app_user\n"
+                "  using (org_id = (select app.current_org()) and exists (select 1 from app.case_file c where c.id = case_id))\n"
+                "  with check (exists (select 1 from app.case_party x where x.id = 1));\n"
+                "drop policy if exists p on app.issue;\n"
+                "drop trigger if exists t on app.issue;\n"
+                "create or replace function app.apl(p date default null) returns setof app.product\n"
+                "language sql stable set search_path = pg_catalog, app as $$\n  select p.* from app.product p;\n$$;\n"
+                "grant execute on function app.a(uuid, uuid), app.b(uuid) to app_user;\n"
+                "revoke all on function app.a(uuid, uuid) from public;\n"
+                "do $$ begin update app.counter set n = 0; end $$;\n")
+        add_sql_file(self.graph, "src", text, "db/rls.sql")
+        self.assertEqual(self.tables(), {("app.issue", "db/rls.sql:1"): "declares", ("app.case_file", "db/rls.sql:1"): "reads in policy",
+                                         ("app.case_party", "db/rls.sql:1"): "reads in policy",
+                                         ("app.issue", "db/rls.sql:4"): "declares", ("app.issue", "db/rls.sql:5"): "declares",
+                                         ("app.product", "db/rls.sql:6"): "reads in function body",
+                                         ("app.counter", "db/rls.sql:12"): "writes in function body"})
+        self.assertEqual(self.codes(), [])
+
+    def test_dynamic_do_blocks_rules_and_maintenance_stay_reported(self):
+        add_sql_file(self.graph, "src",
+                     "do $$ declare t text; begin foreach t in array array['a','b'] loop\n"
+                     "  execute format('alter table %I enable row level security', t); end loop; end $$;\n"
+                     "create rule r as on update to orders do instead nothing;\nvacuum orders;\n"
+                     "do $$ begin perform 1; raise notice 'execute'; end $$;\n", "db/dyn.sql")
+        self.assertEqual([(i.code, i.evidence) for i in self.graph.issues],
+                         [("SQL_UNSUPPORTED_STATEMENT", "db/dyn.sql:1"), ("SQL_UNSUPPORTED_STATEMENT", "db/dyn.sql:3"),
+                          ("SQL_UNSUPPORTED_STATEMENT", "db/dyn.sql:4")])
+        self.assertTrue(self.complete())
 
     def test_a_rule_event_keyword_is_never_a_table(self):
         add_sql_file(self.graph, "src", "CREATE RULE r AS ON UPDATE TO orders DO INSTEAD NOTHING;\n"
